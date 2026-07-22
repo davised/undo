@@ -46,18 +46,19 @@ _undo_precmd() {
     fi
     unset _undo_saved_preload
 
-    # commands that changed nothing leave no journal: drop the session
-    if [[ ! -s $_undo_session/journal ]]; then
-        command rm -rf -- $_undo_session
-    fi
     unset _undo_session
 
-    # keep only the newest UNDO_KEEP sessions
+    # drop sessions whose command changed nothing (no journal written),
+    # and keep only the newest UNDO_KEEP real ones
     local -a sessions
     sessions=($UNDO_DATA_DIR/sessions/*(N/On))
-    if (( ${#sessions} > UNDO_KEEP )); then
-        command rm -rf -- ${sessions[UNDO_KEEP+1,-1]}
-    fi
+    local d
+    local -i n=0
+    for d in $sessions; do
+        if [[ ! -s $d/journal ]] || (( ++n > UNDO_KEEP )); then
+            command rm -rf -- $d
+        fi
+    done
 }
 
 autoload -Uz add-zsh-hook

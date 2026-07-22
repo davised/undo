@@ -41,12 +41,12 @@ func when(id string) string {
 	if err != nil {
 		return "?"
 	}
-	return time.Unix(n, 0).Format("15:04:05")
+	return time.Unix(n, 0).Format("Jan 2 15:04:05")
 }
 
 func shortID(id string) string {
-	if len(id) > 12 {
-		return id[:12]
+	if len(id) > 14 {
+		return id[:14]
 	}
 	return id
 }
@@ -61,6 +61,9 @@ func cmdList() {
 		return
 	}
 	for _, s := range sessions {
+		if len(s.Entries) == 0 {
+			continue
+		}
 		mark := " "
 		if s.Undone {
 			mark = "u"
