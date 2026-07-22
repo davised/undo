@@ -9,10 +9,12 @@
 package session
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/edaywalid/undo/internal/journal"
 )
@@ -125,7 +127,48 @@ func Latest() (*Session, error) {
 	return nil, os.ErrNotExist
 }
 
+// LatestUndone returns the most recent session in the undone state.
+func LatestUndone() (*Session, error) {
+	all, err := List()
+	if err != nil {
+		return nil, err
+	}
+	for _, s := range all {
+		if len(s.Entries) > 0 && s.Undone {
+			return s, nil
+		}
+	}
+	return nil, os.ErrNotExist
+}
+
+// Create makes a fresh session directory for cmd, ready for the shim.
+func Create(cmd string) (*Session, error) {
+	id := fmt.Sprintf("%d%06d", time.Now().Unix(), time.Now().Nanosecond()/1000)
+	dir := filepath.Join(Root(), id)
+	if err := os.MkdirAll(filepath.Join(dir, "data"), 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cmd"), []byte(cmd+"\n"), 0o644); err != nil {
+		return nil, err
+	}
+	return &Session{ID: id, Dir: dir, Cmd: cmd}, nil
+}
+
+// Remove deletes a session and its backups entirely.
+func (s *Session) Remove() error {
+	return os.RemoveAll(s.Dir)
+}
+
 // MarkUndone records that a session was reverted.
 func (s *Session) MarkUndone() error {
 	return os.WriteFile(filepath.Join(s.Dir, "undone"), nil, 0o644)
+}
+
+// ClearUndone flips a session back to the applied state after a redo.
+func (s *Session) ClearUndone() error {
+	err := os.Remove(filepath.Join(s.Dir, "undone"))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
 }
