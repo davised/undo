@@ -81,5 +81,47 @@ echo "newer content" >"$PLAY/top.txt"
 "$UNDO" -y 2>&1 | grep -q "skipped" || fail "expected a skip warning"
 [[ $(cat "$PLAY/top.txt") == "newer content" ]] || fail "clobbered without force"
 
+echo "== case 8: undo run arms the shim without a hook"
+export UNDO_LIB=$LIB
+"$UNDO" run -- rm "$PLAY/top.txt" 2>&1 | grep -q "captured 1 change" || fail "run did not capture"
+[[ ! -e $PLAY/top.txt ]] || fail "run did not execute rm"
+"$UNDO" -y
+[[ $(cat "$PLAY/top.txt") == "newer content" ]] || fail "run session not undoable"
+
+echo "== case 9: redo re-applies, then undo works again"
+run_armed "rm $PLAY/top.txt"
+"$UNDO" -y
+[[ -e $PLAY/top.txt ]] || fail "undo failed"
+"$UNDO" redo -y
+[[ ! -e $PLAY/top.txt ]] || fail "redo did not re-delete"
+"$UNDO" -y
+[[ $(cat "$PLAY/top.txt") == "newer content" ]] || fail "second undo failed"
+
+echo "== case 10: mod entries toggle both ways without losing either version"
+echo "original" >"$PLAY/toggle.txt"
+run_armed "echo overwritten > $PLAY/toggle.txt"
+"$UNDO" -y
+[[ $(cat "$PLAY/toggle.txt") == "original" ]] || fail "undo lost original"
+"$UNDO" redo -y
+[[ $(cat "$PLAY/toggle.txt") == "overwritten" ]] || fail "redo lost new version"
+"$UNDO" -y
+[[ $(cat "$PLAY/toggle.txt") == "original" ]] || fail "second undo failed"
+
+echo "== case 11: interactive cherry-pick restores only selected entries"
+echo "one" >"$PLAY/f1.txt"
+echo "two" >"$PLAY/f2.txt"
+run_armed "rm $PLAY/f1.txt $PLAY/f2.txt"
+printf '1\n1\ny\n' | "$UNDO" -i >/dev/null
+[[ -e $PLAY/f1.txt && ! -e $PLAY/f2.txt ]] || fail "cherry-pick restored wrong set"
+"$UNDO" -y 2>/dev/null
+[[ -e $PLAY/f1.txt && -e $PLAY/f2.txt ]] || fail "full undo after cherry-pick failed"
+
+echo "== case 12: diff shows content changes"
+echo "alpha" >"$PLAY/d.txt"
+run_armed "echo beta > $PLAY/d.txt"
+out=$("$UNDO" diff)
+grep -q -- "-alpha" <<<"$out" || fail "diff missing removed line"
+grep -q -- "+beta" <<<"$out" || fail "diff missing added line"
+
 echo
 echo "all cases passed"
