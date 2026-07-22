@@ -1,0 +1,60 @@
+# undo.bash - arm the undo shim around every interactive command.
+# Source from ~/.bashrc:  source ~/.local/share/undo/undo.bash
+# Needs bash >= 5 (EPOCHREALTIME).
+
+[[ -n ${EPOCHREALTIME-} ]] || return 0
+: "${UNDO_DATA_DIR:=${XDG_DATA_HOME:-$HOME/.local/share}/undo}"
+: "${UNDO_LIB:=$HOME/.local/lib/undo/libundo.so}"
+: "${UNDO_KEEP:=30}"
+[[ -r $UNDO_LIB ]] || return 0
+
+_undo_at_prompt=1
+
+_undo_preexec() {
+    [[ -n $_undo_at_prompt ]] || return 0
+    _undo_at_prompt=
+    local cmd=$BASH_COMMAND
+    case $cmd in undo | 'undo '*) return 0 ;; esac
+
+    local id=${EPOCHREALTIME/./}
+    local dir=$UNDO_DATA_DIR/sessions/$id
+    mkdir -p "$dir/data" 2>/dev/null || return 0
+    printf '%s\n' "$cmd" >"$dir/cmd"
+
+    _undo_session=$dir
+    export UNDO_SESSION=$dir
+    if [[ ":${LD_PRELOAD-}:" != *":$UNDO_LIB:"* ]]; then
+        _undo_saved_preload=${LD_PRELOAD-__undo_unset__}
+        export LD_PRELOAD=$UNDO_LIB${LD_PRELOAD:+:$LD_PRELOAD}
+    fi
+}
+
+_undo_precmd() {
+    _undo_at_prompt=1
+    [[ -n ${_undo_session-} ]] || return 0
+    unset UNDO_SESSION
+    if [[ ${_undo_saved_preload-} == __undo_unset__ ]]; then
+        unset LD_PRELOAD
+    elif [[ -n ${_undo_saved_preload-} ]]; then
+        export LD_PRELOAD=$_undo_saved_preload
+    fi
+    unset _undo_saved_preload _undo_session
+
+    # drop empty sessions, then prune the oldest beyond UNDO_KEEP
+    local d
+    for d in "$UNDO_DATA_DIR"/sessions/*/; do
+        [[ -d $d ]] || continue
+        [[ -s $d/journal ]] || rm -rf -- "$d"
+    done
+    local -a all=("$UNDO_DATA_DIR"/sessions/*/)
+    local n=${#all[@]} i
+    if [[ -d ${all[0]-} ]] && ((n > UNDO_KEEP)); then
+        for ((i = 0; i < n - UNDO_KEEP; i++)); do
+            rm -rf -- "${all[i]}"
+        done
+    fi
+}
+
+trap '_undo_preexec' DEBUG
+# run our precmd last so the at-prompt flag is set after other hooks
+PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND;}_undo_precmd"

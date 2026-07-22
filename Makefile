@@ -20,9 +20,13 @@ install: all
 	install -Dm755 bin/undo $(PREFIX)/bin/undo
 	install -Dm755 build/libundo.so $(PREFIX)/lib/undo/libundo.so
 	install -Dm644 shell/undo.zsh $(PREFIX)/share/undo/undo.zsh
+	install -Dm644 shell/undo.bash $(PREFIX)/share/undo/undo.bash
+	install -Dm644 shell/undo.fish $(PREFIX)/share/undo/undo.fish
 	@echo
-	@echo 'installed. add this to ~/.zshrc:'
-	@echo '  source $(PREFIX)/share/undo/undo.zsh'
+	@echo 'installed. add the line for your shell:'
+	@echo '  zsh:   source $(PREFIX)/share/undo/undo.zsh   (~/.zshrc)'
+	@echo '  bash:  source $(PREFIX)/share/undo/undo.bash  (~/.bashrc)'
+	@echo '  fish:  source $(PREFIX)/share/undo/undo.fish  (config.fish)'
 
 clean:
 	rm -rf bin build
