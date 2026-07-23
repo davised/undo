@@ -164,12 +164,27 @@ func LatestUndone() (*Session, error) {
 
 // Create makes a fresh session directory for cmd, ready for the shim.
 func Create(cmd string) (*Session, error) {
-	id := fmt.Sprintf("%d%06d", time.Now().Unix(), time.Now().Nanosecond()/1000)
-	dir := filepath.Join(Root(), id)
-	if err := os.MkdirAll(filepath.Join(dir, "data"), 0o700); err != nil {
+	if err := os.MkdirAll(Root(), 0o700); err != nil {
 		return nil, err
 	}
 	TightenPerms()
+	var id, dir string
+	for {
+		now := time.Now()
+		id = fmt.Sprintf("%d%06d", now.Unix(), now.Nanosecond()/1000)
+		dir = filepath.Join(Root(), id)
+		err := os.Mkdir(dir, 0o700)
+		if err == nil {
+			break
+		}
+		if !os.IsExist(err) {
+			return nil, err
+		}
+		time.Sleep(time.Microsecond) // same-microsecond collision
+	}
+	if err := os.Mkdir(filepath.Join(dir, "data"), 0o700); err != nil {
+		return nil, err
+	}
 	if err := os.WriteFile(filepath.Join(dir, "cmd"), []byte(cmd+"\n"), 0o600); err != nil {
 		return nil, err
 	}

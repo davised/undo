@@ -1,5 +1,6 @@
 PREFIX ?= $(HOME)/.local
 CC ?= gcc
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
 GO_SRC := $(shell find cmd internal -name '*.go')
 
@@ -11,9 +12,10 @@ build/libundo.so: shim/undo_shim.c
 
 bin/undo: $(GO_SRC) go.mod
 	@mkdir -p bin
-	go build -o $@ ./cmd/undo
+	go build -ldflags "-X main.version=$(VERSION)" -o $@ ./cmd/undo
 
 test: all
+	go test ./...
 	./test/e2e.sh
 
 install: all
@@ -22,6 +24,9 @@ install: all
 	install -Dm644 shell/undo.zsh $(PREFIX)/share/undo/undo.zsh
 	install -Dm644 shell/undo.bash $(PREFIX)/share/undo/undo.bash
 	install -Dm644 shell/undo.fish $(PREFIX)/share/undo/undo.fish
+	install -Dm644 completions/_undo $(PREFIX)/share/zsh/site-functions/_undo
+	install -Dm644 completions/undo.bash $(PREFIX)/share/bash-completion/completions/undo
+	install -Dm644 completions/undo.fish $(PREFIX)/share/fish/vendor_completions.d/undo.fish
 	@echo
 	@echo 'installed. add the line for your shell:'
 	@echo '  zsh:   source $(PREFIX)/share/undo/undo.zsh   (~/.zshrc)'
@@ -29,6 +34,6 @@ install: all
 	@echo '  fish:  source $(PREFIX)/share/undo/undo.fish  (config.fish)'
 
 clean:
-	rm -rf bin build
+	rm -rf bin build dist
 
 .PHONY: all test install clean

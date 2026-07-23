@@ -1,0 +1,15 @@
+# fish completion for undo
+complete -c undo -f
+complete -c undo -n __fish_use_subcommand -a list -d 'list recent sessions'
+complete -c undo -n __fish_use_subcommand -a show -d 'show what a session changed'
+complete -c undo -n __fish_use_subcommand -a apply -d 'revert a specific session'
+complete -c undo -n __fish_use_subcommand -a redo -d 're-apply an undone session'
+complete -c undo -n __fish_use_subcommand -a diff -d 'show content diffs for a session'
+complete -c undo -n __fish_use_subcommand -a run -d 'run one command with the shim armed'
+complete -c undo -n __fish_use_subcommand -a gc -d 'prune old and oversized sessions'
+complete -c undo -n __fish_use_subcommand -a purge -d 'delete all stored sessions'
+complete -c undo -s n -l dry-run -d 'show what would happen without doing it'
+complete -c undo -s y -l yes -d 'skip the confirmation prompt'
+complete -c undo -l force -d 'overwrite files that changed after the session'
+complete -c undo -s i -l interactive -d 'pick a session and entries interactively'
+complete -c undo -s V -l version -d 'print version'

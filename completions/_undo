@@ -1,0 +1,45 @@
+#compdef undo
+
+_undo() {
+    local -a commands
+    commands=(
+        'list:list recent sessions'
+        'show:show what a session changed'
+        'apply:revert a specific session'
+        'redo:re-apply an undone session'
+        'diff:show content diffs for a session'
+        'run:run one command with the shim armed'
+        'gc:prune old, empty, and oversized sessions'
+        'purge:delete all stored sessions and backups'
+        'help:show usage'
+    )
+
+    _arguments -C \
+        '(-n --dry-run)'{-n,--dry-run}'[show what would happen without doing it]' \
+        '(-y --yes)'{-y,--yes}'[skip the confirmation prompt]' \
+        '--force[overwrite files that changed after the session]' \
+        '(-i --interactive)'{-i,--interactive}'[pick a session and entries interactively]' \
+        '(-V --version)'{-V,--version}'[print version]' \
+        '1:command:->cmds' \
+        '*::arg:->args'
+
+    case $state in
+    cmds)
+        _describe 'command' commands
+        ;;
+    args)
+        case $words[1] in
+        show | apply | redo | diff)
+            local -a ids
+            ids=(${(f)"$(command undo list 2>/dev/null | awk '{print $2}')"})
+            _describe 'session id' ids
+            ;;
+        run)
+            _normal
+            ;;
+        esac
+        ;;
+    esac
+}
+
+_undo "$@"
