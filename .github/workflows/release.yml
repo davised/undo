@@ -1,0 +1,35 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: cross toolchain
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+      - name: build shims
+        run: |
+          mkdir -p build
+          gcc -shared -fPIC -O2 -Wall -o build/libundo_amd64.so shim/undo_shim.c -ldl
+          aarch64-linux-gnu-gcc -shared -fPIC -O2 -Wall -o build/libundo_arm64.so shim/undo_shim.c -ldl
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # PAT with push access to edaywalid/homebrew-tap; formula upload
+          # fails gracefully absent while the release itself still publishes
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}

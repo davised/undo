@@ -37,6 +37,14 @@ that actually changed something. The last 30 are kept.
 
 ## Install
 
+From the tap:
+
+```
+brew install edaywalid/tap/undo
+```
+
+Or from source:
+
 ```
 make install          # installs to ~/.local
 ```
@@ -68,20 +76,28 @@ undo run -- cmd   run one command with the shim armed, no hook needed
 undo list         recent sessions
 undo show [id]    what a session changed
 undo apply <id>   revert a specific session
+undo gc           prune old, empty, and oversized sessions
+undo purge        delete all stored sessions and backups
 ```
 
 Flags: `-n` dry run, `-y` skip confirmation, `--force` overwrite files
 that changed again after the session.
 
 `undo` refuses to clobber a path that was recreated after the session
-unless you pass `--force`. A session toggles between applied and undone;
-`undo list` marks undone sessions with `u`.
+unless you pass `--force`, and refuses to touch a session whose command
+may still be running in another terminal. A session toggles between
+applied and undone; `undo list` marks undone sessions with `u`.
+
+The session store is kept private (mode 0700) since backups can contain
+copies of sensitive files. `undo purge` wipes it entirely.
 
 ## Configuration
 
 Environment variables, set before sourcing the hook:
 
 - `UNDO_KEEP` - sessions to keep (default 30)
+- `UNDO_MAX_STORE` - total store size budget in bytes (default 1 GiB);
+  oldest sessions are pruned first
 - `UNDO_DATA_DIR` - session store (default `~/.local/share/undo`)
 - `UNDO_MAX_BYTES` - largest file the shim will copy as a backup
   (default 256 MiB; only matters for in-place writes, deletions are

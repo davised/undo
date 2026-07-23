@@ -1,0 +1,81 @@
+version: 2
+project_name: undo
+
+builds:
+  - main: ./cmd/undo
+    binary: undo
+    env:
+      - CGO_ENABLED=0
+    goos: [linux]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - formats: [tar.gz]
+    name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
+    files:
+      - LICENSE
+      - README.md
+      - shell/*
+      - completions/*
+      - build/libundo_amd64.so
+      - build/libundo_arm64.so
+
+nfpms:
+  - formats: [deb, rpm, archlinux]
+    description: Undo what the last shell command did to the filesystem
+    homepage: https://github.com/edaywalid/undo
+    license: MIT
+    maintainer: edaywalid <becharwalid9@gmail.com>
+    contents:
+      - src: build/libundo_{{ .Arch }}.so
+        dst: /usr/lib/undo/libundo.so
+      - src: shell/undo.zsh
+        dst: /usr/share/undo/undo.zsh
+      - src: shell/undo.bash
+        dst: /usr/share/undo/undo.bash
+      - src: shell/undo.fish
+        dst: /usr/share/undo/undo.fish
+      - src: completions/_undo
+        dst: /usr/share/zsh/site-functions/_undo
+      - src: completions/undo.bash
+        dst: /usr/share/bash-completion/completions/undo
+      - src: completions/undo.fish
+        dst: /usr/share/fish/vendor_completions.d/undo.fish
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: git
+  filters:
+    exclude:
+      - '^ci:'
+      - '^docs:'
+
+brews:
+  - name: undo
+    repository:
+      owner: edaywalid
+      name: homebrew-tap
+      token: '{{ .Env.TAP_GITHUB_TOKEN }}'
+    directory: Formula
+    homepage: https://github.com/edaywalid/undo
+    description: Undo what the last shell command did to the filesystem
+    license: MIT
+    install: |
+      bin.install "undo"
+      arch = Hardware::CPU.arm? ? "arm64" : "amd64"
+      (lib/"undo").install "build/libundo_#{arch}.so" => "libundo.so"
+      (share/"undo").install Dir["shell/*"]
+      zsh_completion.install "completions/_undo"
+      bash_completion.install "completions/undo.bash" => "undo"
+      fish_completion.install "completions/undo.fish"
+    caveats: |
+      Add the hook for your shell:
+        zsh:   source #{HOMEBREW_PREFIX}/share/undo/undo.zsh
+        bash:  source #{HOMEBREW_PREFIX}/share/undo/undo.bash
+        fish:  source #{HOMEBREW_PREFIX}/share/undo/undo.fish
+    test: |
+      system "#{bin}/undo", "--version"
