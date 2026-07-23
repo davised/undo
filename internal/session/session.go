@@ -10,10 +10,13 @@ package session
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/edaywalid/undo/internal/journal"
@@ -24,7 +27,19 @@ type Session struct {
 	Dir     string
 	Cmd     string
 	Undone  bool
+	Done    bool // the command finished (done marker present)
+	Pid     int  // shell or runner pid, 0 for pre-lock sessions
 	Entries []journal.Entry
+}
+
+// Live reports whether the session's command may still be running.
+// Sessions without a pid file (old format) are assumed finished.
+func (s *Session) Live() bool {
+	if s.Done || s.Pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(s.Pid, 0)
+	return err == nil || err == syscall.EPERM
 }
 
 // Root returns the sessions directory, honoring UNDO_DATA_DIR.
@@ -47,6 +62,12 @@ func load(dir string) (*Session, error) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "undone")); err == nil {
 		s.Undone = true
+	}
+	if _, err := os.Stat(filepath.Join(dir, "done")); err == nil {
+		s.Done = true
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "pid")); err == nil {
+		s.Pid, _ = strconv.Atoi(strings.TrimSpace(string(b)))
 	}
 	entries, err := journal.Read(filepath.Join(dir, "journal"))
 	if err != nil {
@@ -145,13 +166,75 @@ func LatestUndone() (*Session, error) {
 func Create(cmd string) (*Session, error) {
 	id := fmt.Sprintf("%d%06d", time.Now().Unix(), time.Now().Nanosecond()/1000)
 	dir := filepath.Join(Root(), id)
-	if err := os.MkdirAll(filepath.Join(dir, "data"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(dir, "data"), 0o700); err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(filepath.Join(dir, "cmd"), []byte(cmd+"\n"), 0o644); err != nil {
+	TightenPerms()
+	if err := os.WriteFile(filepath.Join(dir, "cmd"), []byte(cmd+"\n"), 0o600); err != nil {
 		return nil, err
 	}
-	return &Session{ID: id, Dir: dir, Cmd: cmd}, nil
+	pid := strconv.Itoa(os.Getpid())
+	if err := os.WriteFile(filepath.Join(dir, "pid"), []byte(pid+"\n"), 0o600); err != nil {
+		return nil, err
+	}
+	return &Session{ID: id, Dir: dir, Cmd: cmd, Pid: os.Getpid()}, nil
+}
+
+// MarkDone records that the session's command finished.
+func (s *Session) MarkDone() error {
+	return os.WriteFile(filepath.Join(s.Dir, "done"), nil, 0o600)
+}
+
+// TightenPerms keeps the store private: backups may contain copies of
+// sensitive files.
+func TightenPerms() {
+	os.Chmod(filepath.Dir(Root()), 0o700)
+	os.Chmod(Root(), 0o700)
+}
+
+func dirSize(dir string) int64 {
+	var total int64
+	filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info, err := d.Info(); err == nil && info.Mode().IsRegular() {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
+
+// GC removes empty sessions and prunes the oldest until at most keep
+// sessions remain within maxBytes total. Live sessions are never touched.
+func GC(keep int, maxBytes int64) (int, error) {
+	TightenPerms()
+	all, err := List()
+	if err != nil {
+		return 0, err
+	}
+	removed, kept := 0, 0
+	var total int64
+	for _, s := range all { // newest first
+		if s.Live() {
+			continue
+		}
+		if len(s.Entries) == 0 {
+			if s.Remove() == nil {
+				removed++
+			}
+			continue
+		}
+		kept++
+		total += dirSize(s.Dir)
+		if kept > keep || total > maxBytes {
+			if s.Remove() == nil {
+				removed++
+			}
+		}
+	}
+	return removed, nil
 }
 
 // Remove deletes a session and its backups entirely.

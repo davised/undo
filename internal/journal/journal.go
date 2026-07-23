@@ -21,6 +21,7 @@ const (
 	OpExchange = "exchange" // a, b            -> swap back
 	OpMkdir    = "mkdir"    // path            -> rmdir
 	OpRmdir    = "rmdir"    // path, mode      -> mkdir
+	OpChmod    = "chmod"    // path, old, new  -> chmod back
 	OpLost     = "lost"     // path, why       -> warn only
 )
 
@@ -100,6 +101,8 @@ func (e Entry) Describe() string {
 		return "created   " + f(0) + "/"
 	case OpRmdir:
 		return "deleted   " + f(0) + "/"
+	case OpChmod:
+		return "mode      " + f(0) + " (" + f(1) + " -> " + f(2) + ")"
 	case OpLost:
 		return "changed   " + f(0) + " (no backup saved)"
 	default:

@@ -211,6 +211,8 @@ static int copy_file(const char *src, const char *dst)
     if (n < 0)
         ok = 0;
     fchmod(out, st.st_mode & 07777);
+    struct timespec times[2] = {st.st_atim, st.st_mtim};
+    futimens(out, times);
     close(in);
     close(out);
     if (!ok)
@@ -316,6 +318,14 @@ static void handle_open_pre(int dirfd, const char *path, int flags,
     if (abs_path(dirfd, path, abs) != 0)
         return;
     struct stat st;
+    if (lstat(abs, &st) == 0 && S_ISLNK(st.st_mode)) {
+        /* writing through a symlink modifies the target; journal the
+         * target so restore swaps content instead of clobbering the link */
+        char rp[PATH_MAX];
+        if (!realpath(abs, rp))
+            return;
+        strcpy(abs, rp);
+    }
     if (lstat(abs, &st) == 0) {
         if (writes && S_ISREG(st.st_mode)) {
             if (save_file(abs, 1, bak) == 0)
@@ -585,6 +595,79 @@ int link(const char *oldp, const char *newp)
             jwrite("create", abs, NULL);
         in_shim = 0;
     }
+    return rc;
+}
+
+int linkat(int olddirfd, const char *oldp, int newdirfd, const char *newp,
+           int flags)
+{
+    REAL(linkat, int, int, const char *, int, const char *, int);
+    int rc = real_linkat(olddirfd, oldp, newdirfd, newp, flags);
+    if (rc == 0 && armed()) {
+        in_shim = 1;
+        char abs[PATH_MAX];
+        if (abs_path(newdirfd, newp, abs) == 0)
+            jwrite("create", abs, NULL);
+        in_shim = 0;
+    }
+    return rc;
+}
+
+static void chmod_pre(int dirfd, const char *path, char *abs, char *oldmode,
+                      int *ok)
+{
+    *ok = 0;
+    struct stat st;
+    if (abs_path(dirfd, path, abs) != 0)
+        return;
+    if (stat(abs, &st) != 0)
+        return;
+    snprintf(oldmode, 8, "%o", st.st_mode & 07777);
+    *ok = 1;
+}
+
+static void chmod_post(int rc, const char *abs, const char *oldmode,
+                       mode_t mode, int ok)
+{
+    if (rc != 0 || !ok)
+        return;
+    char newmode[8];
+    snprintf(newmode, sizeof newmode, "%o", mode & 07777);
+    if (strcmp(oldmode, newmode) != 0)
+        jwrite("chmod", abs, oldmode, newmode, NULL);
+}
+
+int chmod(const char *path, mode_t mode)
+{
+    REAL(chmod, int, const char *, mode_t);
+    if (!armed())
+        return real_chmod(path, mode);
+    in_shim = 1;
+    char abs[PATH_MAX], oldmode[8];
+    int ok;
+    chmod_pre(AT_FDCWD, path, abs, oldmode, &ok);
+    in_shim = 0;
+    int rc = real_chmod(path, mode);
+    in_shim = 1;
+    chmod_post(rc, abs, oldmode, mode, ok);
+    in_shim = 0;
+    return rc;
+}
+
+int fchmodat(int dirfd, const char *path, mode_t mode, int flags)
+{
+    REAL(fchmodat, int, int, const char *, mode_t, int);
+    if (!armed())
+        return real_fchmodat(dirfd, path, mode, flags);
+    in_shim = 1;
+    char abs[PATH_MAX], oldmode[8];
+    int ok;
+    chmod_pre(dirfd, path, abs, oldmode, &ok);
+    in_shim = 0;
+    int rc = real_fchmodat(dirfd, path, mode, flags);
+    in_shim = 1;
+    chmod_post(rc, abs, oldmode, mode, ok);
+    in_shim = 0;
     return rc;
 }
 

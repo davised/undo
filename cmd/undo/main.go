@@ -13,6 +13,9 @@ import (
 	"github.com/edaywalid/undo/internal/session"
 )
 
+// set via -ldflags "-X main.version=..."
+var version = "dev"
+
 const usage = `undo - revert what the last command did to the filesystem
 
 usage:
@@ -24,12 +27,65 @@ usage:
   undo run [--] <cmd...>  run one command with the shim armed (no hook needed)
   undo list               list recent sessions
   undo show [id]          show what a session changed
+  undo gc                 prune old, empty, and oversized sessions
+  undo purge              delete all stored sessions and backups
 
 flags:
   -n, --dry-run   show what would happen without doing it
   -y, --yes       skip the confirmation prompt
       --force     overwrite files that changed after the session
+  -V, --version   print version
 `
+
+func envInt(name string, def int64) int64 {
+	if v := os.Getenv(name); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+func cmdGC(auto bool) {
+	keep := int(envInt("UNDO_KEEP", 30))
+	maxBytes := envInt("UNDO_MAX_STORE", 1<<30)
+	removed, err := session.GC(keep, maxBytes)
+	if auto {
+		return
+	}
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Printf("removed %d session(s)\n", removed)
+}
+
+func cmdPurge(yes, force bool) {
+	sessions, err := session.List()
+	if err != nil {
+		fatal(err)
+	}
+	if len(sessions) == 0 {
+		fmt.Println("store is already empty")
+		return
+	}
+	if !yes && !confirm(fmt.Sprintf(
+		"delete %d session(s) and every stored backup? [y/N] ", len(sessions))) {
+		fmt.Println("aborted")
+		return
+	}
+	removed := 0
+	for _, s := range sessions {
+		if s.Live() && !force {
+			fmt.Fprintf(os.Stderr, "skipped %s: command may still be running (pid %d)\n",
+				shortID(s.ID), s.Pid)
+			continue
+		}
+		if s.Remove() == nil {
+			removed++
+		}
+	}
+	fmt.Printf("purged %d session(s)\n", removed)
+}
 
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, "undo:", err)
@@ -154,6 +210,9 @@ func cmdApply(s *session.Session, dir restore.Direction, opts restore.Options, y
 	if len(s.Entries) == 0 {
 		fatal(fmt.Errorf("session recorded no changes"))
 	}
+	if s.Live() && !opts.Force {
+		fatal(fmt.Errorf("the command may still be running (pid %d); --force to override", s.Pid))
+	}
 	if dir == restore.Undo && s.Undone {
 		fatal(fmt.Errorf("session was already undone (undo redo %s to re-apply)", shortID(s.ID)))
 	}
@@ -202,6 +261,9 @@ func main() {
 			opts.Force = true
 		case "-i", "--interactive":
 			interactive = true
+		case "-V", "--version":
+			fmt.Println("undo", version)
+			return
 		case "-h", "--help", "help":
 			fmt.Print(usage)
 			return
@@ -229,6 +291,10 @@ func main() {
 		cmdList()
 	case "show":
 		cmdShow(args[1:])
+	case "gc":
+		cmdGC(len(args) > 1 && args[1] == "--auto")
+	case "purge":
+		cmdPurge(yes, opts.Force)
 	case "diff":
 		cmdDiff(args[1:])
 	case "apply":

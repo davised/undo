@@ -77,6 +77,7 @@ func cmdRun(argv []string) {
 	cmd.Env = env
 
 	runErr := cmd.Run()
+	s.MarkDone()
 
 	code := 0
 	if runErr != nil {

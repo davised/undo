@@ -71,6 +71,7 @@ func moveAny(src, dst string) error {
 	if err := out.Close(); err != nil {
 		return err
 	}
+	os.Chtimes(dst, st.ModTime(), st.ModTime())
 	return os.Remove(src)
 }
 
@@ -345,6 +346,25 @@ func Run(s *session.Session, dir Direction, opts Options) (*Result, error) {
 					continue
 				}
 			}
+
+		case journal.OpChmod:
+			if !exists(field(0)) {
+				done = false
+				break
+			}
+			target := field(1)
+			if dir == Redo {
+				target = field(2)
+			}
+			mode, perr := strconv.ParseUint(target, 8, 32)
+			if perr != nil {
+				skip("bad mode in journal")
+				continue
+			}
+			if !act() {
+				continue
+			}
+			err = os.Chmod(field(0), os.FileMode(mode))
 
 		case journal.OpLost:
 			if dir == Undo {

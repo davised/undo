@@ -123,5 +123,35 @@ out=$("$UNDO" diff)
 grep -q -- "-alpha" <<<"$out" || fail "diff missing removed line"
 grep -q -- "+beta" <<<"$out" || fail "diff missing added line"
 
+echo "== case 13: chmod is journaled and reversible"
+chmod 644 "$PLAY/d.txt"
+run_armed "chmod 600 $PLAY/d.txt"
+[[ $(stat -c %a "$PLAY/d.txt") == 600 ]] || fail "chmod did not run"
+"$UNDO" -y
+[[ $(stat -c %a "$PLAY/d.txt") == 644 ]] || fail "mode not restored"
+"$UNDO" redo -y
+[[ $(stat -c %a "$PLAY/d.txt") == 600 ]] || fail "mode redo failed"
+
+echo "== case 14: refuses to undo a session whose command may be running"
+run_armed "rm $PLAY/f2.txt"
+last=$(ls "$UNDO_DATA_DIR/sessions" | sort | tail -1)
+echo $$ >"$UNDO_DATA_DIR/sessions/$last/pid"
+rm -f "$UNDO_DATA_DIR/sessions/$last/done"
+out=$("$UNDO" -y 2>&1 || true)
+grep -q "still be running" <<<"$out" || fail "live session not refused"
+[[ ! -e $PLAY/f2.txt ]] || fail "live session was restored anyway"
+touch "$UNDO_DATA_DIR/sessions/$last/done"
+"$UNDO" -y
+[[ -e $PLAY/f2.txt ]] || fail "undo failed after done marker"
+
+echo "== case 15: gc removes empty sessions, purge empties the store"
+mkdir -p "$UNDO_DATA_DIR/sessions/1111111111111111/data"
+"$UNDO" gc | grep -q "removed" || fail "gc did not report"
+[[ ! -d $UNDO_DATA_DIR/sessions/1111111111111111 ]] || fail "empty session survived gc"
+"$UNDO" purge -y >/dev/null
+[[ -z $(ls "$UNDO_DATA_DIR/sessions" 2>/dev/null) ]] || fail "purge left sessions"
+out=$("$UNDO" -y 2>&1 || true)
+grep -q "nothing to undo" <<<"$out" || fail "store not empty after purge"
+
 echo
 echo "all cases passed"

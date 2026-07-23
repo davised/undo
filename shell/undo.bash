@@ -4,9 +4,22 @@
 
 [[ -n ${EPOCHREALTIME-} ]] || return 0
 : "${UNDO_DATA_DIR:=${XDG_DATA_HOME:-$HOME/.local/share}/undo}"
-: "${UNDO_LIB:=$HOME/.local/lib/undo/libundo.so}"
 : "${UNDO_KEEP:=30}"
-[[ -r $UNDO_LIB ]] || return 0
+
+if [[ -z ${UNDO_LIB-} ]]; then
+    _undo_bin=$(command -v undo 2>/dev/null)
+    for _undo_l in "$HOME/.local/lib/undo/libundo.so" \
+        ${_undo_bin:+"${_undo_bin%/*}/../lib/undo/libundo.so"} \
+        /usr/local/lib/undo/libundo.so /usr/lib/undo/libundo.so; do
+        [[ -r $_undo_l ]] && { UNDO_LIB=$_undo_l; break; }
+    done
+    unset _undo_bin _undo_l
+fi
+[[ -r ${UNDO_LIB-} ]] || return 0
+
+# backups may hold copies of sensitive files: keep the store private
+mkdir -p -- "$UNDO_DATA_DIR/sessions" 2>/dev/null
+chmod 700 -- "$UNDO_DATA_DIR" "$UNDO_DATA_DIR/sessions" 2>/dev/null
 
 _undo_at_prompt=1
 
@@ -19,7 +32,8 @@ _undo_preexec() {
     local id=${EPOCHREALTIME/./}
     local dir=$UNDO_DATA_DIR/sessions/$id
     mkdir -p "$dir/data" 2>/dev/null || return 0
-    printf '%s\n' "$cmd" >"$dir/cmd"
+    printf '%s\n' "$cmd" >| "$dir/cmd"
+    printf '%s\n' "$$" >| "$dir/pid"
 
     _undo_session=$dir
     export UNDO_SESSION=$dir
@@ -38,9 +52,14 @@ _undo_precmd() {
     elif [[ -n ${_undo_saved_preload-} ]]; then
         export LD_PRELOAD=$_undo_saved_preload
     fi
+    : >| "$_undo_session/done"
     unset _undo_saved_preload _undo_session
 
-    # drop empty sessions, then prune the oldest beyond UNDO_KEEP
+    if command -v undo >/dev/null 2>&1; then
+        command undo gc --auto 2>/dev/null
+        return 0
+    fi
+    # fallback: drop empty sessions, prune the oldest beyond UNDO_KEEP
     local d
     for d in "$UNDO_DATA_DIR"/sessions/*/; do
         [[ -d $d ]] || continue

@@ -4,10 +4,23 @@
 zmodload zsh/datetime 2>/dev/null
 
 : ${UNDO_DATA_DIR:=${XDG_DATA_HOME:-$HOME/.local/share}/undo}
-: ${UNDO_LIB:=$HOME/.local/lib/undo/libundo.so}
 : ${UNDO_KEEP:=30}
 
-[[ -r $UNDO_LIB ]] || return 0
+# locate the shim: explicit override, user install, next to the undo
+# binary (homebrew), then system paths
+if [[ -z ${UNDO_LIB-} ]]; then
+    for _undo_l in $HOME/.local/lib/undo/libundo.so \
+        ${commands[undo]:+${commands[undo]:h}/../lib/undo/libundo.so} \
+        /usr/local/lib/undo/libundo.so /usr/lib/undo/libundo.so; do
+        [[ -r $_undo_l ]] && { typeset -g UNDO_LIB=$_undo_l; break }
+    done
+    unset _undo_l
+fi
+[[ -r ${UNDO_LIB-} ]] || return 0
+
+# backups may hold copies of sensitive files: keep the store private
+command mkdir -p -- $UNDO_DATA_DIR/sessions 2>/dev/null
+command chmod 700 -- $UNDO_DATA_DIR $UNDO_DATA_DIR/sessions 2>/dev/null
 
 # Optional: re-exec zsh with the shim preloaded so redirections done by the
 # shell itself (echo x > file) are captured too. Set UNDO_CAPTURE_SHELL=1
@@ -26,7 +39,8 @@ _undo_preexec() {
     local id=${EPOCHREALTIME/./}    # sortable: seconds + microseconds
     local dir=$UNDO_DATA_DIR/sessions/$id
     command mkdir -p -- $dir/data 2>/dev/null || return 0
-    print -r -- $1 > $dir/cmd
+    print -r -- $1 >| $dir/cmd
+    print -r -- $$ >| $dir/pid
 
     typeset -g _undo_session=$dir
     export UNDO_SESSION=$dir
@@ -45,20 +59,24 @@ _undo_precmd() {
         export LD_PRELOAD=$_undo_saved_preload
     fi
     unset _undo_saved_preload
-
+    : >| $_undo_session/done
     unset _undo_session
 
-    # drop sessions whose command changed nothing (no journal written),
-    # and keep only the newest UNDO_KEEP real ones
-    local -a sessions
-    sessions=($UNDO_DATA_DIR/sessions/*(N/On))
-    local d
-    local -i n=0
-    for d in $sessions; do
-        if [[ ! -s $d/journal ]] || (( ++n > UNDO_KEEP )); then
-            command rm -rf -- $d
-        fi
-    done
+    # prune: the CLI enforces count and size budgets; fall back to a
+    # count-only prune when undo is not in PATH
+    if (( $+commands[undo] )); then
+        command undo gc --auto 2>/dev/null
+    else
+        local -a sessions
+        sessions=($UNDO_DATA_DIR/sessions/*(N/On))
+        local d
+        local -i n=0
+        for d in $sessions; do
+            if [[ ! -s $d/journal ]] || (( ++n > UNDO_KEEP )); then
+                command rm -rf -- $d
+            fi
+        done
+    fi
 }
 
 autoload -Uz add-zsh-hook
