@@ -250,13 +250,120 @@ static int save_file(const char *abs, int need_copy, char *bak)
     return -1;
 }
 
+/* ---------- ignore rules ---------- */
+
+/* true if `seg` appears in `abs` as a whole path component */
+static int seg_match(const char *abs, const char *seg, size_t seglen)
+{
+    const char *p = abs;
+    while ((p = strstr(p, seg)) != NULL) {
+        char before = (p == abs) ? '/' : p[-1];
+        char after = p[seglen];
+        if (before == '/' && (after == '/' || after == '\0'))
+            return 1;
+        p += seglen;
+    }
+    return 0;
+}
+
+/* High-churn, always-regenerable trees. Skipped unless the user sets
+ * UNDO_DEFAULT_IGNORE=0. Keeps `undo list` and the store free of build
+ * noise (a compiler rewriting node_modules should not fill the store). */
+static const char *const default_ignores[] = {
+    "node_modules", ".cache", "__pycache__", ".git", NULL,
+};
+
+/* true if `abs` should not be journaled. Patterns come from
+ * UNDO_IGNORE (colon-separated): a leading-'/' pattern matches as an
+ * absolute path prefix, anything else matches as a path component. */
+static int ignored(const char *abs)
+{
+    static int loaded, use_default = 1;
+    static char patterns[8192];
+    if (!loaded) {
+        loaded = 1;
+        const char *env = getenv("UNDO_IGNORE");
+        snprintf(patterns, sizeof patterns, "%s", env ? env : "");
+        const char *nd = getenv("UNDO_DEFAULT_IGNORE");
+        if (nd && (nd[0] == '0' || nd[0] == 'n' || nd[0] == 'N'))
+            use_default = 0;
+    }
+
+    if (use_default)
+        for (int i = 0; default_ignores[i]; i++)
+            if (seg_match(abs, default_ignores[i], strlen(default_ignores[i])))
+                return 1;
+
+    for (const char *s = patterns; *s;) {
+        const char *end = strchr(s, ':');
+        size_t len = end ? (size_t)(end - s) : strlen(s);
+        if (len > 0 && len < PATH_MAX) {
+            char pat[PATH_MAX];
+            memcpy(pat, s, len);
+            pat[len] = 0;
+            if (pat[0] == '/') {
+                if (strncmp(abs, pat, len) == 0 &&
+                    (abs[len] == '/' || abs[len] == '\0'))
+                    return 1;
+            } else if (seg_match(abs, pat, len)) {
+                return 1;
+            }
+        }
+        if (!end)
+            break;
+        s = end + 1;
+    }
+    return 0;
+}
+
+/* ---------- dedup of repeated in-place writes ---------- */
+
+/* A build that rewrites the same file many times in one command would
+ * otherwise save one backup per write. Only the first (pre-command)
+ * backup is needed to restore, so we record which paths have been saved
+ * and skip the rest. Best-effort: once the table fills we stop deduping,
+ * which only costs extra backups, never a missed one. */
+#define DEDUP_CAP 16384
+static char *dedup_tab[DEDUP_CAP];
+static int dedup_count;
+
+static unsigned long path_hash(const char *s)
+{
+    unsigned long h = 1469598103934665603UL;
+    for (; *s; s++) {
+        h ^= (unsigned char)*s;
+        h *= 1099511628211UL;
+    }
+    return h;
+}
+
+/* returns 1 if `abs` was already saved this command (skip it); otherwise
+ * records it and returns 0. */
+static int mod_seen(const char *abs)
+{
+    if (dedup_count * 4 >= DEDUP_CAP * 3)
+        return 0; /* table nearly full: stop deduping, keep saving */
+    unsigned long i = path_hash(abs) & (DEDUP_CAP - 1);
+    while (dedup_tab[i]) {
+        if (strcmp(dedup_tab[i], abs) == 0)
+            return 1;
+        i = (i + 1) & (DEDUP_CAP - 1);
+    }
+    char *dup = strdup(abs);
+    if (!dup)
+        return 0; /* out of memory: save anyway */
+    dedup_tab[i] = dup;
+    dedup_count++;
+    return 0;
+}
+
 /* ---------- operation handlers ---------- */
 
 static void handle_unlink_pre(int dirfd, const char *path, char *abs,
                               char *bak, char *lnk, int *kind)
 {
     *kind = 0;
-    if (abs_path(dirfd, path, abs) != 0)
+    if (abs_path(dirfd, path, abs) != 0 || ignored(abs))
         return;
     struct stat st;
     if (lstat(abs, &st) != 0)
@@ -296,7 +403,7 @@ static void handle_rmdir_pre(int dirfd, const char *path, char *abs,
                              char *mode, int *ok)
 {
     *ok = 0;
-    if (abs_path(dirfd, path, abs) != 0)
+    if (abs_path(dirfd, path, abs) != 0 || ignored(abs))
         return;
     struct stat st;
     if (lstat(abs, &st) != 0 || !S_ISDIR(st.st_mode))
@@ -315,7 +422,7 @@ static void handle_open_pre(int dirfd, const char *path, int flags,
     int writes = (flags & (O_WRONLY | O_RDWR)) != 0;
     if (!writes && !(flags & O_CREAT))
         return;
-    if (abs_path(dirfd, path, abs) != 0)
+    if (abs_path(dirfd, path, abs) != 0 || ignored(abs))
         return;
     struct stat st;
     if (lstat(abs, &st) == 0 && S_ISLNK(st.st_mode)) {
@@ -328,6 +435,8 @@ static void handle_open_pre(int dirfd, const char *path, int flags,
     }
     if (lstat(abs, &st) == 0) {
         if (writes && S_ISREG(st.st_mode)) {
+            if (mod_seen(abs))
+                return; /* already backed up earlier this command */
             if (save_file(abs, 1, bak) == 0)
                 *kind = 1;
             else
@@ -361,6 +470,10 @@ static void handle_rename_pre(int olddirfd, const char *oldp, int newdirfd,
     *kind = 0;
     if (abs_path(olddirfd, oldp, absold) != 0 ||
         abs_path(newdirfd, newp, absnew) != 0)
+        return;
+    /* skip only when the move stays entirely inside ignored trees; a
+     * move that rescues a file out of one must stay recoverable */
+    if (ignored(absold) && ignored(absnew))
         return;
     if (flags & RENAME_EXCHANGE) {
         *kind = 3;
@@ -535,7 +648,7 @@ int mkdir(const char *path, mode_t mode)
     if (rc == 0 && armed()) {
         in_shim = 1;
         char abs[PATH_MAX];
-        if (abs_path(AT_FDCWD, path, abs) == 0)
+        if (abs_path(AT_FDCWD, path, abs) == 0 && !ignored(abs))
             jwrite("mkdir", abs, NULL);
         in_shim = 0;
     }
@@ -549,7 +662,7 @@ int mkdirat(int dirfd, const char *path, mode_t mode)
     if (rc == 0 && armed()) {
         in_shim = 1;
         char abs[PATH_MAX];
-        if (abs_path(dirfd, path, abs) == 0)
+        if (abs_path(dirfd, path, abs) == 0 && !ignored(abs))
             jwrite("mkdir", abs, NULL);
         in_shim = 0;
     }
@@ -563,7 +676,7 @@ int symlink(const char *target, const char *linkpath)
     if (rc == 0 && armed()) {
         in_shim = 1;
         char abs[PATH_MAX];
-        if (abs_path(AT_FDCWD, linkpath, abs) == 0)
+        if (abs_path(AT_FDCWD, linkpath, abs) == 0 && !ignored(abs))
             jwrite("create", abs, NULL);
         in_shim = 0;
     }
@@ -577,7 +690,7 @@ int symlinkat(const char *target, int dirfd, const char *linkpath)
     if (rc == 0 && armed()) {
         in_shim = 1;
         char abs[PATH_MAX];
-        if (abs_path(dirfd, linkpath, abs) == 0)
+        if (abs_path(dirfd, linkpath, abs) == 0 && !ignored(abs))
             jwrite("create", abs, NULL);
         in_shim = 0;
     }
@@ -591,7 +704,7 @@ int link(const char *oldp, const char *newp)
     if (rc == 0 && armed()) {
         in_shim = 1;
         char abs[PATH_MAX];
-        if (abs_path(AT_FDCWD, newp, abs) == 0)
+        if (abs_path(AT_FDCWD, newp, abs) == 0 && !ignored(abs))
             jwrite("create", abs, NULL);
         in_shim = 0;
     }
@@ -606,7 +719,7 @@ int linkat(int olddirfd, const char *oldp, int newdirfd, const char *newp,
     if (rc == 0 && armed()) {
         in_shim = 1;
         char abs[PATH_MAX];
-        if (abs_path(newdirfd, newp, abs) == 0)
+        if (abs_path(newdirfd, newp, abs) == 0 && !ignored(abs))
             jwrite("create", abs, NULL);
         in_shim = 0;
     }
@@ -618,7 +731,7 @@ static void chmod_pre(int dirfd, const char *path, char *abs, char *oldmode,
 {
     *ok = 0;
     struct stat st;
-    if (abs_path(dirfd, path, abs) != 0)
+    if (abs_path(dirfd, path, abs) != 0 || ignored(abs))
         return;
     if (stat(abs, &st) != 0)
         return;
@@ -680,8 +793,8 @@ int truncate(const char *path, off_t length)
     char abs[PATH_MAX], bak[PATH_MAX];
     int have = 0;
     struct stat st;
-    if (abs_path(AT_FDCWD, path, abs) == 0 && lstat(abs, &st) == 0 &&
-        S_ISREG(st.st_mode))
+    if (abs_path(AT_FDCWD, path, abs) == 0 && !ignored(abs) &&
+        lstat(abs, &st) == 0 && S_ISREG(st.st_mode) && !mod_seen(abs))
         have = save_file(abs, 1, bak) == 0;
     in_shim = 0;
     int rc = real_truncate(path, length);
