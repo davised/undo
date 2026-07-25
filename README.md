@@ -8,18 +8,7 @@
 
 Website: [undo.edaywalid.com](https://undo.edaywalid.com)
 
-```console
-$ rm -rf thesis/
-$ undo
-$ rm -rf thesis/  (14:02:11, 4 changes)
-  deleted   thesis/draft.md
-  deleted   thesis/refs.bib
-  deleted   thesis/notes/
-  deleted   thesis/
-
-revert this? [y/N] y
-restored 4 change(s)
-```
+![undo reverting an accidental rm -rf](assets/demo.gif)
 
 Works for the classic mistakes: `rm` / `rm -rf`, `mv` over a file you
 needed, truncating with `>`, an accidental `chmod -R`, files and
