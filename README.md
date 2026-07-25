@@ -37,17 +37,17 @@ that actually changed something. The last 30 are kept.
 
 ## Install
 
-From the tap:
+Pick your channel:
 
-```
-brew install edaywalid/tap/undo
-```
-
-Or from source:
-
-```
-make install          # installs to ~/.local
-```
+| Channel | Command |
+| --- | --- |
+| Homebrew (Linux) | `brew install edaywalid/tap/undo` |
+| Debian / Ubuntu | `.deb` from [releases](https://github.com/edaywalid/undo/releases), `sudo dpkg -i undo_*.deb` |
+| Fedora / openSUSE | `.rpm` from [releases](https://github.com/edaywalid/undo/releases), `sudo rpm -i undo_*.rpm` |
+| Arch | `.pkg.tar.zst` from [releases](https://github.com/edaywalid/undo/releases), `sudo pacman -U` (AUR: `undo-cli`, pending) |
+| Nix | `nix run github:edaywalid/undo` (flake, experimental) |
+| Any distro, no root | `curl -fsSL https://raw.githubusercontent.com/edaywalid/undo/main/install.sh \| sh` |
+| From source | `make install` (needs gcc + go, installs to ~/.local) |
 
 Then add the hook for your shell:
 
@@ -57,13 +57,31 @@ bash:  echo 'source ~/.local/share/undo/undo.bash' >> ~/.bashrc   # bash >= 5
 fish:  echo 'source ~/.local/share/undo/undo.fish' >> ~/.config/fish/config.fish
 ```
 
+Package installs put the hooks in `/usr/share/undo/` instead of
+`~/.local/share/undo/`.
+
 No hook, or a script/CI context? Arm a single command instead:
 
 ```
 undo run -- ./sketchy-cleanup.sh
 ```
 
-Requires: Linux, gcc, go. The fish hook is currently untested.
+## Platform support
+
+- **Linux, amd64 and arm64.** Any glibc distro: Debian, Ubuntu, Fedora,
+  Arch, openSUSE, and friends. WSL2 counts, it is Linux.
+- **Alpine / musl**: build from source (`make install`, CI-tested). The
+  prebuilt shim in releases targets glibc.
+- **Shells**: zsh, bash 5+, fish 3.4+ for the automatic hook. Any shell
+  works with `undo run`.
+- **macOS**: not supported. The mechanism is Linux LD_PRELOAD plus
+  /proc; on macOS, SIP blocks library injection into system binaries,
+  so a port would not be able to cover `rm` and friends.
+- **Windows**: not supported natively. Use it inside WSL2.
+- **Snap / Flatpak**: never. Sandboxes and an LD_PRELOAD hook are
+  architecturally incompatible; use a package or the installer.
+
+The fish hook is currently untested.
 
 ## Usage
 
