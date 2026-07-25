@@ -27,6 +27,14 @@ test -r "$UNDO_LIB"; or return
 command mkdir -p $UNDO_DATA_DIR/sessions 2>/dev/null
 command chmod 700 $UNDO_DATA_DIR $UNDO_DATA_DIR/sessions 2>/dev/null
 
+# extra ignore patterns from the config file, colon-joined for the shim.
+# The shim always ignores node_modules/.cache/__pycache__/.git on top.
+set -q UNDO_IGNORE_FILE; or set -g UNDO_IGNORE_FILE (set -q XDG_CONFIG_HOME; and echo $XDG_CONFIG_HOME; or echo $HOME/.config)/undo/ignore
+if not set -q UNDO_IGNORE; and test -r "$UNDO_IGNORE_FILE"
+    set -l pats (command grep -vE '^[[:space:]]*(#|$)' $UNDO_IGNORE_FILE 2>/dev/null)
+    test (count $pats) -gt 0; and set -gx UNDO_IGNORE (string join : $pats)
+end
+
 function _undo_preexec --on-event fish_preexec
     set -l cmd (string trim -- $argv[1])
     string match -q 'undo' -- $cmd; and return

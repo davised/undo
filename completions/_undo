@@ -11,6 +11,7 @@ _undo() {
         'run:run one command with the shim armed'
         'gc:prune old, empty, and oversized sessions'
         'purge:delete all stored sessions and backups'
+        'doctor:check the install and run a live self-test'
         'help:show usage'
     )
 

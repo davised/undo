@@ -21,6 +21,15 @@ fi
 mkdir -p -- "$UNDO_DATA_DIR/sessions" 2>/dev/null
 chmod 700 -- "$UNDO_DATA_DIR" "$UNDO_DATA_DIR/sessions" 2>/dev/null
 
+# extra ignore patterns from the config file, colon-joined for the shim.
+# The shim always ignores node_modules/.cache/__pycache__/.git on top.
+: "${UNDO_IGNORE_FILE:=${XDG_CONFIG_HOME:-$HOME/.config}/undo/ignore}"
+if [[ -z ${UNDO_IGNORE-} && -r $UNDO_IGNORE_FILE ]]; then
+    _undo_ig=$(grep -vE '^[[:space:]]*(#|$)' "$UNDO_IGNORE_FILE" 2>/dev/null | paste -sd: -)
+    [[ -n $_undo_ig ]] && export UNDO_IGNORE=$_undo_ig
+    unset _undo_ig
+fi
+
 _undo_at_prompt=1
 
 _undo_preexec() {

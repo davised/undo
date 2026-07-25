@@ -22,6 +22,16 @@ fi
 command mkdir -p -- $UNDO_DATA_DIR/sessions 2>/dev/null
 command chmod 700 -- $UNDO_DATA_DIR $UNDO_DATA_DIR/sessions 2>/dev/null
 
+# extra ignore patterns from the config file, colon-joined for the shim.
+# The shim always ignores node_modules/.cache/__pycache__/.git on top.
+: ${UNDO_IGNORE_FILE:=${XDG_CONFIG_HOME:-$HOME/.config}/undo/ignore}
+if [[ -z ${UNDO_IGNORE-} && -r $UNDO_IGNORE_FILE ]]; then
+    local -a _undo_pats
+    _undo_pats=(${(f)"$(command grep -vE '^[[:space:]]*(#|$)' $UNDO_IGNORE_FILE 2>/dev/null)"})
+    (( ${#_undo_pats} )) && export UNDO_IGNORE=${(j.:.)_undo_pats}
+    unset _undo_pats
+fi
+
 # Optional: re-exec zsh with the shim preloaded so redirections done by the
 # shell itself (echo x > file) are captured too. Set UNDO_CAPTURE_SHELL=1
 # before sourcing. Without it, only child processes are covered.

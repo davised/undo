@@ -1,0 +1,27 @@
+# undo ignore patterns. Copy to ~/.config/undo/ignore and edit.
+# One pattern per line. Blank lines and # comments are ignored.
+#
+# Two kinds of pattern:
+#   name        matches any path component (e.g. "target" ignores
+#               anything under a directory named target, at any depth)
+#   /abs/path   matches that absolute path and everything under it
+#
+# The shim ALWAYS ignores these on top of your list, unless you set
+# UNDO_DEFAULT_IGNORE=0:  node_modules  .cache  __pycache__  .git
+
+# Rust / Go / Java build output
+target
+build
+
+# Python
+.venv
+.mypy_cache
+.pytest_cache
+
+# JS/TS
+dist
+.next
+.turbo
+
+# a specific directory tree, by absolute path
+# /home/you/big-scratch-area
