@@ -1,12 +1,17 @@
 # Changelog
 
-## Unreleased
+## v0.2.0 - 2026-07-25
 
 - Ignore rules: the shim skips `node_modules`, `.cache`, `__pycache__`,
   and `.git` by default, plus patterns from `~/.config/undo/ignore` or
   `UNDO_IGNORE`. Keeps build noise out of `undo list` and the store.
+- Dedup: repeated in-place writes to the same file within one command
+  now keep a single pre-command backup instead of one per write.
 - `undo doctor`: checks the shim, libc, store, ignore config, and hooks,
   then runs a live capture/restore self-test on a canary file.
+- More packaging channels: curl installer, AUR PKGBUILDs, nix flake.
+- Unit tests for the restore engine; e2e coverage for ignore, dedup,
+  and doctor.
 
 ## v0.1.0 - 2026-07-23
 
