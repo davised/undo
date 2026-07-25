@@ -3,3 +3,6 @@ build/
 dist/
 *.so
 *.o
+
+# internal, not distributed
+PRD.md
