@@ -38,6 +38,26 @@ func findShim() string {
 	return ""
 }
 
+// armedEnv returns base with the shim preloaded and the session pointed
+// at dir, prepending libundo.so to any existing LD_PRELOAD.
+func armedEnv(base []string, shim, dir string) []string {
+	preload := shim
+	env := make([]string, 0, len(base)+2)
+	for _, kv := range base {
+		if v, ok := strings.CutPrefix(kv, "LD_PRELOAD="); ok {
+			if v != "" {
+				preload = shim + ":" + v
+			}
+			continue
+		}
+		if strings.HasPrefix(kv, "UNDO_SESSION=") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	return append(env, "UNDO_SESSION="+dir, "LD_PRELOAD="+preload)
+}
+
 // cmdRun executes one command with the shim armed, no shell hook needed.
 func cmdRun(argv []string) {
 	if len(argv) > 0 && argv[0] == "--" {
@@ -56,25 +76,9 @@ func cmdRun(argv []string) {
 		fatal(err)
 	}
 
-	preload := shim
-	env := make([]string, 0, len(os.Environ())+2)
-	for _, kv := range os.Environ() {
-		if strings.HasPrefix(kv, "LD_PRELOAD=") {
-			if v := strings.TrimPrefix(kv, "LD_PRELOAD="); v != "" {
-				preload = shim + ":" + v
-			}
-			continue
-		}
-		if strings.HasPrefix(kv, "UNDO_SESSION=") {
-			continue
-		}
-		env = append(env, kv)
-	}
-	env = append(env, "UNDO_SESSION="+s.Dir, "LD_PRELOAD="+preload)
-
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	cmd.Env = env
+	cmd.Env = armedEnv(os.Environ(), shim, s.Dir)
 
 	runErr := cmd.Run()
 	s.MarkDone()

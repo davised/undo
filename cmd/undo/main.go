@@ -29,6 +29,7 @@ usage:
   undo show [id]          show what a session changed
   undo gc                 prune old, empty, and oversized sessions
   undo purge              delete all stored sessions and backups
+  undo doctor             check the install and run a live self-test
 
 flags:
   -n, --dry-run   show what would happen without doing it
@@ -295,6 +296,8 @@ func main() {
 		cmdGC(len(args) > 1 && args[1] == "--auto")
 	case "purge":
 		cmdPurge(yes, opts.Force)
+	case "doctor":
+		cmdDoctor()
 	case "diff":
 		cmdDiff(args[1:])
 	case "apply":

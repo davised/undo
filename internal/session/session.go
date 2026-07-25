@@ -259,14 +259,19 @@ func (s *Session) Remove() error {
 
 // MarkUndone records that a session was reverted.
 func (s *Session) MarkUndone() error {
-	return os.WriteFile(filepath.Join(s.Dir, "undone"), nil, 0o644)
+	if err := os.WriteFile(filepath.Join(s.Dir, "undone"), nil, 0o644); err != nil {
+		return err
+	}
+	s.Undone = true
+	return nil
 }
 
 // ClearUndone flips a session back to the applied state after a redo.
 func (s *Session) ClearUndone() error {
 	err := os.Remove(filepath.Join(s.Dir, "undone"))
-	if os.IsNotExist(err) {
-		return nil
+	if err != nil && !os.IsNotExist(err) {
+		return err
 	}
-	return err
+	s.Undone = false
+	return nil
 }
