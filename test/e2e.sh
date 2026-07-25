@@ -153,5 +153,41 @@ mkdir -p "$UNDO_DATA_DIR/sessions/1111111111111111/data"
 out=$("$UNDO" -y 2>&1 || true)
 grep -q "nothing to undo" <<<"$out" || fail "store not empty after purge"
 
+echo "== case 16: default ignores skip build noise, real files still tracked"
+mkdir -p "$PLAY/node_modules/pkg" "$PLAY/.cache" "$PLAY/src"
+echo junk >"$PLAY/node_modules/pkg/i.js"
+echo blob >"$PLAY/.cache/x"
+echo real >"$PLAY/src/keep.c"
+run_armed "rm $PLAY/node_modules/pkg/i.js $PLAY/.cache/x $PLAY/src/keep.c"
+last=$(ls "$UNDO_DATA_DIR/sessions" | sort | tail -1)
+j="$UNDO_DATA_DIR/sessions/$last/journal"
+[[ $(grep -c . "$j") == 1 ]] || fail "expected 1 journal entry, got $(grep -c . "$j")"
+grep -q "src/keep.c" "$j" || fail "real file not journaled"
+grep -q "node_modules\|.cache/x" "$j" && fail "ignored path was journaled"
+"$UNDO" -y >/dev/null
+[[ -e $PLAY/src/keep.c ]] || fail "real file not restored"
+
+echo "== case 17: UNDO_IGNORE adds custom patterns"
+echo data >"$PLAY/scratch.tmp"
+id=$(date +%s%N | cut -c1-16); sess="$UNDO_DATA_DIR/sessions/$id"
+mkdir -p "$sess/data"; echo "rm scratch" >"$sess/cmd"
+env UNDO_IGNORE="scratch.tmp" UNDO_SESSION="$sess" LD_PRELOAD="$LIB" bash -c "rm $PLAY/scratch.tmp"
+[[ ! -s $sess/journal ]] || fail "custom UNDO_IGNORE pattern was not honored"
+
+echo "== case 18: repeated writes to one file keep a single backup"
+echo original >"$PLAY/churn.txt"
+run_armed "for i in 1 2 3 4 5; do echo edit\$i > $PLAY/churn.txt; done"
+last=$(ls "$UNDO_DATA_DIR/sessions" | sort | tail -1)
+sd="$UNDO_DATA_DIR/sessions/$last"
+[[ $(grep -c "churn.txt" "$sd/journal") == 1 ]] || fail "expected 1 mod entry, got $(grep -c churn.txt "$sd/journal")"
+[[ $(ls "$sd/data" | wc -l) == 1 ]] || fail "expected 1 backup, got $(ls "$sd/data" | wc -l)"
+"$UNDO" -y >/dev/null
+[[ $(cat "$PLAY/churn.txt") == original ]] || fail "dedup broke restore, got $(cat "$PLAY/churn.txt")"
+
+echo "== case 19: undo doctor passes its live self-test"
+out=$("$UNDO" doctor 2>&1) || fail "doctor exited non-zero: $out"
+grep -q "\[ok  \] capture" <<<"$out" || fail "doctor capture check did not pass"
+grep -q "\[ok  \] restore" <<<"$out" || fail "doctor restore check did not pass"
+
 echo
 echo "all cases passed"

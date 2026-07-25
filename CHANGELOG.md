@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Ignore rules: the shim skips `node_modules`, `.cache`, `__pycache__`,
+  and `.git` by default, plus patterns from `~/.config/undo/ignore` or
+  `UNDO_IGNORE`. Keeps build noise out of `undo list` and the store.
+- `undo doctor`: checks the shim, libc, store, ignore config, and hooks,
+  then runs a live capture/restore self-test on a canary file.
+
 ## v0.1.0 - 2026-07-23
 
 Initial release.

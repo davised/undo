@@ -96,7 +96,29 @@ undo show [id]    what a session changed
 undo apply <id>   revert a specific session
 undo gc           prune old, empty, and oversized sessions
 undo purge        delete all stored sessions and backups
+undo doctor       check the install and run a live capture/restore test
 ```
+
+If nothing seems to happen after installing, run `undo doctor`: it
+locates the shim, checks the store, and deletes then restores a canary
+file end to end, so you get a concrete diagnosis instead of silence.
+
+## Ignoring build noise
+
+A command that rewrites thousands of files (a package install, a build)
+would otherwise fill `undo list` and the backup store with churn you will
+never want to revert. The shim always skips `node_modules`, `.cache`,
+`__pycache__`, and `.git`. Add your own patterns in
+`~/.config/undo/ignore` (see `examples/ignore`):
+
+```
+target        # any directory component named target, at any depth
+dist
+/home/you/scratch   # an absolute path and everything under it
+```
+
+Set `UNDO_DEFAULT_IGNORE=0` to turn off the built-ins, or `UNDO_IGNORE`
+to a colon-separated list to override the config file.
 
 Flags: `-n` dry run, `-y` skip confirmation, `--force` overwrite files
 that changed again after the session.
