@@ -104,7 +104,6 @@ func detectLibc() (musl bool, note string) {
 }
 
 func reportStore(report func(checkState, string, string), root string) {
-	base := filepath.Dir(root)
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		report(failed, "store", err.Error())
 		return
@@ -117,9 +116,14 @@ func reportStore(report func(checkState, string, string), root string) {
 	}
 	os.Remove(probe)
 
-	if fi, err := os.Stat(base); err == nil && fi.Mode().Perm() != 0o700 {
-		report(warn, "store", fmt.Sprintf("%s is mode %o, want 700", base, fi.Mode().Perm()))
-		return
+	// Only the sessions dir holds backups, so it is the one that must be
+	// private. Its parent also holds the hook scripts and is world-readable
+	// by design in both package and installer layouts.
+	if fi, err := os.Stat(root); err == nil && fi.Mode().Perm() != 0o700 {
+		if err := os.Chmod(root, 0o700); err != nil {
+			report(warn, "store", fmt.Sprintf("%s is mode %o, want 700", root, fi.Mode().Perm()))
+			return
+		}
 	}
 	report(pass, "store", root)
 }
