@@ -13,7 +13,7 @@ optdepends=('zsh: zsh hook' 'bash: bash hook' 'fish: fish hook')
 provides=('undo-cli')
 conflicts=('undo-cli-bin')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('85eeb598847771743b7892d96476d9e085d52c306e69bd43e0ccc404aba2cd99')
+sha256sums=('84a284efd6039b3800bf5148853bd887f51983719047aa18a3b1af4c678e7c59')
 
 build() {
     cd "undo-$pkgver"
