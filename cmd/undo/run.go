@@ -40,13 +40,25 @@ func findShim() string {
 
 // armedEnv returns base with the shim preloaded and the session pointed
 // at dir, prepending libundo.so to any existing LD_PRELOAD.
+//
+// Any libundo.so already in LD_PRELOAD is dropped first. A shell with the
+// hook installed already has one, and loading two copies makes both
+// intercept every call: duplicate journal entries, and each copy records
+// the other's backup writes as if they were the user's.
 func armedEnv(base []string, shim, dir string) []string {
-	preload := shim
 	env := make([]string, 0, len(base)+2)
+	preload := shim
 	for _, kv := range base {
 		if v, ok := strings.CutPrefix(kv, "LD_PRELOAD="); ok {
-			if v != "" {
-				preload = shim + ":" + v
+			var keep []string
+			for _, p := range strings.Split(v, ":") {
+				if p == "" || isUndoShim(p) {
+					continue
+				}
+				keep = append(keep, p)
+			}
+			if len(keep) > 0 {
+				preload = shim + ":" + strings.Join(keep, ":")
 			}
 			continue
 		}
@@ -56,6 +68,12 @@ func armedEnv(base []string, shim, dir string) []string {
 		env = append(env, kv)
 	}
 	return append(env, "UNDO_SESSION="+dir, "LD_PRELOAD="+preload)
+}
+
+// isUndoShim reports whether an LD_PRELOAD entry is one of our shims,
+// under any install prefix.
+func isUndoShim(path string) bool {
+	return filepath.Base(path) == "libundo.so"
 }
 
 // cmdRun executes one command with the shim armed, no shell hook needed.
