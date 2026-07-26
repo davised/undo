@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # weekly, so a broken published installer surfaces without a user report
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
 
 jobs:
   test:
@@ -37,3 +41,48 @@ jobs:
         run: apk add --no-cache bash build-base go coreutils diffutils make git
       - name: build and test
         run: make test
+
+  # A shim built on a new glibc records symbol versions that older distros
+  # do not have, and silently refuses to load there. This catches that at
+  # PR time instead of from a user's bug report.
+  glibc-floor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build shim and check its glibc floor
+        run: |
+          mkdir -p build
+          gcc -shared -fPIC -O2 -Wall -o build/libundo.so shim/undo_shim.c -ldl
+          max=$(objdump -T build/libundo.so | grep -o 'GLIBC_[0-9.]*' | sort -u -V | tail -1)
+          echo "highest glibc symbol required: $max"
+          # even built on a modern runner, nothing newer than 2.34 (dlsym)
+          # should appear; 2.38 means a C23 symbol crept back in
+          case "$max" in
+            GLIBC_2.[0-9]|GLIBC_2.[12][0-9]|GLIBC_2.3[0-4]) ;;
+            *) echo "::error::shim requires $max, breaks Debian 12 / Ubuntu 22.04 / RHEL 9"; exit 1 ;;
+          esac
+
+  # Proves the advertised curl | sh actually works on real distros, using
+  # the published release. Scheduled so a bad release surfaces on its own.
+  installer:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['debian:12', 'ubuntu:22.04', 'fedora:40']
+    container: ${{ matrix.image }}
+    steps:
+      - name: deps
+        run: |
+          if command -v apt-get >/dev/null; then
+            apt-get update -qq && apt-get install -y -qq curl ca-certificates
+          else
+            dnf install -y -q curl tar findutils
+          fi
+      - name: install from the public one-liner
+        run: curl -fsSL https://undo.edaywalid.com/install.sh | sh
+      - name: it actually runs and can restore a file
+        run: |
+          ~/.local/bin/undo --version
+          ~/.local/bin/undo doctor
