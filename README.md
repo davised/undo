@@ -113,8 +113,14 @@ canary file, so you get a real answer rather than a guess. Then try it
 for yourself:
 
 ```console
-$ touch x && rm x && undo
+$ touch x
+$ rm x
+$ undo
 ```
+
+Run `undo` on its own line, not chained with `&&`. A chained line is a
+single command to the shell, so `undo` would be running inside the very
+session it is being asked to revert, before that command has finished.
 
 No hook, or a script / CI context? Arm a single command instead, no
 setup required:

@@ -51,7 +51,19 @@ function _undo_preexec --on-event fish_preexec
     if not string match -q "*:$UNDO_LIB:*" ":$LD_PRELOAD:"
         if set -q LD_PRELOAD
             set -g _undo_saved_preload $LD_PRELOAD
-            set -gx LD_PRELOAD "$UNDO_LIB:$LD_PRELOAD"
+            # drop any other libundo.so first: two loaded copies both
+            # intercept, duplicating entries and recording each other
+            set -l keep
+            for p in (string split : -- $LD_PRELOAD)
+                test -z "$p"; and continue
+                string match -q '*libundo.so' -- $p; and continue
+                set -a keep $p
+            end
+            if test (count $keep) -gt 0
+                set -gx LD_PRELOAD "$UNDO_LIB:"(string join : $keep)
+            else
+                set -gx LD_PRELOAD $UNDO_LIB
+            end
         else
             set -g _undo_saved_preload __undo_unset__
             set -gx LD_PRELOAD $UNDO_LIB

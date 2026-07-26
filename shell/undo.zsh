@@ -56,6 +56,12 @@ _undo_preexec() {
     export UNDO_SESSION=$dir
     if [[ ":${LD_PRELOAD-}:" != *":$UNDO_LIB:"* ]]; then
         typeset -g _undo_saved_preload=${LD_PRELOAD-__undo_unset__}
+        # drop any other libundo.so first: two loaded copies both intercept,
+        # duplicating journal entries and recording each other's backups
+        local -a _undo_pre
+        _undo_pre=(${(s.:.)LD_PRELOAD})
+        _undo_pre=(${_undo_pre:#*libundo.so})
+        export LD_PRELOAD=${(j.:.)${(@)_undo_pre}}
         export LD_PRELOAD=$UNDO_LIB${LD_PRELOAD:+:$LD_PRELOAD}
     fi
 }

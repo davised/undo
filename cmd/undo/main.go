@@ -212,6 +212,14 @@ func cmdApply(s *session.Session, dir restore.Direction, opts restore.Options, y
 		fatal(fmt.Errorf("session recorded no changes"))
 	}
 	if s.Live() && !opts.Force {
+		// chained like `rm x && undo`: the whole line is one session, so
+		// undo is running inside the very session it is being asked to
+		// revert, and the journal is not finished yet
+		if cur := os.Getenv("UNDO_SESSION"); cur != "" && cur == s.Dir {
+			fatal(fmt.Errorf("this is the command line you are running right now.\n" +
+				"undo works on finished commands, so run it on its own line:\n" +
+				"  rm x\n  undo"))
+		}
 		fatal(fmt.Errorf("the command may still be running (pid %d); --force to override", s.Pid))
 	}
 	if dir == restore.Undo && s.Undone {
