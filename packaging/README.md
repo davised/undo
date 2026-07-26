@@ -1,59 +1,62 @@
 # Packaging
 
-What ships where, and what each channel needs.
+What ships where, and who generates it.
 
-## Already automated (goreleaser, on every tag)
+## Automated on every tag
 
-- GitHub release archives (tar.gz, amd64 + arm64, shim included)
-- deb, rpm, pkg.tar.zst packages attached to the release
-- Homebrew formula pushed to edaywalid/homebrew-tap
+| Artifact | Produced by |
+| --- | --- |
+| tar.gz archives (amd64, arm64) | goreleaser |
+| deb, rpm, pkg.tar.zst | goreleaser (nfpms) |
+| Homebrew formula in edaywalid/homebrew-tap | goreleaser (`brews:`) |
+| **AUR `undo-cli-bin`** | goreleaser (`aurs:`) |
+| **AUR `undo-cli`** (source) | `packaging/aur/render.sh`, run by the release workflow |
 
-## AUR (this directory)
+Nothing here is hand-edited. That is deliberate: `pkgver` and the
+checksums used to be maintained by hand in two files and drifted apart,
+shipping a package whose sums did not match its version, which fails for
+every user who installs it.
 
-Two PKGBUILDs, both installing the binary as `undo`:
+## Secrets the release workflow expects
 
-- `undo-cli-bin`: repackages the release artifacts
-- `undo-cli`: builds from the release tarball
+| Secret | Used for | Without it |
+| --- | --- | --- |
+| `TAP_GITHUB_TOKEN` | pushing the Homebrew formula | formula step fails, release still publishes |
+| `AUR_KEY` | AUR SSH key (unencrypted private key, contents not path) | both AUR steps skip cleanly |
 
-The AUR names `undo` / `undo-bin` are occupied by an unrelated project
-(github.com/nvrmnd-png/undo) whose package provides "undo", hence the
-`undo-cli` base name.
+## Why two mechanisms for AUR
 
-To publish (needs an AUR account and the repo to be public):
+goreleaser's `aurs:` writes the binary package and takes its checksums
+directly from the archives it just built, so nothing can drift. Arch
+guidelines reserve the plain name for packages built from source, which
+is why it is `undo-cli-bin`.
 
+goreleaser cannot also produce the source package: configuring `aurs`
+and `aur_sources` together is a [known
+panic](https://goreleaser.com/customization/aursources/). So `undo-cli`
+is rendered by `render.sh` from `PKGBUILD.src.in`, hashing the release
+tarball itself, and verified before it is pushed.
+
+The AUR names `undo` and `undo-bin` were already taken by an unrelated
+project that declares `provides=(undo)`, hence the `undo-cli` base. The
+installed binary is still `undo`.
+
+## Doing it by hand
+
+```sh
+packaging/aur/render.sh v0.2.6      # writes packaging/aur/undo-cli/PKGBUILD
+cd packaging/aur/undo-cli && makepkg -f   # optional: build it locally first
 ```
-# fill sha256sums from the release checksums.txt first
-git clone ssh://aur@aur.archlinux.org/undo-cli-bin.git
-cp packaging/aur/undo-cli-bin/PKGBUILD undo-cli-bin/
-cd undo-cli-bin && makepkg --printsrcinfo > .SRCINFO
-git add PKGBUILD .SRCINFO && git commit -m "0.1.0" && git push
-```
 
-Same flow for `undo-cli`.
+Then copy `PKGBUILD` and `.SRCINFO` into a clone of
+`ssh://aur@aur.archlinux.org/undo-cli.git` and push.
 
-## Nix
+The generated `PKGBUILD` and `.SRCINFO` are gitignored. The template and
+the script are the sources of truth.
 
-`flake.nix` at the repo root; `nix run github:edaywalid/undo` once the
-repo is public. Untested until nix is available locally; treat as
-experimental. Upstreaming to nixpkgs is a follow-up once the tool has
-users.
+## Channels not covered
 
-## curl installer
-
-`install.sh` at the repo root: detects arch, downloads the latest
-release, installs to ~/.local without root, prints hook instructions.
-Serve it from the site (or raw.githubusercontent.com) once public.
-
-## Channel requirements and blockers
-
-| Channel            | Works today | Needs                                   |
-| ------------------ | ----------- | --------------------------------------- |
-| brew tap           | yes         | token while the repo is private         |
-| release deb/rpm    | yes         | manual download while private           |
-| release pkg.tar.zst| yes         | manual download while private           |
-| curl installer     | no          | public releases                         |
-| AUR                | no          | public repo + AUR account               |
-| nix flake          | no          | public repo                             |
-| COPR / OBS repos   | later       | public repo, per-distro maintenance     |
-| Debian/Fedora main | much later  | sponsor, review process, project maturity |
-| Snap / Flatpak     | never       | sandboxing is incompatible with an LD_PRELOAD hook |
+- **COPR / OBS**: possible later, needs per-distro maintenance.
+- **Debian / Fedora proper**: needs a sponsor and a mature project.
+- **Snap / Flatpak**: never. Sandboxing and an `LD_PRELOAD` hook are
+  architecturally incompatible.

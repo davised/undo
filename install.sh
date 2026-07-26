@@ -23,7 +23,7 @@ fi
 
 # fetch fully before parsing: piping straight into grep -m1 closes the pipe
 # early and makes curl print a confusing "(23) Failure writing output" error
-api=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest") ||
+api=$(curl -fsSL --retry 3 --retry-delay 1 "https://api.github.com/repos/$REPO/releases/latest") ||
     fail "could not query latest release"
 tag=$(printf '%s\n' "$api" | grep '"tag_name"' | head -n1 | cut -d'"' -f4)
 [ -n "$tag" ] || fail "could not parse the latest release tag"
@@ -34,7 +34,8 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 echo "downloading undo $tag (linux/$arch)..."
-curl -fsSL "$url" | tar -xz -C "$tmp" || fail "download failed: $url"
+curl -fsSL --retry 3 --retry-delay 1 "$url" | tar -xz -C "$tmp" ||
+    fail "download failed: $url"
 
 # The binary and the shim may be running or mapped right now (this is
 # also how `undo upgrade` reinstalls), and writing over those fails with
@@ -67,7 +68,11 @@ esac
 hook_line=""
 path_line=""
 rc=""
-case "${SHELL##*/}" in
+# ${SHELL##*/} alone aborts under set -u when SHELL is unset, which happens
+# in containers, cron jobs and some CI runners
+shell_name=${SHELL:-}
+shell_name=${shell_name##*/}
+case "$shell_name" in
     zsh)  rc="$HOME/.zshrc";                  hook_line="source $PREFIX/share/undo/undo.zsh" ;;
     bash) rc="$HOME/.bashrc";                 hook_line="source $PREFIX/share/undo/undo.bash" ;;
     fish) rc="$HOME/.config/fish/config.fish"; hook_line="source $PREFIX/share/undo/undo.fish" ;;
@@ -77,7 +82,7 @@ esac
 case ":$PATH:" in
     *":$PREFIX/bin:"*) ;;
     *)
-        case "${SHELL##*/}" in
+        case "$shell_name" in
             fish) path_line="fish_add_path $PREFIX/bin" ;;
             zsh | bash) path_line="export PATH=\"$PREFIX/bin:\$PATH\"" ;;
         esac

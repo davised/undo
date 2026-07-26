@@ -80,9 +80,21 @@ jobs:
           else
             dnf install -y -q curl tar findutils
           fi
-      - name: install from the public one-liner
-        run: curl -fsSL https://undo.edaywalid.com/install.sh | sh
-      - name: it actually runs and can restore a file
+      # No terminal here, so the installer must not touch any rc file.
+      - name: install without consent to edit the shell rc
         run: |
+          curl -fsSL https://undo.edaywalid.com/install.sh | sh
           ~/.local/bin/undo --version
-          ~/.local/bin/undo doctor
+          if [ -f ~/.bashrc ] && grep -q 'share/undo/undo' ~/.bashrc; then
+            echo "::error::installer edited ~/.bashrc with no terminal to ask at"; exit 1
+          fi
+
+      # Then the path a user who says yes gets: rc written, hook loads,
+      # doctor's live capture/restore passes.
+      - name: install with consent, then verify the hook actually works
+        run: |
+          export SHELL=/bin/bash
+          curl -fsSL https://undo.edaywalid.com/install.sh | UNDO_MODIFY_RC=1 sh
+          grep -q 'share/undo/undo.bash' ~/.bashrc ||
+            { echo "::error::hook line missing from ~/.bashrc"; exit 1; }
+          bash -c '. ~/.local/share/undo/undo.bash && ~/.local/bin/undo doctor'

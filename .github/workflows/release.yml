@@ -48,3 +48,43 @@ jobs:
           # PAT with push access to edaywalid/homebrew-tap; formula upload
           # fails gracefully absent while the release itself still publishes
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          # goreleaser's own aurs: block builds and pushes undo-cli-bin
+          AUR_KEY: ${{ secrets.AUR_KEY }}
+
+      # goreleaser covers the -bin package but cannot also do the source one
+      # (aurs + aur_sources panics), so undo-cli is rendered from the tag
+      # that was just released and pushed here.
+      - name: publish the source package to the AUR
+        env:
+          AUR_KEY: ${{ secrets.AUR_KEY }}
+        run: |
+          # opt-in: skip cleanly until the deploy key is configured, so the
+          # release never depends on it
+          if [ -z "${AUR_KEY:-}" ]; then
+            echo "AUR_KEY not set, skipping the source package"
+            exit 0
+          fi
+          sudo pacman -Sy --noconfirm pacman-contrib 2>/dev/null || true
+          ./packaging/aur/render.sh "${GITHUB_REF_NAME}"
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$AUR_KEY" > ~/.ssh/aur && chmod 600 ~/.ssh/aur
+          cat >> ~/.ssh/config <<'EOF'
+          Host aur.archlinux.org
+            User aur
+            IdentityFile ~/.ssh/aur
+            IdentitiesOnly yes
+            StrictHostKeyChecking accept-new
+          EOF
+          git config --global user.name edaywalid
+          git config --global user.email becharwalid9@gmail.com
+          git clone ssh://aur@aur.archlinux.org/undo-cli.git /tmp/undo-cli
+          cp packaging/aur/undo-cli/PKGBUILD /tmp/undo-cli/
+          [ -f packaging/aur/undo-cli/.SRCINFO ] &&
+            cp packaging/aur/undo-cli/.SRCINFO /tmp/undo-cli/
+          git -C /tmp/undo-cli add -A
+          if git -C /tmp/undo-cli diff --cached --quiet; then
+            echo "undo-cli unchanged"
+          else
+            git -C /tmp/undo-cli commit -m "undo-cli ${GITHUB_REF_NAME#v}"
+            git -C /tmp/undo-cli push origin master
+          fi
