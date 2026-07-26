@@ -31,6 +31,7 @@ usage:
   undo purge              delete all stored sessions and backups
   undo doctor             check the install and run a live self-test
   undo upgrade [--check]  update to the latest release
+  undo uninstall [--purge] remove undo (--purge also deletes backups)
 
 flags:
   -n, --dry-run   show what would happen without doing it
@@ -258,7 +259,7 @@ func main() {
 	}
 
 	var opts restore.Options
-	var yes, interactive bool
+	var yes, interactive, purge bool
 	var args []string
 
 	for _, a := range os.Args[1:] {
@@ -269,6 +270,8 @@ func main() {
 			yes = true
 		case "--force":
 			opts.Force = true
+		case "--purge":
+			purge = true
 		case "-i", "--interactive":
 			interactive = true
 		case "-V", "--version":
@@ -316,6 +319,8 @@ func main() {
 		cmdDoctor()
 	case "upgrade":
 		cmdUpgrade(len(args) > 1 && args[1] == "--check")
+	case "uninstall":
+		cmdUninstall(yes, purge)
 	case "diff":
 		cmdDiff(args[1:])
 	case "apply":

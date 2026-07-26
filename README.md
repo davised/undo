@@ -77,8 +77,10 @@ Any distro, no root, nothing to configure:
 curl -fsSL https://undo.edaywalid.com/install.sh | sh
 ```
 
-That installs into `~/.local` and prints the one line to add to your
-shell rc. Prefer a package manager?
+That installs into `~/.local` and wires up the shell hook (and your PATH,
+if needed) for you, so undo is armed as soon as you open a new terminal.
+Set `UNDO_NO_MODIFY_RC=1` if you would rather add the line yourself.
+Prefer a package manager?
 
 | Channel | Command |
 | --- | --- |
@@ -91,16 +93,29 @@ shell rc. Prefer a package manager?
 
 ### 2. Turn it on
 
-Add the hook for your shell, then open a new terminal:
+The one-liner does this step for you; open a new terminal and skip to
+step 3. After a **package install**, add the line for your shell:
+
+**zsh**
 
 ```sh
-zsh:   echo 'source ~/.local/share/undo/undo.zsh'  >> ~/.zshrc
-bash:  echo 'source ~/.local/share/undo/undo.bash' >> ~/.bashrc            # bash >= 5
-fish:  echo 'source ~/.local/share/undo/undo.fish' >> ~/.config/fish/config.fish
+echo 'source /usr/share/undo/undo.zsh' >> ~/.zshrc && exec zsh
 ```
 
-Package installs put the hooks under `/usr/share/undo/` instead of
-`~/.local/share/undo/`.
+**bash** (5 or newer)
+
+```sh
+echo 'source /usr/share/undo/undo.bash' >> ~/.bashrc && exec bash
+```
+
+**fish** (3.4 or newer)
+
+```fish
+echo 'source /usr/share/undo/undo.fish' >> ~/.config/fish/config.fish && exec fish
+```
+
+Installing from source or the one-liner puts the hooks in
+`~/.local/share/undo/` instead of `/usr/share/undo/`.
 
 ### 3. Check it works
 
@@ -148,6 +163,7 @@ undo gc           prune old, empty, and oversized sessions
 undo purge        delete all stored sessions and backups
 undo doctor       check the install and run a live capture/restore test
 undo upgrade      update to the latest release
+undo uninstall    remove undo (--purge also deletes backups)
 ```
 
 ## Upgrading
@@ -161,6 +177,19 @@ place. If undo came from a package manager it will not fight it, and
 prints the right command for your system instead (`brew upgrade undo`,
 `sudo pacman -Syu undo-cli-bin`, and so on). Open a new shell afterwards
 so the updated hook is loaded.
+
+## Uninstalling
+
+```console
+$ undo uninstall            # keeps your backups
+$ undo uninstall --purge    # deletes the session store too
+```
+
+It shows what it will remove and asks first, then takes out the binary,
+the shim, the hooks and the completions, and removes the lines it added
+to your shell rc. Your session store is left alone unless you pass
+`--purge`. A package-managed copy is not touched: it prints your package
+manager's remove command instead.
 
 Flags: `-n` dry run, `-y` skip the confirmation prompt, `--force`
 overwrite files that changed again after the session.

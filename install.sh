@@ -59,13 +59,52 @@ case ":$PATH:" in
     *":$PREFIX/bin:"*) ;;
     *) echo "note: $PREFIX/bin is not on your PATH" ;;
 esac
+
+# undo does nothing until its hook is loaded, and an install that stops at
+# "here is a line to paste" leaves people with a tool that silently records
+# nothing. Wire it up, idempotently, unless told not to.
+hook_line=""
+path_line=""
+rc=""
+case "${SHELL##*/}" in
+    zsh)  rc="$HOME/.zshrc";                  hook_line="source $PREFIX/share/undo/undo.zsh" ;;
+    bash) rc="$HOME/.bashrc";                 hook_line="source $PREFIX/share/undo/undo.bash" ;;
+    fish) rc="$HOME/.config/fish/config.fish"; hook_line="source $PREFIX/share/undo/undo.fish" ;;
+esac
+
+# an install that leaves `undo` unrunnable is not an install
+case ":$PATH:" in
+    *":$PREFIX/bin:"*) ;;
+    *)
+        case "${SHELL##*/}" in
+            fish) path_line="fish_add_path $PREFIX/bin" ;;
+            zsh | bash) path_line="export PATH=\"$PREFIX/bin:\$PATH\"" ;;
+        esac
+        ;;
+esac
+
 echo
-echo "add the hook for your shell:"
-echo "  zsh:   echo 'source $PREFIX/share/undo/undo.zsh'  >> ~/.zshrc"
-echo "  bash:  echo 'source $PREFIX/share/undo/undo.bash' >> ~/.bashrc"
-echo "  fish:  echo 'source $PREFIX/share/undo/undo.fish' >> ~/.config/fish/config.fish"
+if [ -n "${UNDO_NO_MODIFY_RC-}" ] || [ -z "$rc" ]; then
+    echo "add the hook for your shell, then open a new terminal:"
+    echo "  zsh:   echo 'source $PREFIX/share/undo/undo.zsh'  >> ~/.zshrc"
+    echo "  bash:  echo 'source $PREFIX/share/undo/undo.bash' >> ~/.bashrc"
+    echo "  fish:  echo 'source $PREFIX/share/undo/undo.fish' >> ~/.config/fish/config.fish"
+elif [ -f "$rc" ] && grep -qF "$hook_line" "$rc"; then
+    echo "hook already set up in $rc"
+else
+    mkdir -p "$(dirname "$rc")"
+    {
+        printf '\n# undo: revert what the last command did (undo.edaywalid.com)\n'
+        [ -n "$path_line" ] && printf '%s\n' "$path_line"
+        printf '%s\n' "$hook_line"
+    } >>"$rc"
+    echo "hook added to $rc"
+    [ -n "$path_line" ] && echo "added $PREFIX/bin to your PATH there too"
+    echo "(re-run with UNDO_NO_MODIFY_RC=1 to skip this next time)"
+fi
+
 echo
-echo "then open a new shell and try it (undo needs its own line):"
+echo "open a new terminal, then try it (undo needs its own line):"
 echo "  touch x"
 echo "  rm x"
 echo "  undo"

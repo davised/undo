@@ -13,6 +13,7 @@ _undo() {
         'purge:delete all stored sessions and backups'
         'doctor:check the install and run a live self-test'
         'upgrade:update to the latest release'
+        'uninstall:remove undo from this machine'
         'help:show usage'
     )
 
