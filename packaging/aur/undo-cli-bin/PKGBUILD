@@ -4,7 +4,7 @@
 # unrelated project that also provides "undo".
 pkgname=undo-cli-bin
 _pkgname=undo
-pkgver=0.2.5
+pkgver=0.2.6
 pkgrel=1
 pkgdesc="Revert what the last shell command did to the filesystem"
 arch=('x86_64' 'aarch64')

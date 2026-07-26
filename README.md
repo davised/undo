@@ -17,6 +17,22 @@ directories created by a script that ran amok. Changed your mind again?
 parks it in the session store, so a session toggles between undone and
 applied as many times as you like.
 
+**Contents**
+
+- [Why](#why)
+- [How it works](#how-it-works)
+- [Install](#install)
+- [Usage](#usage)
+- [Storage and disk space](#storage-and-disk-space) - what it keeps, for
+  how long, and what it costs you
+- [Ignoring build noise](#ignoring-build-noise)
+- [Configuration](#configuration) - every environment variable
+- [What it cannot catch](#what-it-cannot-catch)
+- [Secure deletion](#secure-deletion) - read this before `shred`
+- [Platform support](#platform-support)
+- [Upgrading](#upgrading) and [Uninstalling](#uninstalling)
+- [Development](#development)
+
 ## Why
 
 The shell has never had an undo, and the usual advice is that once data
@@ -79,9 +95,12 @@ Any distro, no root, nothing to configure:
 curl -fsSL https://undo.edaywalid.com/install.sh | sh
 ```
 
-That installs into `~/.local` and wires up the shell hook (and your PATH,
-if needed) for you, so undo is armed as soon as you open a new terminal.
-Set `UNDO_NO_MODIFY_RC=1` if you would rather add the line yourself.
+That installs into `~/.local`, then **asks** whether to add the hook line
+to your shell rc, showing you the exact line first. Say no and it prints
+the instructions instead; it never edits anything when there is no
+terminal to ask at (a CI run, a piped install). `UNDO_MODIFY_RC=1`
+answers yes for scripted installs, `UNDO_NO_MODIFY_RC=1` answers no.
+
 Prefer a package manager?
 
 | Channel | Command |
@@ -89,14 +108,15 @@ Prefer a package manager?
 | Homebrew (Linux) | `brew install edaywalid/tap/undo` |
 | Debian / Ubuntu | `.deb` from [releases](https://github.com/edaywalid/undo/releases), then `sudo dpkg -i undo_*.deb` |
 | Fedora / openSUSE | `.rpm` from [releases](https://github.com/edaywalid/undo/releases), then `sudo rpm -i undo_*.rpm` |
-| Arch | `.pkg.tar.zst` from [releases](https://github.com/edaywalid/undo/releases), then `sudo pacman -U ...` (AUR: `undo-cli`, pending) |
+| Arch | `yay -S undo-cli-bin` (AUR), or `.pkg.tar.zst` from [releases](https://github.com/edaywalid/undo/releases) |
 | Nix | `nix run github:edaywalid/undo` (flake, experimental) |
 | From source | `make install` (needs gcc + go, installs to `~/.local`) |
 
 ### 2. Turn it on
 
-The one-liner does this step for you; open a new terminal and skip to
-step 3. After a **package install**, add the line for your shell:
+If you let the installer do it, open a new terminal and skip to step 3.
+After a **package install**, or if you declined, add the line for your
+shell:
 
 **zsh**
 
@@ -168,6 +188,129 @@ undo upgrade      update to the latest release
 undo uninstall    remove undo (--purge also deletes backups)
 ```
 
+## Storage and disk space
+
+The honest version, because it is the question everyone asks second.
+
+**Deleting costs no new disk, but it does defer freeing the old.** When
+you `rm` a file, undo makes a **hardlink** to it before the delete runs.
+A hardlink is a second name for the same data, not a copy, which is why
+`rm -rf` on gigabytes is instant and adds nothing. The catch: Linux only
+frees a file's blocks when its *last* name disappears, and undo is still
+holding one. So the space is not reclaimed until that backup is pruned.
+If you deleted something specifically to free disk, run `undo purge`.
+
+**Overwriting a file in place does cost disk.** A hardlink cannot
+preserve content that is about to be rewritten, so for `>` truncation,
+editors, and `shred`, undo copies the previous version. That copy is real
+new space, capped per file by `UNDO_MAX_BYTES` (256 MiB default).
+
+**Nothing grows without bound.** After every command undo prunes the
+store:
+
+| Limit | Default | Meaning |
+| --- | --- | --- |
+| `UNDO_KEEP` | 30 | how many **commands** are kept, not files. One `rm -rf` of 10,000 files is a single session and one `undo` restores all of them. |
+| `UNDO_MAX_STORE` | 1 GiB | total size budget for the whole store. Oldest sessions are dropped first. |
+
+The **most recent session is never pruned**, even if it alone exceeds the
+budget, since that is the one plain `undo` reverts. Older sessions that
+bust the budget are dropped almost immediately, so a very large delete
+stays undoable only until the next command unless you raise the limits.
+
+Commands that changed nothing leave no session at all. `undo gc` prunes
+on demand, `undo purge` empties the store completely.
+
+## Secure deletion
+
+If you are deleting something because it must be **gone**, know that undo
+works against you by default: for an in-place overwrite it copies the
+original bytes into its store *before* `shred` rewrites them, so a
+readable copy survives. `undo purge` unlinks that copy but does not
+overwrite it either.
+
+Exclude the path first, then shred:
+
+```sh
+echo '/home/you/secrets' >> ~/.config/undo/ignore
+shred -u ~/secrets/tax-return.pdf
+```
+
+`sudo shred` also works, since sudo strips `LD_PRELOAD` and undo never
+loads. Note that `shred` is itself unreliable on journaling filesystems
+and SSDs, which its own man page explains.
+
+## Ignoring build noise
+
+A command that rewrites thousands of files (a package install, a build)
+would otherwise flood `undo list` and the store with churn you will never
+revert. The shim always skips `node_modules`, `.cache`, `__pycache__`,
+and `.git`, and collapses repeated writes to the same file within one
+command down to a single backup. Add your own patterns in
+`~/.config/undo/ignore` (see [`examples/ignore`](examples/ignore)):
+
+```
+target              # any path component named target, at any depth
+dist
+/home/you/scratch   # an absolute path and everything under it
+```
+
+Set `UNDO_DEFAULT_IGNORE=0` to turn the built-ins off, or `UNDO_IGNORE`
+to a colon-separated list to override the config file.
+
+## Configuration
+
+Environment variables, set before sourcing the hook:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `UNDO_KEEP` | `30` | how many commands are kept (see [storage](#storage-and-disk-space)) |
+| `UNDO_MAX_STORE` | 1 GiB | total store size budget in bytes; oldest pruned first |
+| `UNDO_MAX_BYTES` | 256 MiB | largest file the shim will copy for an in-place overwrite; deletions are hardlinked with no size limit |
+| `UNDO_DATA_DIR` | `~/.local/share/undo` | where sessions live |
+| `UNDO_IGNORE` | from config file | colon-separated ignore patterns, overrides `~/.config/undo/ignore` |
+| `UNDO_IGNORE_FILE` | `~/.config/undo/ignore` | where the ignore list is read from |
+| `UNDO_DEFAULT_IGNORE` | on | set to `0` to stop skipping `node_modules`, `.cache`, `__pycache__`, `.git` |
+| `UNDO_CAPTURE_SHELL` | off | zsh only: set to `1` to re-exec once at startup with the shim preloaded, so the shell's own redirections (`echo x > file`) are captured too |
+| `UNDO_LIB` | auto-detected | explicit path to `libundo.so` |
+
+Installer-only variables, for `install.sh`:
+
+| Variable | Meaning |
+| --- | --- |
+| `PREFIX` | install location, default `~/.local` |
+| `UNDO_MODIFY_RC` | set to `1` to add the hook line without being asked (for scripted installs) |
+| `UNDO_NO_MODIFY_RC` | set to `1` to never touch your shell rc |
+
+## What it cannot catch
+
+`LD_PRELOAD` only reaches dynamically linked programs that go through
+libc. undo does **not** see:
+
+- static binaries and programs that make raw syscalls (Go programs)
+- `sudo` and setuid programs; the loader strips `LD_PRELOAD`
+- writes through already-open file descriptors, `ftruncate`, mmap writes
+- `chown` and other metadata beyond mode (`chmod` **is** covered)
+- anything run outside the hooked shell (use `undo run` there)
+
+Coreutils and your shell are glibc-dynamic, which is exactly where the
+everyday accidents happen. **This is a safety net, not a backup.** Keep
+backups.
+
+## Platform support
+
+- **Linux, amd64 and arm64.** Any glibc distro (Debian, Ubuntu, Fedora,
+  Arch, openSUSE, ...). WSL2 counts, it is Linux.
+- **Alpine / musl**: build from source (`make install`, CI-tested); the
+  prebuilt shim in releases targets glibc.
+- **Shells**: zsh, bash 5+, fish 3.4+ for the automatic hook. Any shell
+  works with `undo run`. The fish hook is currently untested.
+- **macOS**: not supported. SIP blocks library injection into system
+  binaries, so a port could not cover `rm` and friends.
+- **Windows**: use it inside WSL2.
+- **Snap / Flatpak**: never; sandboxing and an `LD_PRELOAD` hook are
+  architecturally incompatible. Use a package or the installer.
+
 ## Upgrading
 
 ```console
@@ -204,66 +347,6 @@ list` marks undone sessions with a leading `u`.
 If nothing seems to happen after installing, run `undo doctor`: it
 locates the shim, checks the store, and deletes then restores a canary
 file end to end, so you get a concrete diagnosis instead of silence.
-
-## Ignoring build noise
-
-A command that rewrites thousands of files (a package install, a build)
-would otherwise flood `undo list` and the store with churn you will never
-revert. The shim always skips `node_modules`, `.cache`, `__pycache__`,
-and `.git`, and collapses repeated writes to the same file within one
-command down to a single backup. Add your own patterns in
-`~/.config/undo/ignore` (see [`examples/ignore`](examples/ignore)):
-
-```
-target              # any path component named target, at any depth
-dist
-/home/you/scratch   # an absolute path and everything under it
-```
-
-Set `UNDO_DEFAULT_IGNORE=0` to turn the built-ins off, or `UNDO_IGNORE`
-to a colon-separated list to override the config file.
-
-## Configuration
-
-Environment variables, set before sourcing the hook:
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `UNDO_KEEP` | `30` | sessions to keep |
-| `UNDO_MAX_STORE` | 1 GiB | total store size budget in bytes; oldest pruned first |
-| `UNDO_DATA_DIR` | `~/.local/share/undo` | where sessions live |
-| `UNDO_MAX_BYTES` | 256 MiB | largest file the shim copies as a backup (in-place writes only; deletions are hardlinked with no size limit) |
-| `UNDO_IGNORE` | (from config) | colon-separated ignore patterns |
-| `UNDO_CAPTURE_SHELL=1` | off | zsh only: re-exec once at startup with the shim preloaded so the shell's own redirections (`echo x > file`) are captured too |
-
-## What it cannot catch
-
-`LD_PRELOAD` only reaches dynamically linked programs that go through
-libc. undo does **not** see:
-
-- static binaries and programs that make raw syscalls (Go programs)
-- `sudo` and setuid programs; the loader strips `LD_PRELOAD`
-- writes through already-open file descriptors, `ftruncate`, mmap writes
-- `chown` and other metadata beyond mode (`chmod` **is** covered)
-- anything run outside the hooked shell (use `undo run` there)
-
-Coreutils and your shell are glibc-dynamic, which is exactly where the
-everyday accidents happen. **This is a safety net, not a backup.** Keep
-backups.
-
-## Platform support
-
-- **Linux, amd64 and arm64.** Any glibc distro (Debian, Ubuntu, Fedora,
-  Arch, openSUSE, ...). WSL2 counts, it is Linux.
-- **Alpine / musl**: build from source (`make install`, CI-tested); the
-  prebuilt shim in releases targets glibc.
-- **Shells**: zsh, bash 5+, fish 3.4+ for the automatic hook. Any shell
-  works with `undo run`. The fish hook is currently untested.
-- **macOS**: not supported. SIP blocks library injection into system
-  binaries, so a port could not cover `rm` and friends.
-- **Windows**: use it inside WSL2.
-- **Snap / Flatpak**: never; sandboxing and an `LD_PRELOAD` hook are
-  architecturally incompatible. Use a package or the installer.
 
 ## Development
 

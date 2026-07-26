@@ -33,7 +33,7 @@ const methodsFor = (sh: ShellId): Method[] => [
   {
     id: 'curl',
     label: 'Any distro',
-    note: 'No root. Wires up your shell hook and PATH for you.',
+    note: 'No root. Offers to set up your shell, and asks first.',
     lines: [
       { cmd: 'curl -fsSL https://undo.edaywalid.com/install.sh | sh' },
       { cmd: SHELLS.find((s) => s.id === sh)!.reload, comment: 'or just open a new terminal' },
@@ -104,9 +104,9 @@ export function Install() {
         <Reveal>
           <h2>One command. That is the entire setup.</h2>
           <p className="lead">
-            The installer adds the shell hook for you. No root for the
-            default, no account, no daemon to enable, no config file to
-            write.
+            The installer offers to add the hook line to your shell rc,
+            showing it to you first. Decline and it just prints the line.
+            No root for the default, no account, no daemon.
           </p>
         </Reveal>
 

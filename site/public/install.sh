@@ -60,9 +60,10 @@ case ":$PATH:" in
     *) echo "note: $PREFIX/bin is not on your PATH" ;;
 esac
 
-# undo does nothing until its hook is loaded, and an install that stops at
+# undo does nothing until its hook is loaded, so an install that stops at
 # "here is a line to paste" leaves people with a tool that silently records
-# nothing. Wire it up, idempotently, unless told not to.
+# nothing. But a shell rc is the user's file, so we ask before touching it
+# and never write without an answer.
 hook_line=""
 path_line=""
 rc=""
@@ -83,14 +84,40 @@ case ":$PATH:" in
         ;;
 esac
 
-echo
-if [ -n "${UNDO_NO_MODIFY_RC-}" ] || [ -z "$rc" ]; then
-    echo "add the hook for your shell, then open a new terminal:"
+manual_instructions() {
+    echo "undo is installed but not armed yet. Add the hook for your shell:"
     echo "  zsh:   echo 'source $PREFIX/share/undo/undo.zsh'  >> ~/.zshrc"
     echo "  bash:  echo 'source $PREFIX/share/undo/undo.bash' >> ~/.bashrc"
     echo "  fish:  echo 'source $PREFIX/share/undo/undo.fish' >> ~/.config/fish/config.fish"
+    echo
+    echo "then open a new terminal. 'undo doctor' will confirm it is active."
+}
+
+# Ask before editing the rc. curl | sh means stdin is the script, so read
+# the answer from the terminal directly. With no terminal (CI, piped) we
+# never write: silence is not consent.
+ask_rc() {
+    [ -n "${UNDO_MODIFY_RC-}" ] && return 0
+    [ -n "${UNDO_NO_MODIFY_RC-}" ] && return 1
+    [ -r /dev/tty ] || return 1
+    printf '\nadd this line to %s?\n  %s\n' "$rc" "$hook_line"
+    [ -n "$path_line" ] && printf '  %s\n' "$path_line"
+    printf '[Y/n] '
+    read -r reply </dev/tty || return 1
+    case "$reply" in
+        [Nn]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+echo
+if [ -z "$rc" ]; then
+    manual_instructions
 elif [ -f "$rc" ] && grep -qF "$hook_line" "$rc"; then
     echo "hook already set up in $rc"
+elif ! ask_rc; then
+    echo
+    manual_instructions
 else
     mkdir -p "$(dirname "$rc")"
     {
@@ -100,7 +127,7 @@ else
     } >>"$rc"
     echo "hook added to $rc"
     [ -n "$path_line" ] && echo "added $PREFIX/bin to your PATH there too"
-    echo "(re-run with UNDO_NO_MODIFY_RC=1 to skip this next time)"
+    echo "('undo uninstall' takes these lines back out)"
 fi
 
 echo

@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.2.6 - 2026-07-26
+
+- The installer now **asks** before touching your shell rc, showing the
+  exact line first, and reads the answer from the terminal so it works
+  through `curl | sh`. With no terminal to ask at (CI, a piped install)
+  it never writes. Editing a config file on an opt-out basis was the
+  wrong default. `UNDO_MODIFY_RC=1` answers yes for scripted installs.
+- Docs: a table of contents, a dedicated "Storage and disk space"
+  section covering hardlinks, why space is not freed immediately, the
+  pruning budgets and every variable that controls them, and a "Secure
+  deletion" section for `shred`.
+
 ## v0.2.5 - 2026-07-26
 
 - The newest session is never pruned. A single delete larger than the
