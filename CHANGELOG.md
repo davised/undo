@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.2.5 - 2026-07-26
+
+- The newest session is never pruned. A single delete larger than the
+  store budget used to drop its own session on the next command, which
+  removed exactly the undo the user was about to reach for. Older
+  sessions still age out on the count and size budgets as before.
+
 ## v0.2.4 - 2026-07-26
 
 - The installer now adds the hook line to your shell rc itself, and your

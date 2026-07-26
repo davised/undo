@@ -65,7 +65,9 @@ whole storage format is plain files you can inspect:
 ```
 
 The last 30 sessions are kept, within a 1 GiB budget; both are
-configurable, and `undo purge` wipes the store.
+configurable, and `undo purge` wipes the store. The most recent session
+is always kept, even if it alone exceeds the budget, since that is the
+one `undo` reverts.
 
 ## Install
 

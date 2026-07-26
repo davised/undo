@@ -243,6 +243,14 @@ func GC(keep int, maxBytes int64) (int, error) {
 		}
 		kept++
 		total += dirSize(s.Dir)
+
+		// The newest session is the one `undo` with no arguments targets,
+		// so it always survives. Dropping it because a single big delete
+		// blew the size budget would silently remove exactly the undo the
+		// user is about to reach for.
+		if kept == 1 {
+			continue
+		}
 		if kept > keep || total > maxBytes {
 			if s.Remove() == nil {
 				removed++

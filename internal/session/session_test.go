@@ -74,3 +74,29 @@ func TestGCKeepsLiveSessions(t *testing.T) {
 		t.Error("gc removed a live session")
 	}
 }
+
+func TestGCKeepsNewestEvenWhenOversized(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+
+	old, _ := Create("older command")
+	old.MarkDone()
+	writeJournal(t, old, "create\t/tmp/a\n")
+
+	// the newest session alone busts the budget, like deleting one huge
+	// file: it is exactly the undo the user is about to reach for
+	big, _ := Create("rm -rf huge/")
+	big.MarkDone()
+	writeJournal(t, big, "create\t/tmp/huge\n")
+	if err := os.WriteFile(filepath.Join(big.Dir, "data", "blob"),
+		make([]byte, 1<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := GC(10, 4096); err != nil {
+		t.Fatal(err)
+	}
+	all, _ := List()
+	if len(all) != 1 || all[0].ID != big.ID {
+		t.Fatalf("newest oversized session should survive, got %+v", all)
+	}
+}
