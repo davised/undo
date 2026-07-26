@@ -148,12 +148,30 @@ static int abs_path(int dirfd, const char *path, char *out)
 
 /* ---------- backups ---------- */
 
+/* Hand-rolled so the shim never references strtoul. Under _GNU_SOURCE a
+ * modern glibc redirects strtoul to __isoc23_strtoul, which only exists
+ * in glibc >= 2.38 and makes the .so refuse to load on older distros
+ * (Debian 12, Ubuntu 22.04, RHEL 9). */
+static unsigned long parse_ulong(const char *s)
+{
+    unsigned long v = 0;
+    if (!s)
+        return 0;
+    while (*s == ' ' || *s == '\t')
+        s++;
+    for (; *s >= '0' && *s <= '9'; s++) {
+        if (v > (ULONG_MAX - (unsigned long)(*s - '0')) / 10)
+            return ULONG_MAX; /* saturate rather than wrap */
+        v = v * 10 + (unsigned long)(*s - '0');
+    }
+    return v;
+}
+
 static unsigned long max_bytes(void)
 {
     static unsigned long v;
     if (!v) {
-        const char *s = getenv("UNDO_MAX_BYTES");
-        v = s ? strtoul(s, NULL, 10) : 0;
+        v = parse_ulong(getenv("UNDO_MAX_BYTES"));
         if (!v)
             v = DEFAULT_MAX_BYTES;
     }
@@ -513,9 +531,7 @@ int unlink(const char *path)
     char abs[PATH_MAX], bak[PATH_MAX], lnk[PATH_MAX];
     int kind;
     handle_unlink_pre(AT_FDCWD, path, abs, bak, lnk, &kind);
-    in_shim = 0;
     int rc = real_unlink(path);
-    in_shim = 1;
     handle_unlink_post(rc, abs, bak, lnk, kind);
     in_shim = 0;
     return rc;
@@ -530,7 +546,6 @@ int rmdir(const char *path)
     char abs[PATH_MAX], mode[8];
     int ok;
     handle_rmdir_pre(AT_FDCWD, path, abs, mode, &ok);
-    in_shim = 0;
     int rc = real_rmdir(path);
     if (rc == 0 && ok) {
         in_shim = 1;
@@ -552,9 +567,7 @@ int unlinkat(int dirfd, const char *path, int flags)
         handle_rmdir_pre(dirfd, path, abs, mode, &dirok);
     else
         handle_unlink_pre(dirfd, path, abs, bak, lnk, &kind);
-    in_shim = 0;
     int rc = real_unlinkat(dirfd, path, flags);
-    in_shim = 1;
     if (flags & AT_REMOVEDIR) {
         if (rc == 0 && dirok)
             jwrite("rmdir", abs, mode, NULL);
@@ -587,9 +600,7 @@ static int do_rename(int olddirfd, const char *oldp, int newdirfd,
     int kind;
     handle_rename_pre(olddirfd, oldp, newdirfd, newp, flags, absold, absnew,
                       bak, &kind);
-    in_shim = 0;
     int rc = call(ctx);
-    in_shim = 1;
     handle_rename_post(rc, absold, absnew, bak, kind);
     in_shim = 0;
     return rc;
@@ -759,9 +770,7 @@ int chmod(const char *path, mode_t mode)
     char abs[PATH_MAX], oldmode[8];
     int ok;
     chmod_pre(AT_FDCWD, path, abs, oldmode, &ok);
-    in_shim = 0;
     int rc = real_chmod(path, mode);
-    in_shim = 1;
     chmod_post(rc, abs, oldmode, mode, ok);
     in_shim = 0;
     return rc;
@@ -776,9 +785,7 @@ int fchmodat(int dirfd, const char *path, mode_t mode, int flags)
     char abs[PATH_MAX], oldmode[8];
     int ok;
     chmod_pre(dirfd, path, abs, oldmode, &ok);
-    in_shim = 0;
     int rc = real_fchmodat(dirfd, path, mode, flags);
-    in_shim = 1;
     chmod_post(rc, abs, oldmode, mode, ok);
     in_shim = 0;
     return rc;
@@ -796,9 +803,7 @@ int truncate(const char *path, off_t length)
     if (abs_path(AT_FDCWD, path, abs) == 0 && !ignored(abs) &&
         lstat(abs, &st) == 0 && S_ISREG(st.st_mode) && !mod_seen(abs))
         have = save_file(abs, 1, bak) == 0;
-    in_shim = 0;
     int rc = real_truncate(path, length);
-    in_shim = 1;
     if (rc == 0 && have)
         jwrite("mod", abs, bak, NULL);
     else if (have)
@@ -817,9 +822,7 @@ static int open_common(const char *fn, int dirfd, const char *path,
     char abs[PATH_MAX], bak[PATH_MAX];
     int kind;
     handle_open_pre(dirfd, path, flags, abs, bak, &kind);
-    in_shim = 0;
     int fd = real_openat(dirfd, path, flags, mode);
-    in_shim = 1;
     handle_open_post(fd >= 0, abs, bak, kind);
     in_shim = 0;
     (void)fn;
@@ -931,9 +934,7 @@ static FILE *fopen_common(FILE *(*real)(const char *, const char *),
     char abs[PATH_MAX], bak[PATH_MAX];
     int kind;
     handle_open_pre(AT_FDCWD, path, fopen_flags(mode), abs, bak, &kind);
-    in_shim = 0;
     FILE *f = real(path, mode);
-    in_shim = 1;
     handle_open_post(f != NULL, abs, bak, kind);
     in_shim = 0;
     return f;
@@ -960,9 +961,7 @@ FILE *freopen(const char *path, const char *mode, FILE *stream)
     char abs[PATH_MAX], bak[PATH_MAX];
     int kind;
     handle_open_pre(AT_FDCWD, path, fopen_flags(mode), abs, bak, &kind);
-    in_shim = 0;
     FILE *f = real_freopen(path, mode, stream);
-    in_shim = 1;
     handle_open_post(f != NULL, abs, bak, kind);
     in_shim = 0;
     return f;
