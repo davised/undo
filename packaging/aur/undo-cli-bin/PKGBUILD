@@ -16,8 +16,8 @@ provides=('undo-cli')
 conflicts=('undo-cli')
 source_x86_64=("$url/releases/download/v$pkgver/undo_${pkgver}_linux_amd64.tar.gz")
 source_aarch64=("$url/releases/download/v$pkgver/undo_${pkgver}_linux_arm64.tar.gz")
-sha256sums_x86_64=('SKIP')  # fill from checksums.txt before publishing
-sha256sums_aarch64=('SKIP')
+sha256sums_x86_64=('f77fc19e4ac660d92fbba177f1ffd794152bb293c38d9ac16c2da4aa1ec0de61')
+sha256sums_aarch64=('77c8707b1c061169c109cbdb4547f6c2a85f85af1ca97a7897a397bafbb6e16e')
 
 package() {
     case "$CARCH" in

@@ -21,8 +21,12 @@ if ldd --version 2>&1 | grep -qi musl; then
     fail "build from source instead: git clone https://github.com/$REPO && cd undo && make install"
 fi
 
-tag=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" |
-    grep -m1 '"tag_name"' | cut -d'"' -f4) || fail "could not query latest release"
+# fetch fully before parsing: piping straight into grep -m1 closes the pipe
+# early and makes curl print a confusing "(23) Failure writing output" error
+api=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest") ||
+    fail "could not query latest release"
+tag=$(printf '%s\n' "$api" | grep '"tag_name"' | head -n1 | cut -d'"' -f4)
+[ -n "$tag" ] || fail "could not parse the latest release tag"
 ver=${tag#v}
 url="https://github.com/$REPO/releases/download/$tag/undo_${ver}_linux_${arch}.tar.gz"
 
