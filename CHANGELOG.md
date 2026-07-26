@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.2.2 - 2026-07-26
+
+- New `undo upgrade` (and `undo upgrade --check`). It updates a copy
+  installed by the one-liner or `make install` in place, and refuses to
+  touch a package-managed copy, printing that package manager's command
+  instead.
+- The shell hooks no longer preload a second copy of the shim when one is
+  already present at a different path. Two loaded copies both intercepted
+  every call, which duplicated journal entries and recorded each other's
+  backup writes into your sessions.
+- `undo` chained onto the command it should revert (`rm x && undo`) now
+  explains that it needs its own line, instead of printing a pid. The
+  documented smoke test was itself written in the broken chained form.
+- The installer replaces the binary and shim by atomic rename, so it works
+  while they are running or mapped.
+- `undo doctor` no longer warns about the parent directory's permissions,
+  which is world-readable by design; it checks the session store itself.
+
 ## v0.2.1 - 2026-07-26
 
 Fixes a release that did not work on most distributions. Upgrading is
