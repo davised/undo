@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.2.4 - 2026-07-26
+
+- The installer now adds the hook line to your shell rc itself, and your
+  PATH when `~/.local/bin` is missing from it. Handing people a line to
+  paste was the biggest first-run failure: undo installed fine and then
+  silently recorded nothing. `UNDO_NO_MODIFY_RC=1` opts out.
+- New `undo uninstall` (`--purge` to drop the backups too). It removes
+  what it installed and takes its own lines back out of your rc file,
+  leaves the session store alone by default, and refuses to touch a
+  package-managed copy.
+- Docs and the site give the hook line per shell instead of assuming zsh.
+
 ## v0.2.3 - 2026-07-26
 
 - The shell hooks now export `UNDO_HOOK`, so undo can tell an installed
