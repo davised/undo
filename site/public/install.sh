@@ -104,11 +104,15 @@ manual_instructions() {
 ask_rc() {
     [ -n "${UNDO_MODIFY_RC-}" ] && return 0
     [ -n "${UNDO_NO_MODIFY_RC-}" ] && return 1
-    [ -r /dev/tty ] || return 1
+    # `[ -r /dev/tty ]` is not enough: in a container the device node exists
+    # and tests readable, but opening it fails with ENXIO when there is no
+    # controlling terminal, and a failed redirection is fatal in dash. Try
+    # the open for real, with its error swallowed.
+    { : </dev/tty; } 2>/dev/null || return 1
     printf '\nadd this line to %s?\n  %s\n' "$rc" "$hook_line"
     [ -n "$path_line" ] && printf '  %s\n' "$path_line"
     printf '[Y/n] '
-    read -r reply </dev/tty || return 1
+    read -r reply </dev/tty 2>/dev/null || return 1
     case "$reply" in
         [Nn]*) return 1 ;;
         *) return 0 ;;

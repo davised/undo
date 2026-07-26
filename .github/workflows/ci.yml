@@ -64,6 +64,10 @@ jobs:
 
   # Proves the advertised curl | sh actually works on real distros, using
   # the published release. Scheduled so a bad release surfaces on its own.
+  #
+  # Note this exercises the *deployed* script at undo.edaywalid.com, which
+  # can lag the repo: a fix committed here is not live until the site is
+  # redeployed. The repo-version job below catches that gap.
   installer:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
@@ -97,4 +101,34 @@ jobs:
           curl -fsSL https://undo.edaywalid.com/install.sh | UNDO_MODIFY_RC=1 sh
           grep -q 'share/undo/undo.bash' ~/.bashrc ||
             { echo "::error::hook line missing from ~/.bashrc"; exit 1; }
+          bash -c '. ~/.local/share/undo/undo.bash && ~/.local/bin/undo doctor'
+
+  # The installer job above downloads the deployed copy, so a bug fixed in
+  # this repo still fails there until the site ships. Run the repo's own
+  # install.sh too: this fails on the commit that introduces a bug rather
+  # than after a deploy, and catches a stale site/public/install.sh.
+  installer-from-repo:
+    runs-on: ubuntu-latest
+    container: debian:12
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: apt-get update -qq && apt-get install -y -qq curl ca-certificates
+      - name: the served copy must match the repo
+        run: |
+          diff install.sh site/public/install.sh ||
+            { echo "::error::site/public/install.sh is stale, re-copy it"; exit 1; }
+      - name: runs with SHELL unset and no controlling terminal
+        run: |
+          env -u SHELL sh -e ./install.sh
+          ~/.local/bin/undo --version
+          if [ -f ~/.bashrc ] && grep -q 'share/undo/undo' ~/.bashrc; then
+            echo "::error::edited the rc with no terminal to ask at"; exit 1
+          fi
+      - name: with consent, the hook lands and works
+        run: |
+          export SHELL=/bin/bash
+          UNDO_MODIFY_RC=1 sh -e ./install.sh
+          grep -q 'share/undo/undo.bash' ~/.bashrc ||
+            { echo "::error::hook line missing"; exit 1; }
           bash -c '. ~/.local/share/undo/undo.bash && ~/.local/bin/undo doctor'
