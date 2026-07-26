@@ -30,6 +30,7 @@ usage:
   undo gc                 prune old, empty, and oversized sessions
   undo purge              delete all stored sessions and backups
   undo doctor             check the install and run a live self-test
+  undo upgrade [--check]  update to the latest release
 
 flags:
   -n, --dry-run   show what would happen without doing it
@@ -306,6 +307,8 @@ func main() {
 		cmdPurge(yes, opts.Force)
 	case "doctor":
 		cmdDoctor()
+	case "upgrade":
+		cmdUpgrade(len(args) > 1 && args[1] == "--check")
 	case "diff":
 		cmdDiff(args[1:])
 	case "apply":

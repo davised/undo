@@ -1,7 +1,7 @@
 # bash completion for undo
 _undo_complete() {
     local cur=${COMP_WORDS[COMP_CWORD]}
-    local cmds="list show apply redo diff run gc purge doctor help"
+    local cmds="list show apply redo diff run gc purge doctor upgrade help"
     local flags="-n --dry-run -y --yes --force -i --interactive -V --version"
     if [[ $COMP_CWORD -eq 1 ]]; then
         COMPREPLY=($(compgen -W "$cmds $flags" -- "$cur"))

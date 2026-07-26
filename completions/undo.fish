@@ -9,6 +9,7 @@ complete -c undo -n __fish_use_subcommand -a run -d 'run one command with the sh
 complete -c undo -n __fish_use_subcommand -a gc -d 'prune old and oversized sessions'
 complete -c undo -n __fish_use_subcommand -a purge -d 'delete all stored sessions'
 complete -c undo -n __fish_use_subcommand -a doctor -d 'check the install and self-test'
+complete -c undo -n __fish_use_subcommand -a upgrade -d 'update to the latest release'
 complete -c undo -s n -l dry-run -d 'show what would happen without doing it'
 complete -c undo -s y -l yes -d 'skip the confirmation prompt'
 complete -c undo -l force -d 'overwrite files that changed after the session'

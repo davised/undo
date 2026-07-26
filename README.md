@@ -147,7 +147,20 @@ undo apply <id>   revert a specific session
 undo gc           prune old, empty, and oversized sessions
 undo purge        delete all stored sessions and backups
 undo doctor       check the install and run a live capture/restore test
+undo upgrade      update to the latest release
 ```
+
+## Upgrading
+
+```console
+$ undo upgrade           # or: undo upgrade --check, to only look
+```
+
+That updates a copy installed by the one-liner or `make install`, in
+place. If undo came from a package manager it will not fight it, and
+prints the right command for your system instead (`brew upgrade undo`,
+`sudo pacman -Syu undo-cli-bin`, and so on). Open a new shell afterwards
+so the updated hook is loaded.
 
 Flags: `-n` dry run, `-y` skip the confirmation prompt, `--force`
 overwrite files that changed again after the session.

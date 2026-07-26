@@ -12,6 +12,7 @@ _undo() {
         'gc:prune old, empty, and oversized sessions'
         'purge:delete all stored sessions and backups'
         'doctor:check the install and run a live self-test'
+        'upgrade:update to the latest release'
         'help:show usage'
     )
 

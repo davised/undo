@@ -36,8 +36,16 @@ trap 'rm -rf "$tmp"' EXIT
 echo "downloading undo $tag (linux/$arch)..."
 curl -fsSL "$url" | tar -xz -C "$tmp" || fail "download failed: $url"
 
-install -Dm755 "$tmp/undo" "$PREFIX/bin/undo"
-install -Dm755 "$tmp/build/libundo_${arch}.so" "$PREFIX/lib/undo/libundo.so"
+# The binary and the shim may be running or mapped right now (this is
+# also how `undo upgrade` reinstalls), and writing over those fails with
+# "Text file busy". Land them beside the target, then rename into place:
+# rename is atomic and leaves existing processes on the old inode.
+replace() { # replace <src> <dst> <mode>
+    install -Dm"$3" "$1" "$2.new" || fail "could not write $2.new"
+    mv -f "$2.new" "$2" || fail "could not replace $2"
+}
+replace "$tmp/undo" "$PREFIX/bin/undo" 755
+replace "$tmp/build/libundo_${arch}.so" "$PREFIX/lib/undo/libundo.so" 755
 install -Dm644 "$tmp/shell/undo.zsh" "$PREFIX/share/undo/undo.zsh"
 install -Dm644 "$tmp/shell/undo.bash" "$PREFIX/share/undo/undo.bash"
 install -Dm644 "$tmp/shell/undo.fish" "$PREFIX/share/undo/undo.fish"
