@@ -1,6 +1,6 @@
 pkgbase = undo-cli
 	pkgdesc = Revert what the last shell command did to the filesystem
-	pkgver = 0.2.0
+	pkgver = 0.2.1
 	pkgrel = 1
 	url = https://github.com/edaywalid/undo
 	arch = x86_64
@@ -15,7 +15,7 @@ pkgbase = undo-cli
 	optdepends = fish: fish hook
 	provides = undo-cli
 	conflicts = undo-cli-bin
-	source = undo-cli-0.2.0.tar.gz::https://github.com/edaywalid/undo/archive/refs/tags/v0.2.0.tar.gz
-	sha256sums = c4e941ecf9a2762e5c435cff3f543d9ca018001eeaafac030bb7fc12fc7992bb
+	source = undo-cli-0.2.1.tar.gz::https://github.com/edaywalid/undo/archive/refs/tags/v0.2.1.tar.gz
+	sha256sums = 85eeb598847771743b7892d96476d9e085d52c306e69bd43e0ccc404aba2cd99
 
 pkgname = undo-cli

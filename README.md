@@ -69,6 +69,17 @@ configurable, and `undo purge` wipes the store.
 
 ## Install
 
+### 1. Get the binary
+
+Any distro, no root, nothing to configure:
+
+```sh
+curl -fsSL https://undo.edaywalid.com/install.sh | sh
+```
+
+That installs into `~/.local` and prints the one line to add to your
+shell rc. Prefer a package manager?
+
 | Channel | Command |
 | --- | --- |
 | Homebrew (Linux) | `brew install edaywalid/tap/undo` |
@@ -76,10 +87,11 @@ configurable, and `undo purge` wipes the store.
 | Fedora / openSUSE | `.rpm` from [releases](https://github.com/edaywalid/undo/releases), then `sudo rpm -i undo_*.rpm` |
 | Arch | `.pkg.tar.zst` from [releases](https://github.com/edaywalid/undo/releases), then `sudo pacman -U ...` (AUR: `undo-cli`, pending) |
 | Nix | `nix run github:edaywalid/undo` (flake, experimental) |
-| Any distro, no root | `curl -fsSL https://undo.edaywalid.com/install.sh \| sh` |
 | From source | `make install` (needs gcc + go, installs to `~/.local`) |
 
-Then add the hook for your shell:
+### 2. Turn it on
+
+Add the hook for your shell, then open a new terminal:
 
 ```sh
 zsh:   echo 'source ~/.local/share/undo/undo.zsh'  >> ~/.zshrc
@@ -88,18 +100,32 @@ fish:  echo 'source ~/.local/share/undo/undo.fish' >> ~/.config/fish/config.fish
 ```
 
 Package installs put the hooks under `/usr/share/undo/` instead of
-`~/.local/share/undo/`. Open a new shell, then confirm it works:
+`~/.local/share/undo/`.
+
+### 3. Check it works
 
 ```console
 $ undo doctor
+```
+
+`doctor` verifies the install and then actually deletes and restores a
+canary file, so you get a real answer rather than a guess. Then try it
+for yourself:
+
+```console
 $ touch x && rm x && undo
 ```
 
-No hook, or a script / CI context? Arm a single command instead:
+No hook, or a script / CI context? Arm a single command instead, no
+setup required:
 
 ```sh
 undo run -- ./sketchy-cleanup.sh
 ```
+
+Requires Linux (amd64 or arm64) with glibc 2.6 or newer, which is every
+distribution still in use. See [platform support](#platform-support) for
+musl, macOS and WSL.
 
 ## Usage
 
