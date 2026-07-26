@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.2.1 - 2026-07-26
+
+Fixes a release that did not work on most distributions. Upgrading is
+strongly recommended.
+
+- The v0.2.0 shim required glibc 2.38 (a C23 `strtoul` symbol pulled in
+  by the build host), so it failed to load on Debian 12, Ubuntu 22.04,
+  RHEL 9 and anything older, printing a loader error on every command.
+  Release shims are now built against glibc 2.31 and work from 2.6 up.
+- `undo run` no longer preloads a second copy of the shim when the shell
+  hook is already active, which caused duplicate journal entries.
+- CI now asserts the shim's glibc floor and installs the published
+  release on Debian, Ubuntu and Fedora on every run.
+
 ## v0.2.0 - 2026-07-25
 
 - Ignore rules: the shim skips `node_modules`, `.cache`, `__pycache__`,
