@@ -95,6 +95,9 @@ _undo_precmd() {
     fi
 }
 
+# lets `undo doctor` tell an inactive hook from a missing install
+export UNDO_HOOK=zsh
+
 autoload -Uz add-zsh-hook
 add-zsh-hook preexec _undo_preexec
 add-zsh-hook precmd _undo_precmd

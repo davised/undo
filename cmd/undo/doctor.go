@@ -82,7 +82,12 @@ func cmdDoctor() {
 	fmt.Println()
 	switch worst {
 	case pass:
-		fmt.Println("all good. try:  touch x && rm x && undo")
+		// separate lines: chained with && the shell makes it one command,
+		// and undo will not revert a command it is running inside
+		fmt.Println("all good. try it, one command per line:")
+		fmt.Println("  touch x")
+		fmt.Println("  rm x")
+		fmt.Println("  undo")
 	case warn:
 		fmt.Println("usable, with warnings above.")
 	default:
@@ -138,27 +143,47 @@ func reportIgnore(report func(checkState, string, string)) {
 	}
 }
 
-func reportHooks(report func(checkState, string, string), shim string) {
-	// hooks install next to the shim, under share/undo/
+// hookDir finds the installed hook scripts, trying the layout beside the
+// shim first and the source tree second.
+func hookDir(shim string) string {
 	if shim == "" {
-		return
+		return ""
 	}
-	// .../lib/undo/libundo.so -> .../share/undo/
-	base := filepath.Dir(filepath.Dir(filepath.Dir(shim)))
-	shareDir := filepath.Join(base, "share", "undo")
-	var found []string
-	for _, h := range []string{"undo.zsh", "undo.bash", "undo.fish"} {
-		if _, err := os.Stat(filepath.Join(shareDir, h)); err == nil {
-			found = append(found, strings.TrimPrefix(h, "undo."))
+	candidates := []string{
+		// .../lib/undo/libundo.so -> .../share/undo/
+		filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(shim))), "share", "undo"),
+		// dev tree: .../build/libundo.so -> .../shell/
+		filepath.Join(filepath.Dir(filepath.Dir(shim)), "shell"),
+	}
+	for _, dir := range candidates {
+		if _, err := os.Stat(filepath.Join(dir, "undo.zsh")); err == nil {
+			return dir
 		}
 	}
-	if len(found) == 0 {
-		report(warn, "hooks", "not found near the shim; source one in your shell rc")
+	return ""
+}
+
+func reportHooks(report func(checkState, string, string), shim string) {
+	// What matters is whether the hook is loaded in this shell, not where
+	// the files sit. The hook exports UNDO_HOOK when it loads; without it
+	// nothing is ever recorded and every undo says "nothing to undo".
+	if shell := os.Getenv("UNDO_HOOK"); shell != "" {
+		report(pass, "hook", "active in this shell ("+shell+")")
 		return
 	}
-	// is the current process descended from a hooked shell? the hook exports
-	// nothing persistent, so we can only confirm the files exist and remind.
-	report(pass, "hooks", strings.Join(found, ", ")+" available in "+shareDir)
+	dir := hookDir(shim)
+	if dir == "" {
+		report(failed, "hook",
+			"NOT active, and the hook scripts were not found. Reinstall undo.")
+		return
+	}
+	report(failed, "hook", fmt.Sprintf(
+		"NOT active in this shell, so nothing is being recorded.\n"+
+			"         add one line to your shell rc, then open a new terminal:\n"+
+			"           zsh:  echo 'source %s/undo.zsh'  >> ~/.zshrc\n"+
+			"           bash: echo 'source %s/undo.bash' >> ~/.bashrc\n"+
+			"           fish: echo 'source %s/undo.fish' >> ~/.config/fish/config.fish",
+		dir, dir, dir))
 }
 
 func reportRoundTrip(report func(checkState, string, string), shim string) {

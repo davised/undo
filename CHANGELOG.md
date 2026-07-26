@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.2.3 - 2026-07-26
+
+- The shell hooks now export `UNDO_HOOK`, so undo can tell an installed
+  but never activated hook from a working one. This was the most common
+  first-run problem: with no hook nothing is recorded, and every `undo`
+  answered "nothing to undo" with no hint why.
+- `undo doctor` fails loudly when the hook is not active and prints the
+  exact line to add for your shell.
+- "nothing to undo" now says when the hook is the likely reason.
+
 ## v0.2.2 - 2026-07-26
 
 - New `undo upgrade` (and `undo upgrade --check`). It updates a copy

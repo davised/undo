@@ -10,6 +10,9 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
 export UNDO_DATA_DIR=$WORK/store
+# run_armed does what a shell hook does, so declare the hook active:
+# doctor treats a missing hook as a failure, since nothing gets recorded
+export UNDO_HOOK=e2e
 PLAY=$WORK/play
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

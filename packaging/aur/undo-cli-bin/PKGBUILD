@@ -4,7 +4,7 @@
 # unrelated project that also provides "undo".
 pkgname=undo-cli-bin
 _pkgname=undo
-pkgver=0.2.2
+pkgver=0.2.3
 pkgrel=1
 pkgdesc="Revert what the last shell command did to the filesystem"
 arch=('x86_64' 'aarch64')
@@ -16,8 +16,8 @@ provides=('undo-cli')
 conflicts=('undo-cli')
 source_x86_64=("$url/releases/download/v$pkgver/undo_${pkgver}_linux_amd64.tar.gz")
 source_aarch64=("$url/releases/download/v$pkgver/undo_${pkgver}_linux_arm64.tar.gz")
-sha256sums_x86_64=('050c8624ecf9198c1ff34f2bd6c4119d7ee8c9cec466b330538817533474c04f')
-sha256sums_aarch64=('213a82985d3c90e21482dcae666f479750e6935fde0885c7c0f1988f57694002')
+sha256sums_x86_64=('09cae9b5357ff9e75f8804a2b56ee7fa02b20cba17a89542a6d68a960cd129ed')
+sha256sums_aarch64=('dfd3f9162d70f3bda1b1479d5c685f290445faccd0a5edc4116b832161501918')
 
 package() {
     case "$CARCH" in

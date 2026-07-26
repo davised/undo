@@ -290,6 +290,13 @@ func main() {
 	if len(args) == 0 {
 		s, err := session.Latest()
 		if err != nil {
+			// the usual cause is an installed-but-not-activated hook: with
+			// no hook nothing is ever recorded, so there is never anything
+			// to undo
+			if os.Getenv("UNDO_HOOK") == "" {
+				fatal(fmt.Errorf("nothing to undo, and the shell hook is not active here.\n" +
+					"run 'undo doctor' to see how to turn it on"))
+			}
 			fatal(fmt.Errorf("nothing to undo"))
 		}
 		cmdApply(s, restore.Undo, opts, yes)

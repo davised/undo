@@ -35,6 +35,9 @@ if not set -q UNDO_IGNORE; and test -r "$UNDO_IGNORE_FILE"
     test (count $pats) -gt 0; and set -gx UNDO_IGNORE (string join : $pats)
 end
 
+# lets `undo doctor` tell an inactive hook from a missing install
+set -gx UNDO_HOOK fish
+
 function _undo_preexec --on-event fish_preexec
     set -l cmd (string trim -- $argv[1])
     string match -q 'undo' -- $cmd; and return

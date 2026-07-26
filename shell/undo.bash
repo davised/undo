@@ -92,6 +92,9 @@ _undo_precmd() {
     fi
 }
 
+# lets `undo doctor` tell an inactive hook from a missing install
+export UNDO_HOOK=bash
+
 trap '_undo_preexec' DEBUG
 # run our precmd last so the at-prompt flag is set after other hooks
 PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND;}_undo_precmd"
