@@ -79,16 +79,15 @@ section + section { border-top: 1px solid var(--line); }
 @media (hover: hover) { .nav-cta:hover { background: var(--accent); } }
 @media (max-width: 720px) { .nav-links a.opt { display: none; } }
 
-/* ---------- hero: headline + live terminal ---------- */
-.hero { padding: clamp(3rem, 8vh, 5.5rem) 0 clamp(3.5rem, 8vh, 5rem); }
-.hero-grid {
-  display: grid; grid-template-columns: minmax(0, 0.92fr) minmax(0, 1.08fr);
-  gap: clamp(2rem, 5vw, 4rem); align-items: center;
+/* ---------- hero: headline, the install command, then the live demo ---------- */
+.hero { padding: clamp(2.75rem, 7vh, 4.5rem) 0 clamp(3.5rem, 8vh, 5rem); }
+.hero-center { display: flex; flex-direction: column; align-items: center; text-align: center; }
+.hero-center > * { width: 100%; }
+
+.hero-term {
+  margin: clamp(2.75rem, 7vh, 4rem) auto 0;
+  max-width: 46rem; text-align: left;
 }
-@media (max-width: 900px) {
-  .hero-grid { grid-template-columns: 1fr; gap: 2.5rem; }
-}
-.hero-ctas { margin-bottom: 0; }
 
 .term {
   background: var(--term-bg); border: 1px solid var(--term-line);
@@ -117,17 +116,21 @@ section + section { border-top: 1px solid var(--line); }
 @keyframes caret { 50% { opacity: 0; } }
 @media (prefers-reduced-motion: reduce) { .term-caret { animation: none; } }
 h1 {
-  font-size: clamp(2.3rem, 5.8vw, 3.9rem);
+  font-size: clamp(2.15rem, 5.4vw, 3.75rem);
   font-weight: 900;
   line-height: 1.04;
-  letter-spacing: -0.03em;
-  margin: 0 0 1.2rem;
-  max-width: 19ch;
+  letter-spacing: -0.035em;
+  margin: 0 auto 1.2rem;
+  max-width: 28ch;
   text-wrap: balance;
 }
 h1 em { font-style: normal; color: var(--accent); }
-.hero .lead { margin-bottom: 1.75rem; }
-.hero-ctas { display: flex; gap: 0.9rem; flex-wrap: wrap; align-items: center; margin-bottom: clamp(2.5rem, 6vh, 3.5rem); }
+.hero .lead { margin: 0 auto; max-width: 48ch; }
+.hero-ctas {
+  display: flex; gap: 1.5rem; flex-wrap: wrap;
+  align-items: center; justify-content: center;
+  margin: 1.6rem 0 0;
+}
 .btn {
   display: inline-flex; align-items: center;
   font-weight: 700; font-size: 15.5px;
@@ -143,6 +146,90 @@ h1 em { font-style: normal; color: var(--accent); }
   .btn-ghost:hover { border-color: var(--dim); }
 }
 .hero-note { width: 100%; margin: 0; color: var(--faint); font: 500 13.5px var(--mono); }
+
+/* ---------- hero install: the one action, above the fold ---------- */
+.hero-act { margin-top: clamp(1.75rem, 4vh, 2.5rem); }
+
+.hero-install {
+  margin: 0 auto;
+  display: flex; align-items: stretch; gap: 0.5rem;
+  padding: 0.4rem 0.4rem 0.4rem 1rem;
+  background: var(--term-bg);
+  border: 1px solid var(--term-line);
+  border-radius: 10px;
+  max-width: 40rem;
+  text-align: left;
+  transition: border-color 200ms var(--ease), background 200ms var(--ease);
+}
+@media (hover: hover) { .hero-install:hover { border-color: #34343c; } }
+/* copy confirmation on the row, not just the button label, so the feedback
+   lands where the eye already is */
+.hero-install.lit { border-color: var(--accent); background: #17140e; }
+
+.hero-install-cmd {
+  flex: 1; min-width: 0; overflow-x: auto;
+  align-self: center;
+  padding: 0.35rem 0;
+  font: 500 clamp(12px, 2.6vw, 13.5px)/1.5 var(--mono);
+  white-space: nowrap;
+  /* the command is wider than a phone; let it scroll without a visible
+     scrollbar eating a line of height */
+  scrollbar-width: none;
+}
+.hero-install-cmd::-webkit-scrollbar { display: none; }
+
+.hero-copy-btn {
+  flex-shrink: 0;
+  background: var(--accent); color: var(--accent-contrast);
+  border: 1px solid var(--accent); border-radius: 7px;
+  font: 700 13px var(--sans); padding: 0.5rem 1.1rem;
+  transition: background 160ms var(--ease), border-color 160ms var(--ease),
+    transform 140ms var(--ease);
+}
+.hero-copy-btn:active { transform: scale(0.97); }
+@media (hover: hover) {
+  .hero-copy-btn:hover { background: var(--ink); border-color: var(--ink); color: var(--on-ink); }
+}
+
+/* Nobody should have to scroll a command sideways to see what they are
+   piping into sh. On narrow screens the row stacks and the command wraps
+   in full instead of being clipped. */
+@media (max-width: 620px) {
+  .hero-install {
+    flex-direction: column; align-items: stretch;
+    gap: 0.7rem; padding: 0.85rem;
+  }
+  .hero-install-cmd {
+    white-space: pre-wrap; overflow-wrap: anywhere; overflow-x: visible;
+    padding: 0.15rem 0.15rem 0;
+  }
+  .hero-copy-btn { width: 100%; padding: 0.6rem; }
+}
+
+.hero-compat {
+  display: flex; align-items: center; flex-wrap: wrap;
+  gap: 0 0.6ch; justify-content: center;
+  margin: 0.85rem auto 0; max-width: 40rem;
+  color: var(--faint); font-size: 13px; line-height: 1.9;
+}
+.hero-compat-sep {
+  width: 1px; height: 0.85em; flex-shrink: 0;
+  margin: 0 0.7ch; background: var(--line);
+}
+
+.hero-alt {
+  color: var(--faint); font-size: 14px;
+  text-decoration: underline; text-underline-offset: 4px;
+  text-decoration-color: var(--line);
+  transition: color 160ms var(--ease), text-decoration-color 160ms var(--ease);
+}
+@media (hover: hover) {
+  .hero-alt:hover { color: var(--dim); text-decoration-color: var(--faint); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hero-install, .hero-copy-btn, .hero-alt { transition: none; }
+}
 
 .anno { display: grid; grid-template-columns: minmax(0, 1.25fr) 1fr; column-gap: clamp(1.5rem, 4vw, 3rem); }
 .anno-code {
