@@ -821,7 +821,11 @@ int truncate(const char *path, off_t length)
 
 /* Anything built with _FILE_OFFSET_BITS=64 calls this instead, which is
  * most modern software (Python among them). Missing it meant those
- * truncations were silently unrecorded. */
+ * truncations were silently unrecorded.
+ *
+ * glibc only: musl's off_t is already 64-bit, so it has no off64_t and no
+ * separate entry point, and truncate() above catches everything. */
+#ifdef __GLIBC__
 int truncate64(const char *path, off64_t length)
 {
     REAL(truncate64, int, const char *, off64_t);
@@ -830,6 +834,7 @@ int truncate64(const char *path, off64_t length)
     return truncate_common(path, (int (*)(const char *, off_t))real_truncate64,
                            (off_t)length);
 }
+#endif
 
 static int open_common(const char *fn, int dirfd, const char *path,
                        int flags, mode_t mode)
