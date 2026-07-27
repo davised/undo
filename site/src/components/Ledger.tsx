@@ -43,8 +43,9 @@ export function Ledger() {
           <motion.span
             style={{ display: 'block' }}
             variants={{
-              hidden: reduce ? {} : { opacity: 0 },
-              show: { opacity: 1, transition: { duration: 0.3 } },
+              // offset only, so the listing still renders without JS
+              hidden: reduce ? {} : { x: -6 },
+              show: { x: 0, transition: { duration: 0.3 } },
             }}
           >
             $ undo list
@@ -54,9 +55,8 @@ export function Ledger() {
               key={row.id}
               style={{ display: 'block' }}
               variants={{
-                hidden: reduce ? {} : { opacity: 0, x: -10 },
+                hidden: reduce ? {} : { x: -10 },
                 show: {
-                  opacity: 1,
                   x: 0,
                   transition: { duration: 0.4, ease: EASE },
                 },

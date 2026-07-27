@@ -76,9 +76,10 @@ export function Trace() {
               key={i}
               style={{ display: 'block' }}
               variants={{
-                hidden: reduce ? {} : { opacity: 0, x: -8 },
+                // offset only: `hidden` is what the server renders, and a
+                // transparent default hides the trace entirely without JS
+                hidden: reduce ? {} : { x: -8 },
                 show: {
-                  opacity: 1,
                   x: 0,
                   transition: { duration: 0.4, ease: EASE },
                 },
