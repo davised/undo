@@ -104,15 +104,20 @@ manual_instructions() {
 ask_rc() {
     [ -n "${UNDO_MODIFY_RC-}" ] && return 0
     [ -n "${UNDO_NO_MODIFY_RC-}" ] && return 1
-    # `[ -r /dev/tty ]` is not enough: in a container the device node exists
-    # and tests readable, but opening it fails with ENXIO when there is no
-    # controlling terminal, and a failed redirection is fatal in dash. Try
-    # the open for real, with its error swallowed.
-    { : </dev/tty; } 2>/dev/null || return 1
+    # Under `curl | sh` stdin is the script, but stdout still points at the
+    # user's terminal, so that is what tells us whether anyone is there to
+    # answer. Testing /dev/tty instead is not safe: the node exists in a
+    # container and even tests readable, while opening it fails, and a
+    # failed redirection kills the shell outright.
+    [ -t 1 ] || return 1
     printf '\nadd this line to %s?\n  %s\n' "$rc" "$hook_line"
     [ -n "$path_line" ] && printf '  %s\n' "$path_line"
     printf '[Y/n] '
-    read -r reply </dev/tty 2>/dev/null || return 1
+    # read inside a subshell so that if /dev/tty still cannot be opened,
+    # the redirection failure dies there instead of taking the install
+    # down with it
+    reply=$( { read -r r </dev/tty && printf '%s' "$r"; } 2>/dev/null ) ||
+        return 1
     case "$reply" in
         [Nn]*) return 1 ;;
         *) return 0 ;;
