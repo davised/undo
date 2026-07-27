@@ -791,11 +791,10 @@ int fchmodat(int dirfd, const char *path, mode_t mode, int flags)
     return rc;
 }
 
-int truncate(const char *path, off_t length)
+/* saves path, runs `call`, journals the backup if the call stuck */
+static int truncate_common(const char *path, int (*call)(const char *, off_t),
+                           off_t length)
 {
-    REAL(truncate, int, const char *, off_t);
-    if (!armed())
-        return real_truncate(path, length);
     in_shim = 1;
     char abs[PATH_MAX], bak[PATH_MAX];
     int have = 0;
@@ -803,13 +802,33 @@ int truncate(const char *path, off_t length)
     if (abs_path(AT_FDCWD, path, abs) == 0 && !ignored(abs) &&
         lstat(abs, &st) == 0 && S_ISREG(st.st_mode) && !mod_seen(abs))
         have = save_file(abs, 1, bak) == 0;
-    int rc = real_truncate(path, length);
+    int rc = call(path, length);
     if (rc == 0 && have)
         jwrite("mod", abs, bak, NULL);
     else if (have)
         unlink(bak);
     in_shim = 0;
     return rc;
+}
+
+int truncate(const char *path, off_t length)
+{
+    REAL(truncate, int, const char *, off_t);
+    if (!armed())
+        return real_truncate(path, length);
+    return truncate_common(path, real_truncate, length);
+}
+
+/* Anything built with _FILE_OFFSET_BITS=64 calls this instead, which is
+ * most modern software (Python among them). Missing it meant those
+ * truncations were silently unrecorded. */
+int truncate64(const char *path, off64_t length)
+{
+    REAL(truncate64, int, const char *, off64_t);
+    if (!armed())
+        return real_truncate64(path, length);
+    return truncate_common(path, (int (*)(const char *, off_t))real_truncate64,
+                           (off_t)length);
 }
 
 static int open_common(const char *fn, int dirfd, const char *path,

@@ -187,7 +187,24 @@ sd="$UNDO_DATA_DIR/sessions/$last"
 "$UNDO" -y >/dev/null
 [[ $(cat "$PLAY/churn.txt") == original ]] || fail "dedup broke restore, got $(cat "$PLAY/churn.txt")"
 
-echo "== case 19: undo doctor passes its live self-test"
+echo "== case 19: truncate is caught even from a large-file build"
+# anything compiled with _FILE_OFFSET_BITS=64 calls truncate64, which is
+# most software; missing that symbol meant silent, unrecoverable truncation
+printf 'keep me\n' >"$PLAY/trunc.txt"
+cat >"$WORK/tr.c" <<'CEOF'
+#include <unistd.h>
+int main(int c, char **v) { (void)c; return truncate(v[1], 0); }
+CEOF
+if cc -D_FILE_OFFSET_BITS=64 -o "$WORK/tr64" "$WORK/tr.c" 2>/dev/null; then
+    run_armed "$WORK/tr64 $PLAY/trunc.txt"
+    [[ ! -s $PLAY/trunc.txt ]] || fail "truncate did not run"
+    "$UNDO" -y >/dev/null
+    [[ $(cat "$PLAY/trunc.txt") == "keep me" ]] || fail "truncate64 not restored"
+else
+    echo "   (no cc, skipped)"
+fi
+
+echo "== case 20: undo doctor passes its live self-test"
 out=$("$UNDO" doctor 2>&1) || fail "doctor exited non-zero: $out"
 grep -q "\[ok  \] capture" <<<"$out" || fail "doctor capture check did not pass"
 grep -q "\[ok  \] restore" <<<"$out" || fail "doctor restore check did not pass"
