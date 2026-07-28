@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func writeJournal(t *testing.T, s *Session, line string) {
@@ -98,5 +99,106 @@ func TestGCKeepsNewestEvenWhenOversized(t *testing.T) {
 	all, _ := List()
 	if len(all) != 1 || all[0].ID != big.ID {
 		t.Fatalf("newest oversized session should survive, got %+v", all)
+	}
+}
+
+// Undoing twice in a row targets the newer command first, then the older
+// one. A bare redo has to re-apply the older one, because that is the undo
+// the user performed last. Picking by command time re-applies the newer
+// session and leaves the one they just undid still reverted.
+func TestLatestUndoneFollowsUndoOrderNotCommandOrder(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+
+	older, err := Create("rm notes.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeJournal(t, older, "unlink\t/tmp/notes.txt\n")
+
+	// session ids are timestamps, so the second create must sort newer
+	time.Sleep(10 * time.Millisecond)
+	newer, err := Create("rm draft.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeJournal(t, newer, "unlink\t/tmp/draft.md\n")
+
+	reload := func(id string) *Session {
+		t.Helper()
+		all, err := List()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range all {
+			if s.ID == id {
+				return s
+			}
+		}
+		t.Fatalf("session %s vanished", id)
+		return nil
+	}
+
+	// what `undo; undo` does: newest first, then the one before it
+	if err := reload(newer.ID).MarkUndone(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := reload(older.ID).MarkUndone(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := LatestUndone()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != older.ID {
+		t.Fatalf("redo targeted %q (%s), want the session undone last, %q (%s)",
+			got.Cmd, got.ID, reload(older.ID).Cmd, older.ID)
+	}
+
+	// after redoing that one, the remaining undone session is the target
+	if err := got.ClearUndone(); err != nil {
+		t.Fatal(err)
+	}
+	got, err = LatestUndone()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != newer.ID {
+		t.Fatalf("second redo targeted %s, want %s", got.ID, newer.ID)
+	}
+}
+
+// Markers predating the recorded timestamp are empty files; their mtime has
+// to keep working as the undo time so an upgrade does not break redo.
+func TestLatestUndoneFallsBackToMarkerMtime(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+
+	older, err := Create("rm a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeJournal(t, older, "unlink\t/tmp/a\n")
+	time.Sleep(10 * time.Millisecond)
+	newer, err := Create("rm b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeJournal(t, newer, "unlink\t/tmp/b\n")
+
+	// old format: empty marker, undo order carried only by mtime
+	for _, s := range []*Session{newer, older} {
+		if err := os.WriteFile(filepath.Join(s.Dir, "undone"), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	got, err := LatestUndone()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != older.ID {
+		t.Fatalf("redo targeted %s, want %s (marked undone last)", got.ID, older.ID)
 	}
 }

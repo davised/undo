@@ -5,7 +5,9 @@
 //	cmd      - the command line that ran
 //	journal  - shim journal (absent if the command changed nothing)
 //	data/    - file backups
-//	undone   - marker written after a successful undo
+//	undone   - marker written after a successful undo, holding the RFC3339
+//	           nanosecond time of the undo so redo can find the session that
+//	           was undone last rather than the one that ran last
 package session
 
 import (
@@ -23,13 +25,14 @@ import (
 )
 
 type Session struct {
-	ID      string
-	Dir     string
-	Cmd     string
-	Undone  bool
-	Done    bool // the command finished (done marker present)
-	Pid     int  // shell or runner pid, 0 for pre-lock sessions
-	Entries []journal.Entry
+	ID       string
+	Dir      string
+	Cmd      string
+	Undone   bool
+	UndoneAt time.Time // when the undo happened, zero if not undone
+	Done     bool      // the command finished (done marker present)
+	Pid      int       // shell or runner pid, 0 for pre-lock sessions
+	Entries  []journal.Entry
 }
 
 // Live reports whether the session's command may still be running.
@@ -60,8 +63,16 @@ func load(dir string) (*Session, error) {
 	if b, err := os.ReadFile(filepath.Join(dir, "cmd")); err == nil {
 		s.Cmd = strings.TrimSpace(string(b))
 	}
-	if _, err := os.Stat(filepath.Join(dir, "undone")); err == nil {
+	if fi, err := os.Stat(filepath.Join(dir, "undone")); err == nil {
 		s.Undone = true
+		s.UndoneAt = fi.ModTime()
+		// Markers written before undo recorded a time are empty; their
+		// mtime above is the fallback, and it says the same thing.
+		if b, err := os.ReadFile(filepath.Join(dir, "undone")); err == nil {
+			if t, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(string(b))); err == nil {
+				s.UndoneAt = t
+			}
+		}
 	}
 	if _, err := os.Stat(filepath.Join(dir, "done")); err == nil {
 		s.Done = true
@@ -148,18 +159,33 @@ func Latest() (*Session, error) {
 	return nil, os.ErrNotExist
 }
 
-// LatestUndone returns the most recent session in the undone state.
+// LatestUndone returns the session that was undone most recently, which is
+// the one a bare `undo redo` should re-apply.
+//
+// Not the newest undone session by command time: after undoing two commands
+// in a row, the second undo targets the older command, so the session you
+// just undid is the older one. Picking by command time would re-apply the
+// wrong session and leave the one you actually undid still reverted.
 func LatestUndone() (*Session, error) {
 	all, err := List()
 	if err != nil {
 		return nil, err
 	}
+	var best *Session
 	for _, s := range all {
-		if len(s.Entries) > 0 && s.Undone {
-			return s, nil
+		if len(s.Entries) == 0 || !s.Undone {
+			continue
+		}
+		// all is newest-command-first, so a strict > keeps that as the
+		// tiebreak when two markers share a timestamp
+		if best == nil || s.UndoneAt.After(best.UndoneAt) {
+			best = s
 		}
 	}
-	return nil, os.ErrNotExist
+	if best == nil {
+		return nil, os.ErrNotExist
+	}
+	return best, nil
 }
 
 // Create makes a fresh session directory for cmd, ready for the shim.
@@ -265,12 +291,15 @@ func (s *Session) Remove() error {
 	return os.RemoveAll(s.Dir)
 }
 
-// MarkUndone records that a session was reverted.
+// MarkUndone records that a session was reverted, and when.
 func (s *Session) MarkUndone() error {
-	if err := os.WriteFile(filepath.Join(s.Dir, "undone"), nil, 0o644); err != nil {
+	at := time.Now()
+	body := at.Format(time.RFC3339Nano) + "\n"
+	if err := os.WriteFile(filepath.Join(s.Dir, "undone"), []byte(body), 0o644); err != nil {
 		return err
 	}
 	s.Undone = true
+	s.UndoneAt = at
 	return nil
 }
 
@@ -281,5 +310,6 @@ func (s *Session) ClearUndone() error {
 		return err
 	}
 	s.Undone = false
+	s.UndoneAt = time.Time{}
 	return nil
 }
