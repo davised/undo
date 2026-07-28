@@ -23,9 +23,21 @@ const SHELLS: Array<{ id: ShellId; label: string; rc: string; reload: string }> 
   },
 ]
 
-const hookCmd = (sh: ShellId, sys: boolean) => {
-  const dir = sys ? '/usr/share/undo' : '~/.local/share/undo'
+// Where the hooks land depends on who installed them: the one-liner and
+// `make install` use ~/.local, distro packages /usr, and Homebrew its own
+// prefix. Pointing brew users at ~/.local was issue #5.
+type Where = 'user' | 'system' | 'brew'
+
+const hookCmd = (sh: ShellId, where: Where) => {
   const rc = SHELLS.find((s) => s.id === sh)!.rc
+  if (where === 'brew') {
+    // double quotes so the prefix is resolved once, now, and the rc ends up
+    // with a plain path. Left unexpanded it would run brew, a Ruby program,
+    // on every shell startup. $(brew --prefix)/share is the linked path, so
+    // it keeps working across upgrades. fish 3.4+ understands $() too.
+    return `echo "source $(brew --prefix)/share/undo/undo.${sh}" >> ${rc}`
+  }
+  const dir = where === 'system' ? '/usr/share/undo' : '~/.local/share/undo'
   return `echo 'source ${dir}/undo.${sh}' >> ${rc}`
 }
 
@@ -45,7 +57,7 @@ const methodsFor = (sh: ShellId): Method[] => [
     note: 'Linuxbrew. Add the hook line yourself, then reload.',
     lines: [
       { cmd: 'brew install edaywalid/tap/undo' },
-      { cmd: hookCmd(sh, false) },
+      { cmd: hookCmd(sh, 'brew') },
       { cmd: SHELLS.find((s) => s.id === sh)!.reload },
     ],
   },
@@ -55,7 +67,7 @@ const methodsFor = (sh: ShellId): Method[] => [
     note: 'From the AUR. Add the hook line yourself, then reload.',
     lines: [
       { cmd: 'yay -S undo-cli-bin', comment: 'or: paru -S undo-cli-bin' },
-      { cmd: hookCmd(sh, true) },
+      { cmd: hookCmd(sh, 'system') },
       { cmd: SHELLS.find((s) => s.id === sh)!.reload },
     ],
   },
@@ -65,7 +77,7 @@ const methodsFor = (sh: ShellId): Method[] => [
     note: '.deb from the releases page. Hook line is manual here.',
     lines: [
       { cmd: 'sudo dpkg -i undo_*_linux_amd64.deb' },
-      { cmd: hookCmd(sh, true) },
+      { cmd: hookCmd(sh, 'system') },
       { cmd: SHELLS.find((s) => s.id === sh)!.reload },
     ],
   },
@@ -75,7 +87,7 @@ const methodsFor = (sh: ShellId): Method[] => [
     note: '.rpm from the releases page. Hook line is manual here.',
     lines: [
       { cmd: 'sudo rpm -i undo_*_linux_amd64.rpm' },
-      { cmd: hookCmd(sh, true) },
+      { cmd: hookCmd(sh, 'system') },
       { cmd: SHELLS.find((s) => s.id === sh)!.reload },
     ],
   },
@@ -86,7 +98,7 @@ const methodsFor = (sh: ShellId): Method[] => [
     lines: [
       { cmd: 'git clone https://github.com/edaywalid/undo && cd undo' },
       { cmd: 'make install' },
-      { cmd: hookCmd(sh, false) },
+      { cmd: hookCmd(sh, 'user') },
     ],
   },
 ]

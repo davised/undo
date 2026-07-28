@@ -136,8 +136,24 @@ echo 'source /usr/share/undo/undo.bash' >> ~/.bashrc && exec bash
 echo 'source /usr/share/undo/undo.fish' >> ~/.config/fish/config.fish && exec fish
 ```
 
-Installing from source or the one-liner puts the hooks in
-`~/.local/share/undo/` instead of `/usr/share/undo/`.
+Those paths are for a distro package. The hooks land somewhere else for
+the other channels:
+
+| Installed with | Hook directory |
+| --- | --- |
+| `.deb`, `.rpm`, AUR | `/usr/share/undo/` |
+| the one-liner, `make install` | `~/.local/share/undo/` |
+| Homebrew | `$(brew --prefix)/share/undo/` |
+
+For Homebrew, let the shell resolve the prefix as you write the line, so
+your rc ends up with a plain path:
+
+```sh
+echo "source $(brew --prefix)/share/undo/undo.bash" >> ~/.bashrc && exec bash
+```
+
+Use double quotes there. Left unexpanded, that runs `brew` on every
+shell startup, and it is a Ruby program.
 
 ### 3. Check it works
 
@@ -359,6 +375,19 @@ The end-to-end suite (`test/e2e.sh`) arms the shim exactly as the hooks
 do and exercises real deletions, overwrites, renames, undo, redo, ignore
 rules, and `gc` against a temp directory. See
 [CONTRIBUTING.md](CONTRIBUTING.md) for layout and the release process.
+
+## Star history
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/star-history-dark.svg" />
+  <source media="(prefers-color-scheme: light)" srcset="assets/star-history-light.svg" />
+  <img alt="Star history for edaywalid/undo" src="assets/star-history-light.svg" width="700" />
+</picture>
+
+<sub>Redrawn weekly by
+[`.github/workflows/star-history.yml`](.github/workflows/star-history.yml).
+GitHub closed the stargazers endpoint to anonymous callers, so the usual
+third-party chart embeds no longer render.</sub>
 
 ## License
 
