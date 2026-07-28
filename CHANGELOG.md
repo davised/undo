@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.2.7 - 2026-07-28
+
+- `undo redo` re-applies the session you undid last, not the one whose
+  command ran last. Undoing twice steps backwards in time, so the second
+  undo targets the older command; redo then picked the newer session,
+  put that one back, and left the session you had just undone still
+  reverted. Only reachable from the second undo onward, which is why
+  undo and redo on a single session never showed it. The `undone` marker
+  now records when the undo happened. Markers written before this are
+  empty and fall back to their mtime, so existing session stores keep
+  working.
+- The site leads with the install command instead of a button that
+  scrolled somewhere else, and lists the distros, shells and
+  architectures it runs on next to it. The whole page also renders
+  without JavaScript again; everything below the hero, the install
+  instructions included, used to animate in from transparent and stayed
+  blank when the script never ran.
+
 ## v0.2.6 - 2026-07-26
 
 - The installer now **asks** before touching your shell rc, showing the
