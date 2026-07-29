@@ -239,6 +239,14 @@ These hold for every change:
    newer glibc then refuses to load on older hosts. Verified: a shim calling
    `strtoul` built on a recent glibc requires `GLIBC_2.38`, while the same
    shim without it requires only `GLIBC_2.34`. CI must assert the floor.
+
+   **Corollary for heterogeneous fleets.** Build against the oldest *widely
+   deployed* generation, not the newest and not the absolute oldest. Nodes
+   older than that floor, or on architectures upstream does not ship binaries
+   for, need a source build or explicit exclusion. State the resulting
+   coverage as a number rather than assuming the fleet is uniform — a shim
+   that silently fails to load produces exactly the symptom undo is meant to
+   eliminate, a user who believes they are protected and is not.
 3. **No site-specific data in this repository.** See below.
 
 ## Degradation ladder
