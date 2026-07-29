@@ -103,17 +103,44 @@ from the file being saved.
    boundary) or the root is reached.
 3. Track the **highest** ancestor that is still on `d`, is owned by the
    effective uid, and is writable.
-4. That ancestor is the store root; backups go to
+4. **Reject the candidate if it is the operated-on path itself, or a
+   descendant of it.** See "Containment guard" below.
+5. That ancestor is the store root; backups go to
    `<ancestor>/.undo/<session-id>/`.
-5. If no such ancestor exists, return failure and fall back to
+6. If no such ancestor exists, return failure and fall back to
    `$UNDO_SESSION/data` (upstream behavior).
+
+**Containment guard.** A store root that lies inside the tree being modified
+would place backups in the directory they exist to protect — a recursive
+delete would then race its own safety net. This is reachable whenever the
+highest owned ancestor is itself the target: `rm -rf <your top-level
+directory on a volume>` resolves the store to that same directory.
+
+The check is a prefix comparison against the path being operated on, and on
+failure the resolution falls back to `$UNDO_SESSION/data`. It is cheap and it
+closes a data-loss failure mode, so it belongs in the algorithm rather than in
+documentation.
+
+This was found by testing on a filesystem whose per-user directories sit under
+a group-owned parent, where the walk terminated lower than intended and landed
+on a directory inside the working tree.
 
 **Why "owned by the caller" rather than merely writable.** On shared storage
 the mount root is typically not user-writable, while a directory the user owns
 inside the volume is. Selecting the highest *owned* ancestor lands on the
 user's own top-level directory on that volume, which is both writable and a
 natural place for a private store. Selecting merely the highest *writable*
-ancestor risks landing in a shared directory.
+ancestor risks landing in a shared directory, where one user's backups would
+sit in space belonging to everyone.
+
+**Deployment consequence.** Volumes differ in whether per-user directories are
+user-owned or sit beneath a group-owned parent. Where the parent is
+group-owned and the user has no directory of their own yet, the walk finds no
+owned ancestor and undo degrades to capped copies in the session directory —
+safe, but much less useful. Deployment must therefore pre-create the per-user
+directory on such volumes. This is deliberately fixed in deployment rather
+than by relaxing the ownership test in code, because relaxing it reintroduces
+the shared-directory problem above.
 
 **Why runtime resolution rather than configuration.** It requires no site map,
 survives heterogeneous hosts, needs no update when mounts are added or
@@ -127,15 +154,25 @@ table, so the walk happens at most once per filesystem per process.
 store directory must happen with the `in_shim` guard held, or undo will
 journal its own bookkeeping as user activity.
 
-### 3. Reflink-aware copying via `FICLONE`
+### 3. Reflink-aware copying: a three-tier ladder
 
-For in-place overwrites, attempt `ioctl(out_fd, FICLONE, in_fd)` before
-falling back to a read/write loop.
+For in-place overwrites, try progressively cheaper mechanisms:
 
-- **Success** means the filesystem cloned the extents: the copy allocated
-  nothing and took constant time. The size cap does not apply.
-- **Failure** (`EOPNOTSUPP`, `EXDEV`, `EINVAL`) means a real byte copy is
-  required. Fall back to the read/write loop **with** the cap applied.
+1. **`ioctl(out_fd, FICLONE, in_fd)`** — success means the filesystem shared
+   the extents: nothing was allocated and the operation was constant-time.
+   **The size cap does not apply.**
+2. **`copy_file_range(2)`** — may offload the copy to the server, avoiding a
+   round trip through the client, but still allocates a full second copy.
+   Saves time and network, not space, so **the cap still applies**.
+3. **read/write loop** — the universal fallback. **Cap applies.**
+
+Only tier 1 changes the economics; tiers 2 and 3 differ in speed alone. The
+cap therefore keys on whether tier 1 succeeded, not on which tier ran.
+
+Tier 2 is worth keeping even though it is useless on some filesystems: on
+network filesystems with server-side copy support but no reflink — object
+stores in particular — it is the only acceleration available, and it is
+measurably faster than tier 3 there.
 
 **Why `FICLONE` and not `copy_file_range`.** `copy_file_range` is the more
 obvious choice but is unsuitable here: on network filesystems without
@@ -228,6 +265,9 @@ is reported:
   stores.
 - **Reflink path** on a reflink-capable loopback image; assert the cap is
   bypassed only when `FICLONE` actually succeeded.
+- **Containment guard**, asserting that a recursive delete of the directory
+  that would otherwise host the store falls back to the session directory
+  instead of writing backups into the tree being destroyed.
 - **Accounting**, asserting a large hardlinked backup survives GC while an
   equally large copied backup is pruned.
 - **Invariant test:** with the store unwritable, every interposed call must
