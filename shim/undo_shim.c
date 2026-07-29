@@ -547,11 +547,9 @@ int rmdir(const char *path)
     int ok;
     handle_rmdir_pre(AT_FDCWD, path, abs, mode, &ok);
     int rc = real_rmdir(path);
-    if (rc == 0 && ok) {
-        in_shim = 1;
+    if (rc == 0 && ok)
         jwrite("rmdir", abs, mode, NULL);
-        in_shim = 0;
-    }
+    in_shim = 0;
     return rc;
 }
 
