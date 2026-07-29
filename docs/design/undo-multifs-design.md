@@ -34,10 +34,20 @@ Two mechanisms, with very different economics:
   byte copies, capped by `UNDO_MAX_BYTES` (256 MiB default). Above the cap the
   shim writes a `lost` journal record and saves nothing.
 
-The journal already records backup locations as absolute paths, and the Go
-restore path already tolerates cross-device moves. **The storage format needs
-no change** to support distributed backups — only the code that chooses where
-a backup goes.
+The journal already records backup locations as absolute paths, so distributed
+backups need no change to how locations are *expressed*. Two related claims
+are, however, false, and were corrected after review:
+
+- **The journal does need one additive field.** The save method (hardlink,
+  reflink, or byte copy) cannot be recovered after the fact — see item 4 — so
+  the shim must record it at save time. The field is appended, and
+  `journal.Read` already tolerates trailing fields, so older readers degrade
+  gracefully.
+- **Restore does not already tolerate cross-device moves.** `moveAny` does,
+  but five call sites bypass it and call `os.Rename` directly
+  (`restore.go:283–285`, `:303`, `:314`), plus `swapAny` at `:90`. These fail
+  `EXDEV` once the store is on a different filesystem from the target and must
+  be converted. This is required work, not an inherited property.
 
 ## Failure modes on a multi-filesystem host
 
@@ -116,14 +126,44 @@ delete would then race its own safety net. This is reachable whenever the
 highest owned ancestor is itself the target: `rm -rf <your top-level
 directory on a volume>` resolves the store to that same directory.
 
-The check is a prefix comparison against the path being operated on, and on
-failure the resolution falls back to `$UNDO_SESSION/data`. It is cheap and it
-closes a data-loss failure mode, so it belongs in the algorithm rather than in
-documentation.
+Found by testing on a filesystem whose per-user directories sit under a
+group-owned parent, where the walk terminated inside the working tree.
 
-This was found by testing on a filesystem whose per-user directories sit under
-a group-owned parent, where the walk terminated lower than intended and landed
-on a directory inside the working tree.
+A naive prefix comparison is **not** sufficient, for three reasons:
+
+1. `abs_path` (`undo_shim.c:122`) does no normalization — it concatenates cwd
+   or the `/proc/self/fd` link with the given path. `..` components, doubled
+   separators, and symlinks all survive, so `/x/tree/../tree` does not compare
+   equal to `/x/tree`.
+2. Prefix matching without a separator boundary confuses `/x/a` with `/x/ab`.
+3. The `$UNDO_SESSION/data` fallback may itself lie beneath the operated tree,
+   so falling back is not automatically safe.
+
+The guard therefore compares on `/`-delimited component boundaries, rejects
+any candidate containing unresolved `..`, and applies the same containment
+test to the fallback. Full symlink resolution is deliberately **not**
+attempted on every call — `realpath` on a network filesystem is expensive and
+the shim is on the hot path — so aliasing through symlinks or bind mounts
+remains a known, documented gap rather than a solved problem.
+
+**Store creation must not change the operation's outcome.** Creating
+`.undo/` inside a directory can make an otherwise-successful `rmdir` fail with
+`ENOTEMPTY`, which violates Invariant 1. Mitigations, in order:
+
+- Place the store as high as possible (the algorithm already maximizes
+  height), so it is rarely a sibling of anything being removed.
+- Create the store lazily, on the first backup that actually needs it.
+- Never create it inside the operated path (the guard above).
+- On `rmdir`/`unlinkat(AT_REMOVEDIR)` failure, if the target directory's only
+  remaining entry is our own store, remove the store and retry once.
+
+The last item is the only one that fully closes the hole, and it is required.
+
+**Which path drives selection for renames.** A rename has a source, a
+destination, and possibly an overwritten destination inode. The backup taken
+is of the *destination* being overwritten (`undo_shim.c:483`), so the
+destination path selects the store. Containment is checked against both source
+and destination. `RENAME_EXCHANGE` takes no backup and needs no store.
 
 **Why "owned by the caller" rather than merely writable.** On shared storage
 the mount root is typically not user-writable, while a directory the user owns
@@ -147,8 +187,32 @@ survives heterogeneous hosts, needs no update when mounts are added or
 removed, and — usefully — encodes nothing site-specific in the source.
 
 **Caching.** The upward walk costs several `stat(2)` calls, which on network
-filesystems are round trips. Results are cached per `st_dev` in a small fixed
-table, so the walk happens at most once per filesystem per process.
+filesystems are round trips. Results are cached in a small fixed table so the
+walk happens at most once per filesystem per thread.
+
+Two constraints on the cache, both from review:
+
+- **`st_dev` alone is not a sufficient key.** The resolved root is
+  path-dependent: one filesystem can hold several user-owned subtrees beneath
+  different group-owned parents, and whichever path resolves first would
+  otherwise supply a root that is not an ancestor of later paths — silently
+  invalidating the containment decision. A cache hit is therefore accepted
+  only if the cached root is still an ancestor of the current path; otherwise
+  the walk re-runs.
+- **The cache is thread-local**, like the existing journal descriptor
+  (`undo_shim.c:50`). A process-wide table would need locking, and taking a
+  lock inside an interposer invites deadlock and leaves undefined state across
+  `fork`. Per-thread walks cost more `stat` calls than a shared table but
+  avoid both hazards, and the existing unsynchronized `dedup_tab`
+  (`undo_shim.c:344`) is a precedent worth not repeating.
+
+**Accepted risk: TOCTOU.** The resolver stats `P`, walks its parents, then
+links or opens `P`. Components can be renamed, replaced, or mounted over in
+between, so a backup may land on a different filesystem than the inode that is
+ultimately destroyed. The existing code already has a pre-operation race
+(`undo_shim.c:380`); this widens it. Closing it properly needs directory-fd
+resolution and device revalidation throughout, which is a larger change than
+this design takes on. Documented, not solved.
 
 **Implementation trap.** `mkdir` is itself interposed by the shim. Creating a
 store directory must happen with the `in_shim` guard held, or undo will
@@ -159,15 +223,20 @@ journal its own bookkeeping as user activity.
 For in-place overwrites, try progressively cheaper mechanisms:
 
 1. **`ioctl(out_fd, FICLONE, in_fd)`** — success means the filesystem shared
-   the extents: nothing was allocated and the operation was constant-time.
-   **The size cap does not apply.**
+   the extents, so the operation was constant-time and allocated nothing
+   *immediately*. **The size cap still applies**, because the original is
+   about to be overwritten and the shared extents will diverge: the allocation
+   is deferred, not avoided. Tier 1 buys latency and avoids a network round
+   trip; it does not make a large backup free. See item 4.
 2. **`copy_file_range(2)`** — may offload the copy to the server, avoiding a
    round trip through the client, but still allocates a full second copy.
    Saves time and network, not space, so **the cap still applies**.
 3. **read/write loop** — the universal fallback. **Cap applies.**
 
-Only tier 1 changes the economics; tiers 2 and 3 differ in speed alone. The
-cap therefore keys on whether tier 1 succeeded, not on which tier ran.
+All three tiers are subject to the size cap; they differ in latency and in
+whether bytes cross the network. Only a *hardlink* — used for deletions, where
+the original inode survives untouched — is genuinely free, and hardlinks are
+not part of this ladder.
 
 Tier 2 is worth keeping even though it is useless on some filesystems: on
 network filesystems with server-side copy support but no reflink — object
@@ -186,23 +255,44 @@ two orders of magnitude faster than a read/write copy; on an NFS mount,
 
 `ioctl` does not raise the glibc symbol floor.
 
-### 4. Split GC accounting by link count
+### 4. GC accounting by recorded save method
 
-Classify each backup by `st_nlink`:
+An earlier version of this design classified backups at GC time by
+`st_nlink` — treating `nlink > 1` as a hardlink and `nlink == 1` as a copy.
+**That is wrong and was removed.** The shim hardlinks the file and then the
+real `unlink` immediately removes the original, so the link count returns to 1
+before GC ever runs. A hardlink backup is indistinguishable from a copy by the
+time anything inspects it. Reflinked backups also have `nlink == 1`.
 
-- `nlink > 1` — **held**. A hardlink; allocates nothing. Its cost is deferred
-  reclamation, not disk consumption.
-- `nlink == 1` — **copied**. Real allocated bytes.
+The save method is knowable only at save time, so the shim records it:
 
-`UNDO_MAX_STORE` applies to **copied** bytes only. Held bytes are governed
-separately, by session count and by a new age limit.
+| Method | Allocates | Budget treatment |
+|---|---|---|
+| hardlink | nothing | excluded from the size budget |
+| reflink (`FICLONE`) | nothing *initially* | counted at full logical size |
+| byte copy | full size | counted at full logical size |
 
-Add `UNDO_MAX_AGE` for time-based expiry. On scratch-like storage "keep four
-hours" bounds the deferred-reclamation surprise more naturally than "keep
-thirty commands".
+**Why reflinks are counted at full size.** A reflink shares extents with the
+original — but undo's use case is to back up a file that is *about to be
+overwritten*. As the original is rewritten the extents diverge and the space
+is really consumed. Treating a reflink as free would let the store silently
+grow past its budget. The clone buys latency and avoids a network round trip;
+it does not reliably avoid allocation. Counting pessimistically is the safe
+error.
 
-Without this change, item 2 above makes the hardlink mechanism useless for
-exactly the large files it exists to protect.
+`UNDO_MAX_STORE` therefore applies to reflinked and copied bytes. Hardlinked
+bytes are governed by session count and by a new `UNDO_MAX_AGE` time limit,
+since their cost is deferred reclamation rather than allocation.
+
+Without this, the size budget makes the hardlink mechanism useless for exactly
+the large files it exists to protect: a hardlinked backup counted at full size
+is evicted on the next command.
+
+**Orphan recovery.** Distributed backups are deleted by reading the session's
+journal, so a lost or truncated journal orphans them beyond the reach of GC.
+`undo gc` gains a sweep that removes `.undo/<session-id>/` directories under
+known store roots whose session no longer exists. Without it, storage leaks
+are unrecoverable without manual cleanup.
 
 ### 5. Make unprotected files visible
 
@@ -275,7 +365,21 @@ is reported:
   bypassed only when `FICLONE` actually succeeded.
 - **Containment guard**, asserting that a recursive delete of the directory
   that would otherwise host the store falls back to the session directory
-  instead of writing backups into the tree being destroyed.
+  instead of writing backups into the tree being destroyed; plus the boundary
+  cases — `/x/a` vs `/x/ab`, paths containing `..`, and a fallback that itself
+  lies under the operated tree.
+- **`rmdir` must still succeed** when the only thing left in the target
+  directory is undo's own store. This is the concrete form of Invariant 1 and
+  the one most likely to regress.
+- **Save-method recording**, asserting a hardlinked backup is still identified
+  as a hardlink after the original is unlinked — the failure that killed the
+  `st_nlink` approach.
+- **Cross-device restore**, exercising every `os.Rename` call site in
+  `restore.go` with the store on a different filesystem from the target,
+  including the exchange and directory-parking paths that currently bypass
+  `moveAny`.
+- **Orphan sweep**, asserting `undo gc` reclaims distributed backups whose
+  session journal was deleted.
 - **Accounting**, asserting a large hardlinked backup survives GC while an
   equally large copied backup is pruned.
 - **Invariant test:** with the store unwritable, every interposed call must
