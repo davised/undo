@@ -209,5 +209,35 @@ out=$("$UNDO" doctor 2>&1) || fail "doctor exited non-zero: $out"
 grep -q "\[ok  \] capture" <<<"$out" || fail "doctor capture check did not pass"
 grep -q "\[ok  \] restore" <<<"$out" || fail "doctor restore check did not pass"
 
+echo "== case 21: a failed rmdir does not silence the rest of the process"
+# The shim uses a thread-local flag to avoid re-entering itself. rmdir used to
+# clear that flag only when the rmdir succeeded and was journaled, so a single
+# ENOTEMPTY left the shim disabled for the remainder of the process and every
+# later change went unrecorded while still happening on disk.
+#
+# This has to be one compiled program: rmdir(1) and rm(1) are separate
+# processes and the flag is thread-local, so a shell-based test would pass
+# whether or not the bug is present.
+mkdir -p "$PLAY/guard/sub"
+touch "$PLAY/guard/sub/x"
+echo "precious" >"$PLAY/guard/keep.txt"
+cat >"$WORK/guard.c" <<'CEOF'
+#include <unistd.h>
+/* rmdir fails with ENOTEMPTY, then the unlink must still be journaled */
+int main(int c, char **v) { (void)c; rmdir(v[1]); return unlink(v[2]); }
+CEOF
+if cc -o "$WORK/guard" "$WORK/guard.c" 2>/dev/null; then
+    run_armed "$WORK/guard $PLAY/guard $PLAY/guard/keep.txt"
+    [[ ! -e $PLAY/guard/keep.txt ]] || fail "the unlink did not run"
+    # When the guard leaks there is no session at all, so undo exits non-zero
+    # with "nothing to undo". Tolerate that here so the assertion below is
+    # what reports the failure, rather than set -e aborting first.
+    "$UNDO" -y >/dev/null 2>&1 || true
+    [[ -e $PLAY/guard/keep.txt && $(cat "$PLAY/guard/keep.txt") == precious ]] ||
+        fail "an unlink after a failed rmdir was not captured"
+else
+    echo "   (no cc, skipped)"
+fi
+
 echo
 echo "all cases passed"
