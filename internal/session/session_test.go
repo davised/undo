@@ -299,3 +299,40 @@ func TestRemoveLeavesAnotherSessionsStoreAlone(t *testing.T) {
 		t.Fatal("removing one session deleted another session's backup")
 	}
 }
+
+func TestRemoveRefusesSymlinkedStoreDirectory(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	s, err := Create("something")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A file that has nothing to do with undo.
+	outside := t.TempDir()
+	precious := filepath.Join(outside, "precious.txt")
+	if err := os.WriteFile(precious, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A store whose <session-id> component is a symlink pointing at it. On
+	// shared storage another user can pre-create this: the shim's mkdir gets
+	// EEXIST and carries on, and the lexical shape check still passes.
+	vol := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(vol, ".undo"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(vol, ".undo", s.ID)); err != nil {
+		t.Fatal(err)
+	}
+	writeJournal(t, s, "unlink\t"+filepath.Join(vol, "gone.txt")+"\t"+
+		filepath.Join(vol, ".undo", s.ID, "precious.txt")+"\n")
+
+	reloaded, err := Get(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reloaded.Remove(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(precious); err != nil {
+		t.Fatal("purge deleted a file outside the store by following a symlinked store directory")
+	}
+}

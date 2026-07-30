@@ -335,6 +335,43 @@ func inStore(path, id string) bool {
 // now cannot be removed, and refusing to drop the session over it would leave
 // a session nothing can ever delete. The gc orphan sweep is the backstop for
 // exactly that case.
+// realDir reports whether path is a directory in its own right rather than a
+// symlink to one. Lstat does not follow the final component, so a symlink
+// reports ModeSymlink and fails IsDir.
+func realDir(path string) bool {
+	fi, err := os.Lstat(path)
+	return err == nil && fi.Mode().IsDir()
+}
+
+// ownedByCaller reports whether path belongs to the user running this process.
+func ownedByCaller(path string) bool {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	return ok && int(st.Uid) == os.Getuid()
+}
+
+// safeStore reports whether storeDir is a store we may delete inside: it and
+// its parent .undo must both be real directories, and the store itself must
+// belong to us.
+//
+// inStore checks the shape of a path; this checks what is actually on disk,
+// and both are needed. The shape check is purely lexical, so if
+// <root>/.undo/<id> is a symlink then os.Remove follows it and purge deletes
+// files somewhere else entirely. On shared storage another user can arrange
+// exactly that: the shim's mkdir gets EEXIST on the existing symlink and
+// carries on.
+//
+// The .undo directory itself is not required to be ours. On a shared volume it
+// may legitimately have been created by whoever ran undo there first, with our
+// own <id> directory inside it.
+func safeStore(storeDir string) bool {
+	return realDir(storeDir) && ownedByCaller(storeDir) &&
+		realDir(filepath.Dir(storeDir))
+}
+
 func (s *Session) removeDistributedBackups() {
 	prefix := s.Dir + string(os.PathSeparator)
 	stores := make(map[string]bool)
@@ -344,6 +381,9 @@ func (s *Session) removeDistributedBackups() {
 		}
 		if !inStore(p, s.ID) {
 			continue // not ours to delete
+		}
+		if !safeStore(filepath.Dir(p)) {
+			continue // right shape, wrong thing on disk
 		}
 		os.Remove(p)
 		stores[filepath.Dir(p)] = true
