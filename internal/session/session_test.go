@@ -336,3 +336,60 @@ func TestRemoveRefusesSymlinkedStoreDirectory(t *testing.T) {
 		t.Fatal("purge deleted a file outside the store by following a symlinked store directory")
 	}
 }
+
+func TestUnprotectedCounting(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want int
+	}{
+		{"a clean deletion", "unlink\t/f\t/v/.undo/S/1-1\tlink\n", 0},
+		{"the shim saved nothing", "lost\t/f\twrite\n", 1},
+		{"a discarded backup", "unlink\t/f\t-\tlink\n", 1},
+		{"a discarded mod backup", "mod\t/f\t-\tcopy\n", 1},
+		// A rename that overwrote nothing legitimately has no backup. It is
+		// fully restorable and must not be counted, which is why the method
+		// field has to be consulted rather than just the "-".
+		{"a rename that overwrote nothing", "rename\t/a\t/b\t-\tnone\n", 0},
+		{"a rename whose backup was discarded", "rename\t/a\t/b\t-\tlink\n", 1},
+		{"a rename whose target could not be saved", "rename\t/a\t/b\t-\tlost\n", 1},
+		{"a journal predating the method field", "unlink\t/f\t/v/.undo/S/1-1\n", 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("UNDO_DATA_DIR", t.TempDir())
+			s, err := Create("cmd")
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeJournal(t, s, c.line)
+			reloaded, err := Get(s.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := reloaded.Unprotected(); got != c.want {
+				t.Errorf("Unprotected() = %d, want %d", got, c.want)
+			}
+		})
+	}
+}
+
+func TestUnprotectedCountsAcrossAWholeSession(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	s, err := Create("rm -rf big")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeJournal(t, s,
+		"unlink\t/v/a\t/v/.undo/S/1-1\tlink\n"+
+			"lost\t/v/huge.bin\twrite\n"+
+			"unlink\t/v/b\t-\tlink\n"+
+			"rename\t/v/c\t/v/d\t-\tnone\n")
+	reloaded, err := Get(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.Unprotected(); got != 2 {
+		t.Errorf("Unprotected() = %d, want 2", got)
+	}
+}

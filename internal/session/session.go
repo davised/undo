@@ -310,6 +310,33 @@ func (s *Session) backupPaths() []string {
 	return out
 }
 
+// Unprotected counts the entries this session cannot restore.
+//
+// Three journal states land here, all of them already recorded by the shim: a
+// `lost` record, meaning no backup could be taken at all; a backup that
+// existed and was discarded when its store was destroyed; and a rename whose
+// overwritten target could not be saved. They reduce to one rule -- a "-"
+// backup whose method is anything other than "none".
+//
+// The method has to be consulted rather than just testing for "-", because
+// `rename old new - none` is a rename that overwrote nothing, needed no
+// backup, and restores perfectly. It is the most common entry in a real
+// journal, and counting it would make the warning fire on almost every
+// session -- a warning that cries wolf is one nobody reads.
+func (s *Session) Unprotected() int {
+	n := 0
+	for _, e := range s.Entries {
+		if e.Op == journal.OpLost {
+			n++
+			continue
+		}
+		if e.Backup() == "-" && e.Method() != "none" {
+			n++
+		}
+	}
+	return n
+}
+
 // inStore reports whether path sits directly inside a store directory
 // belonging to session id -- that is, whether it looks like
 // <root>/.undo/<id>/<name>.
