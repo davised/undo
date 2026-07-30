@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.2.8 - 2026-07-29
+
+- Homebrew install instructions pointed at the wrong hook path. The site
+  reused the one-liner's `~/.local/share/undo/`, but the formula puts the
+  hooks under the Homebrew prefix, so the source line failed with "No
+  such file or directory". The README's "Turn it on" section had the same
+  gap. Both now list where the hooks land per install channel, and the
+  Homebrew line resolves `$(brew --prefix)` as it is written rather than
+  running brew on every shell startup. Reported by @B4xtr in #5.
+
 ## v0.2.7 - 2026-07-28
 
 - `undo redo` re-applies the session you undid last, not the one whose
