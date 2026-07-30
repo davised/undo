@@ -81,7 +81,14 @@ grep -q "nothing to undo" <<<"$out" || fail "expected nothing to undo, got: $out
 echo "== case 7: refuses to clobber without --force"
 run_armed "rm $PLAY/top.txt"
 echo "newer content" >"$PLAY/top.txt"
-"$UNDO" -y 2>&1 | grep -q "skipped" || fail "expected a skip warning"
+# Captured rather than piped into grep -q, and it needs to stay that way. undo
+# prints the skip lines and then "restored N change(s)"; grep -q exits at the
+# first match, so that trailing write lands on a closed pipe, Go re-raises
+# SIGPIPE on stdout, and undo dies 141. Under `set -o pipefail` that fails the
+# pipeline even though grep matched -- an intermittent failure of an assertion
+# that actually passed, seen about once in 25 runs.
+out=$("$UNDO" -y 2>&1 || true)
+grep -q "skipped" <<<"$out" || fail "expected a skip warning, got: $out"
 [[ $(cat "$PLAY/top.txt") == "newer content" ]] || fail "clobbered without force"
 
 echo "== case 8: undo run arms the shim without a hook"
