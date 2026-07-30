@@ -1064,8 +1064,14 @@ int unlink(const char *path)
     const char *method = "none";
     handle_unlink_pre(AT_FDCWD, path, abs, bak, lnk, &kind, &method, foreign_sid);
     int rc = real_unlink(path);
+    int saved = errno;
+    /* The post hook journals, and on failure unlinks the backup it took.
+     * Both run syscalls that overwrite errno, so a caller whose operation
+     * genuinely failed would otherwise see the bookkeeping's errno instead of
+     * its own. */
     handle_unlink_post(rc, abs, bak, lnk, kind, method, foreign_sid);
     in_shim = 0;
+    errno = saved;
     return rc;
 }
 
@@ -1149,8 +1155,14 @@ static int do_rename(int olddirfd, const char *oldp, int newdirfd,
     handle_rename_pre(olddirfd, oldp, newdirfd, newp, flags, absold, absnew,
                       bak, &kind, &method);
     int rc = call(ctx);
+    int saved = errno;
+    /* The post hook journals, and on failure unlinks the backup it took.
+     * Both run syscalls that overwrite errno, so a caller whose operation
+     * genuinely failed would otherwise see the bookkeeping's errno instead of
+     * its own. */
     handle_rename_post(rc, absold, absnew, bak, kind, method);
     in_shim = 0;
+    errno = saved;
     return rc;
 }
 
@@ -1352,11 +1364,17 @@ static int truncate_common(const char *path, int (*call)(const char *, off_t),
         lstat(abs, &st) == 0 && S_ISREG(st.st_mode) && !mod_seen(abs))
         have = save_file(abs, 1, bak, &method) == 0;
     int rc = call(path, length);
+    int saved = errno;
+    /* The post hook journals, and on failure unlinks the backup it took.
+     * Both run syscalls that overwrite errno, so a caller whose operation
+     * genuinely failed would otherwise see the bookkeeping's errno instead of
+     * its own. */
     if (rc == 0 && have)
         jwrite("mod", abs, bak, method, NULL);
     else if (have)
         unlink(bak);
     in_shim = 0;
+    errno = saved;
     return rc;
 }
 
@@ -1397,8 +1415,14 @@ static int open_common(const char *fn, int dirfd, const char *path,
     const char *method = "none";
     handle_open_pre(dirfd, path, flags, abs, bak, &kind, &method);
     int fd = real_openat(dirfd, path, flags, mode);
+    int saved = errno;
+    /* The post hook journals, and on failure unlinks the backup it took.
+     * Both run syscalls that overwrite errno, so a caller whose operation
+     * genuinely failed would otherwise see the bookkeeping's errno instead of
+     * its own. */
     handle_open_post(fd >= 0, abs, bak, kind, method);
     in_shim = 0;
+    errno = saved;
     (void)fn;
     return fd;
 }
@@ -1510,8 +1534,14 @@ static FILE *fopen_common(FILE *(*real)(const char *, const char *),
     const char *method = "none";
     handle_open_pre(AT_FDCWD, path, fopen_flags(mode), abs, bak, &kind, &method);
     FILE *f = real(path, mode);
+    int saved = errno;
+    /* The post hook journals, and on failure unlinks the backup it took.
+     * Both run syscalls that overwrite errno, so a caller whose operation
+     * genuinely failed would otherwise see the bookkeeping's errno instead of
+     * its own. */
     handle_open_post(f != NULL, abs, bak, kind, method);
     in_shim = 0;
+    errno = saved;
     return f;
 }
 
@@ -1538,7 +1568,13 @@ FILE *freopen(const char *path, const char *mode, FILE *stream)
     const char *method = "none";
     handle_open_pre(AT_FDCWD, path, fopen_flags(mode), abs, bak, &kind, &method);
     FILE *f = real_freopen(path, mode, stream);
+    int saved = errno;
+    /* The post hook journals, and on failure unlinks the backup it took.
+     * Both run syscalls that overwrite errno, so a caller whose operation
+     * genuinely failed would otherwise see the bookkeeping's errno instead of
+     * its own. */
     handle_open_post(f != NULL, abs, bak, kind, method);
     in_shim = 0;
+    errno = saved;
     return f;
 }
