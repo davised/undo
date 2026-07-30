@@ -404,5 +404,43 @@ grep -q "unprotected" <<<"$out" || fail "undo list did not flag the session: $ou
 out=$("$UNDO" -n 2>&1)
 grep -q "cannot be restored" <<<"$out" || fail "the preview did not warn: $out"
 
+echo "== case 31: destroying another session's store is recorded, not silent"
+mkdir -p "$PLAY/shared/work"
+echo "first" >"$PLAY/shared/work/one.txt"
+
+# session A deletes a file, which creates a store somewhere above it
+a=$(date +%s%N | cut -c1-16); adir="$UNDO_DATA_DIR/sessions/$a"
+mkdir -p "$adir/data"; echo "rm one" >"$adir/cmd"
+env UNDO_SESSION="$adir" LD_PRELOAD="$LIB" bash -c "rm $PLAY/shared/work/one.txt"
+sleep 0.01
+abak=$(awk -F'\t' '$1=="unlink"{print $3}' "$adir/journal" | tail -1)
+[[ -f $abak ]] || fail "session A took no backup: $(cat "$adir/journal")"
+
+# session B destroys that store while session A is already finished
+store_root=${abak%/.undo/*}
+b=$(date +%s%N | cut -c1-16); bdir="$UNDO_DATA_DIR/sessions/$b"
+mkdir -p "$bdir/data"; echo "rm -rf the store" >"$bdir/cmd"
+env UNDO_SESSION="$bdir" LD_PRELOAD="$LIB" bash -c "rm -rf $store_root/.undo"
+sleep 0.01
+
+[[ ! -e $abak ]] || fail "the backup survived; this case proves nothing"
+grep -q "^storemv" "$adir/journal" ||
+    fail "session A was not told its backup is gone: $(cat "$adir/journal")"
+
+out=$("$UNDO" list)
+grep -q "unprotected" <<<"$out" || fail "undo list did not flag session A: $out"
+
+# A dot component must not let the derived journal path escape. abs_path does
+# not normalize, so without valid_session_id the id here is ".." and the
+# journal built from it lands one level above the sessions directory.
+mkdir -p "$PLAY/trav/.undo"
+echo probe >"$PLAY/trav/probe.txt"
+c=$(date +%s%N | cut -c1-16); cdir="$UNDO_DATA_DIR/sessions/$c"
+mkdir -p "$cdir/data"; echo "traversal probe" >"$cdir/cmd"
+env UNDO_SESSION="$cdir" LD_PRELOAD="$LIB" \
+    bash -c "rm $PLAY/trav/.undo/../probe.txt"
+[[ ! -e $UNDO_DATA_DIR/journal ]] ||
+    fail "a .. component created a journal outside the sessions directory"
+
 echo
 echo "all cases passed"

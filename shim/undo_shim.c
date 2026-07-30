@@ -522,32 +522,80 @@ static int save_file(const char *abs, int need_copy, char *bak,
     return -1;
 }
 
-/* If `abs` is a backup inside this session's own store, fill `root_out` with
- * that store's root and return 1.
+/* True for a string that is a plausible session id and nothing else.
  *
- * Backups live at <root>/.undo/<session-id>/<name>, so this is a structural
- * match on the two components before the basename. */
-static int in_our_store(const char *abs, char *root_out)
+ * This is a security check, not a formatting one. The id is lifted out of a
+ * path the shim was handed, and abs_path does no normalization, so without it
+ * `rm <anything>/.undo/../x` yields an id of ".." -- and the journal path
+ * derived from that resolves outside the sessions directory, where an ordinary
+ * delete would then create a file. Requiring digits excludes ".", ".." and "/"
+ * together, and session.Create only ever produces digits. */
+static int valid_session_id(const char *s, size_t len)
 {
-    const char *sid = session_id();
-    if (!sid)
+    if (len == 0 || len > 64)
         return 0;
-    size_t sidlen = strlen(sid);
+    for (size_t i = 0; i < len; i++)
+        if (s[i] < '0' || s[i] > '9')
+            return 0;
+    return 1;
+}
 
+/* Fill root_out and sid_out for any backup path of the form
+ * <root>/.undo/<session-id>/<name>, whoever it belongs to. The caller compares
+ * sid_out against session_id() to decide whether the store is its own. */
+static int in_any_store(const char *abs, char *root_out, char *sid_out)
+{
     const char *p = abs;
     while ((p = strstr(p, "/.undo/")) != NULL) {
-        const char *after = p + 7; /* strlen("/.undo/") */
-        if (strncmp(after, sid, sidlen) == 0 && after[sidlen] == '/') {
+        const char *sid = p + 7; /* strlen("/.undo/") */
+        const char *end = strchr(sid, '/');
+        if (end && end > sid) {
             size_t rootlen = (size_t)(p - abs);
-            if (rootlen == 0 || rootlen >= PATH_MAX)
-                return 0;
-            memcpy(root_out, abs, rootlen);
-            root_out[rootlen] = 0;
-            return 1;
+            size_t sidlen = (size_t)(end - sid);
+            if (rootlen > 0 && rootlen < PATH_MAX && sidlen < PATH_MAX &&
+                valid_session_id(sid, sidlen)) {
+                memcpy(root_out, abs, rootlen);
+                root_out[rootlen] = 0;
+                memcpy(sid_out, sid, sidlen);
+                sid_out[sidlen] = 0;
+                return 1;
+            }
         }
         p += 7;
     }
     return 0;
+}
+
+/* A descriptor for another session's journal, or -1.
+ *
+ * Sessions are siblings under one directory, so $UNDO_SESSION's parent plus the
+ * id is the whole derivation -- the shim never learns UNDO_DATA_DIR and does
+ * not need to. Returns -1 unless that session directory already exists and is
+ * ours: this reports a loss to a session that is still there, and must never
+ * bring one into being. A session that is genuinely gone is left to the gc
+ * orphan sweep. */
+static int other_journal_fd(const char *sid)
+{
+    const char *dir = session_dir();
+    if (!dir)
+        return -1;
+    char base[PATH_MAX];
+    if ((size_t)snprintf(base, sizeof base, "%s", dir) >= sizeof base)
+        return -1;
+    char *slash = strrchr(base, '/');
+    if (!slash || slash == base)
+        return -1;
+    *slash = 0;
+
+    char sdir[PATH_MAX], path[PATH_MAX];
+    if ((size_t)snprintf(sdir, sizeof sdir, "%s/%s", base, sid) >= sizeof sdir)
+        return -1;
+    if (!own_real_dir(sdir))
+        return -1;
+    if ((size_t)snprintf(path, sizeof path, "%s/journal", sdir) >= sizeof path)
+        return -1;
+    REAL(open, int, const char *, int, ...);
+    return real_open(path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
 }
 
 /* Roots already evacuated by this thread, so a recursive delete does not
@@ -823,17 +871,27 @@ static int mod_seen(const char *abs)
 
 static void handle_unlink_pre(int dirfd, const char *path, char *abs,
                               char *bak, char *lnk, int *kind,
-                              const char **method)
+                              const char **method, char *foreign_sid)
 {
     *kind = 0;
     *method = "none";
+    foreign_sid[0] = 0;
     if (abs_path(dirfd, path, abs) != 0)
         return;
-    /* Something is deleting our own backups -- a recursive delete that reached
-     * the store. Get them off this filesystem before they go. */
-    char root[PATH_MAX];
-    if (in_our_store(abs, root))
-        evacuate_store(root, 0);
+    /* Something is deleting a backup. If it is ours, get the rest off this
+     * filesystem now, while they still exist. If it belongs to another
+     * session, note whose it is -- but record nothing until the unlink has
+     * actually happened, because a record written before the syscall asserts a
+     * loss that may not occur, and a failed unlink would then mark an intact
+     * backup unreachable for good. */
+    char root[PATH_MAX], sid[PATH_MAX];
+    if (in_any_store(abs, root, sid)) {
+        const char *mine = session_id();
+        if (mine && strcmp(sid, mine) == 0)
+            evacuate_store(root, 0);
+        else
+            snprintf(foreign_sid, PATH_MAX, "%s", sid);
+    }
     if (ignored(abs))
         return;
     struct stat st;
@@ -856,9 +914,19 @@ static void handle_unlink_pre(int dirfd, const char *path, char *abs,
 }
 
 static void handle_unlink_post(int rc, const char *abs, const char *bak,
-                               const char *lnk, int kind, const char *method)
+                               const char *lnk, int kind, const char *method,
+                               const char *foreign_sid)
 {
     if (rc == 0) {
+        if (foreign_sid[0]) {
+            /* This backup belonged to another session and is now really gone.
+             * That session's own journal is the only place its reader looks. */
+            int fd = other_journal_fd(foreign_sid);
+            if (fd >= 0) {
+                jwrite_to(fd, "storemv", abs, "-", NULL);
+                close(fd);
+            }
+        }
         if (kind == 1)
             jwrite("unlink", abs, bak, method, NULL);
         else if (kind == 2)
@@ -991,12 +1059,12 @@ int unlink(const char *path)
     if (!armed())
         return real_unlink(path);
     in_shim = 1;
-    char abs[PATH_MAX], bak[PATH_MAX], lnk[PATH_MAX];
+    char abs[PATH_MAX], bak[PATH_MAX], lnk[PATH_MAX], foreign_sid[PATH_MAX];
     int kind;
     const char *method = "none";
-    handle_unlink_pre(AT_FDCWD, path, abs, bak, lnk, &kind, &method);
+    handle_unlink_pre(AT_FDCWD, path, abs, bak, lnk, &kind, &method, foreign_sid);
     int rc = real_unlink(path);
-    handle_unlink_post(rc, abs, bak, lnk, kind, method);
+    handle_unlink_post(rc, abs, bak, lnk, kind, method, foreign_sid);
     in_shim = 0;
     return rc;
 }
@@ -1031,12 +1099,13 @@ int unlinkat(int dirfd, const char *path, int flags)
         return real_unlinkat(dirfd, path, flags);
     in_shim = 1;
     char abs[PATH_MAX], bak[PATH_MAX], lnk[PATH_MAX], mode[8];
+    char foreign_sid[PATH_MAX];
     int kind = 0, dirok = 0;
     const char *method = "none";
     if (flags & AT_REMOVEDIR)
         handle_rmdir_pre(dirfd, path, abs, mode, &dirok);
     else
-        handle_unlink_pre(dirfd, path, abs, bak, lnk, &kind, &method);
+        handle_unlink_pre(dirfd, path, abs, bak, lnk, &kind, &method, foreign_sid);
     int rc = real_unlinkat(dirfd, path, flags);
     int saved = errno;
     if (flags & AT_REMOVEDIR) {
@@ -1049,7 +1118,7 @@ int unlinkat(int dirfd, const char *path, int flags)
         if (rc == 0 && dirok)
             jwrite("rmdir", abs, mode, NULL);
     } else {
-        handle_unlink_post(rc, abs, bak, lnk, kind, method);
+        handle_unlink_post(rc, abs, bak, lnk, kind, method, foreign_sid);
     }
     in_shim = 0;
     errno = saved;
