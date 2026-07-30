@@ -431,6 +431,27 @@ Enforcement is mechanical, not procedural: a pre-push hook and a CI job fail
 on a denylist of site identifiers. Discipline alone is not sufficient, because
 the natural way to debug this code is to paste real paths into it.
 
+Three properties this check must have, each learned by getting it wrong:
+
+- **Nothing is exempt.** An exempt file is unscannable by definition, so it is
+  exactly where a real identifier survives review — which happened here, with
+  a live address sitting in the scanner's own test file. Fixtures are instead
+  assembled from fragments that individually match nothing, keeping the test
+  file inside coverage. The exemption list exists but is empty, and is itself
+  scanned.
+- **It must not cry wolf.** A three-component address pattern also matches
+  semver, so `"version": "10.0.0"` in a lockfile fired on every push. A noisy
+  check gets bypassed with `--no-verify`, which is worse than no check.
+- **It must not fail open.** Patterns are POSIX ERE; one borrowed from PCRE
+  makes `grep` exit 2, which reads as "no match" and silently disables
+  scanning. A separate check asserts every pattern compiles.
+
+The hook is installed by `core.hooksPath`, which git stores per clone rather
+than in the tree, so it is unset again after every fresh clone — silently.
+Setting it is therefore a prerequisite of the default `make` target, so anyone
+who builds gets it without needing to know it exists. CI runs the same checks
+regardless, since a hook is local and bypassable.
+
 Measurements may be published in generalized form ("on an NFS mount backed by
 ZFS, `copy_file_range` showed no server-side offload") but never attributed to
 named hosts or volumes.

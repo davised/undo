@@ -4,7 +4,23 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
 GO_SRC := $(shell find cmd internal -name '*.go')
 
-all: bin/undo build/libundo.so
+all: hooks bin/undo build/libundo.so
+
+# Git cannot version-control hooks directly; core.hooksPath is the supported
+# indirection and it is per-clone, so it is unset again after every fresh
+# clone -- silently, which is the worst way for a safety check to be missing.
+# Making it a prerequisite of the default target means anyone who builds gets
+# it without having to know it exists.
+#
+# Guarded so it is a no-op outside a work tree: the test container copies the
+# source without .git, and a build must not fail there.
+hooks:
+	@if git rev-parse --git-dir >/dev/null 2>&1; then \
+	    if [ "$$(git config --get core.hooksPath)" != ".githooks" ]; then \
+	        git config core.hooksPath .githooks && \
+	        echo "hooks: core.hooksPath set to .githooks"; \
+	    fi; \
+	fi
 
 build/libundo.so: shim/undo_shim.c
 	@mkdir -p build
@@ -36,4 +52,4 @@ install: all
 clean:
 	rm -rf bin build dist
 
-.PHONY: all test install clean
+.PHONY: all hooks test install clean

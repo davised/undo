@@ -421,20 +421,31 @@ check() { # check <desc> <expected-exit> <file-content>
     else echo "FAIL: $1"; failed=$((failed+1)); fi
 }
 
-# Fixtures use RFC5737/RFC1918 documentation values and invented names only.
-# Never paste a real identifier here: this file is exempt from scanning, so a
-# real one would be committed to a public repository unchallenged.
+# Fixtures are ASSEMBLED FROM FRAGMENTS that individually match nothing, so
+# this file stays scannable and needs no exemption. An exempt test file is
+# unscannable by definition, which is exactly where a real identifier hides.
+EDU_HOST="host.dept.example"".edu"
+NFS_PATH="/nfs0""/example/scratch"
+MAC_PATH="/Users""/someone/projects"
+IP_10="10.99.""99.99"
+
 check "clean prose passes"            0 'The store is resolved at runtime.'
-check "an .edu hostname is caught"    1 'measured on host.dept.example.edu'
-check "an RFC1918 address is caught"  1 'mon at 192.168.99.99:6789'
-check "an /nfsN/ mount is caught"     1 'files under /nfs0/example/scratch'
-check "a workstation path is caught"  1 'run it from /Users/someone/projects'
-check "upstream's /home/you is fine"  0 'echo /home/you/secrets >> ignore'
+check "an institutional host caught"  1 "measured on $EDU_HOST"
+check "a numbered nfs mount caught"   1 "files under $NFS_PATH"
+check "a workstation path caught"     1 "run it from $MAC_PATH"
+check "10/8 caught"                   1 "mon host at $IP_10:6789"
+check "semver is not an IP"           0 '"version": "10.0.0", "node": "^10.6.0"'
+check "upstream /home/you is fine"    0 'echo /home/you/secrets >> ignore'
 check "a generic path is fine"        0 'files under /net/volume/user'
 
 echo "$pass passed, $failed failed"
 [[ $failed -eq 0 ]]
 ```
+
+The fragment trick is the important part. Writing fixtures literally forces
+the test file to be exempted from scanning, and an exempt file is where a real
+identifier survives review. Splitting each fixture so neither half matches
+keeps the file inside the scanner's coverage.
 
 ```bash
 chmod +x tools/check-no-site-data.test.sh
@@ -591,8 +602,8 @@ jobs:
 - [ ] **Step 8: Prove the hook actually blocks**
 
 ```bash
-printf 'measured on host.dept.example.edu\n' > /tmp/leak.md
-cp /tmp/leak.md ./leak-test.md
+# assembled so this plan itself stays scannable
+printf 'measured on %s\n' "host.dept.example"".edu" > ./leak-test.md
 git add leak-test.md && git commit -q -m 'temp: leak test'
 git push --dry-run origin hpc/main; echo "exit=$?"
 ```
