@@ -101,6 +101,7 @@ static int  ensure_store(const char *root, char *out);        /* creates <root>/
 static int  backup_name(const char *abs, char *out);          /* was: backup_name(char *out) */
 static int  save_file(const char *abs, int need_copy, char *bak, const char **method);
 static int  in_our_store(const char *abs, char *root_out);    /* 1 if abs is our backup */
+static int  evac_name(char *out);                             /* unique name in the session dir */
 static void evacuate_store(const char *root, int remove_after);
 static int  dir_holds_only(const char *dir, const char *name);
 ```
@@ -609,9 +610,12 @@ Replace `backup_name` (lines 181-192) with:
  * the directory they exist to protect, so a recursive delete would race its
  * own safety net. The check is applied to the fallback too, since
  * $UNDO_SESSION may itself lie beneath the operated tree. */
+/* File scope so evac_name() draws from the same sequence; a shared counter is
+ * what keeps an evacuated name from colliding with a store name. */
+static unsigned long backup_counter;
+
 static int backup_name(const char *abs, char *out)
 {
-    static unsigned long counter;
     const char *dir = session_dir();
     char store[PATH_MAX], root[PATH_MAX];
     int have = 0;
@@ -631,7 +635,7 @@ static int backup_name(const char *abs, char *out)
             return -1; /* the fallback is inside the tree being operated on */
     }
 
-    unsigned long n = __atomic_add_fetch(&counter, 1, __ATOMIC_RELAXED);
+    unsigned long n = __atomic_add_fetch(&backup_counter, 1, __ATOMIC_RELAXED);
     if ((size_t)snprintf(out, PATH_MAX, "%s/%d-%lu", store, (int)getpid(), n) >=
         PATH_MAX)
         return -1;
@@ -836,7 +840,7 @@ directory on a volume.
 
 **Interfaces:**
 - Consumes: `session_id`, `ensure_store`, `copy_file`, `jwrite` from earlier tasks.
-- Produces: `in_our_store(const char *abs, char *root_out)`, `evacuate_store(const char *root, int remove_after)`, and per-backup `storemv` records.
+- Produces: `in_our_store(const char *abs, char *root_out)`, `evac_name(char *out)`, `evacuate_store(const char *root, int remove_after)`, and per-backup `storemv` records. Also hoists `backup_name`'s counter to file scope as `backup_counter`, so evacuated names draw from the same sequence.
 
 - [ ] **Step 1: Write the failing e2e cases**
 
@@ -929,7 +933,12 @@ static int in_our_store(const char *abs, char *root_out)
 }
 
 /* Roots already evacuated by this thread, so a recursive delete does not
- * re-copy the whole store once per file it removes. */
+ * re-copy the whole store once per file it removes.
+ *
+ * Checking and marking are separate on purpose. Marking on entry means a
+ * transient failure -- opendir hitting EMFILE, say -- permanently suppresses
+ * every later attempt, and the store is then destroyed with no records at all.
+ * The marker goes on only after the store has actually been walked. */
 #define EVAC_SLOTS 8
 static __thread char evac_done[EVAC_SLOTS][PATH_MAX];
 static __thread int evac_next;
@@ -939,8 +948,40 @@ static int evac_seen(const char *root)
     for (int i = 0; i < EVAC_SLOTS; i++)
         if (evac_done[i][0] && strcmp(evac_done[i], root) == 0)
             return 1;
+    return 0;
+}
+
+static void evac_mark(const char *root)
+{
     snprintf(evac_done[evac_next], PATH_MAX, "%s", root);
     evac_next = (evac_next + 1) % EVAC_SLOTS;
+}
+
+/* A fresh, unique name in the session directory for an evacuated backup.
+ *
+ * Deliberately NOT the source basename. Backup names are <pid>-<n>, and
+ * upstream's own save_file notes they collide when a shell execs its last
+ * command without forking -- same pid, counter reset -- which is why it
+ * retries on EEXIST. Two different backups from two different stores can
+ * therefore share a basename, and reusing it here would point two journal
+ * records at one file: the wrong bytes restored, silently.
+ *
+ * Unique names also make a concurrent double evacuation merely wasteful
+ * instead of wrong. Two threads reaching the same store each copy to their own
+ * destination and each journal a successful storemv; the resolver applies the
+ * first and the second no-ops, both files exist with the same content, and the
+ * spare is reclaimed with the session. Sharing a name instead would make one
+ * thread hit O_EXCL and journal "-", which -- if it landed after the winner --
+ * would mark a backup lost that is sitting right there. */
+static int evac_name(char *out)
+{
+    const char *dir = session_dir();
+    if (!dir)
+        return -1;
+    unsigned long n = __atomic_add_fetch(&backup_counter, 1, __ATOMIC_RELAXED);
+    if ((size_t)snprintf(out, PATH_MAX, "%s/data/evac-%d-%lu", dir,
+                         (int)getpid(), n) >= PATH_MAX)
+        return -1;
     return 0;
 }
 
@@ -975,19 +1016,17 @@ static void evacuate_store(const char *root, int remove_after)
 
     DIR *d = opendir(store);
     if (!d)
-        return;
+        return; /* deliberately unmarked: a transient failure must be retried */
     struct dirent *e;
     while ((e = readdir(d)) != NULL) {
         if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
             continue;
         char from[PATH_MAX], to[PATH_MAX];
         if ((size_t)snprintf(from, sizeof from, "%s/%s", store, e->d_name) >=
-                sizeof from ||
-            (size_t)snprintf(to, sizeof to, "%s/data/%s", dir, e->d_name) >=
-                sizeof to)
+            sizeof from)
             continue;
         /* copy_file enforces UNDO_MAX_BYTES and refuses non-regular files */
-        if (copy_file(from, to) == 0)
+        if (evac_name(to) == 0 && copy_file(from, to) == 0)
             jwrite("storemv", from, to, NULL);
         else
             jwrite("storemv", from, "-", NULL);
@@ -997,6 +1036,7 @@ static void evacuate_store(const char *root, int remove_after)
         }
     }
     closedir(d);
+    evac_mark(root); /* only now: the store has actually been walked */
 
     if (remove_after) {
         char undo[PATH_MAX];
@@ -1635,6 +1675,8 @@ unwritable store costs a backup, never the command.'
 - [ ] A backup over `UNDO_MAX_BYTES` in a destroyed store yields `storemv <path> -`, and restore reports it rather than failing on a missing path
 - [ ] An unwritable store leaves the user's command's exit status untouched
 - [ ] `errno` after a genuinely failed `rmdir` is still `ENOTEMPTY`, not something the evacuation path left behind
+- [ ] An evacuation whose `opendir` fails is retried on the next backup deleted from that store, not permanently suppressed
+- [ ] No evacuated backup is named after its source basename
 - [ ] A journal with no method field still restores, and reads as method `copy`
 - [ ] `git ls-files -z | xargs -0 tools/check-no-site-data.sh` exits 0
 - [ ] `tools/check-ere.sh` passes
@@ -1672,6 +1714,22 @@ unwritable store costs a backup, never the command.'
   delete re-copies the entire store once for every file it removes. The
   `remove_after` path deliberately bypasses that check, because it runs at most
   once per directory and must be exhaustive.
+- **`evac_mark` goes at the end, never at the top.** Marking on entry means one
+  transient `opendir` failure (`EMFILE` is the realistic one — the shim is
+  loaded into every process) silently suppresses every later attempt, and the
+  store is then destroyed with no records at all. Check on entry, mark on the
+  way out.
+- **Never name an evacuated backup after its source.** Backup names are
+  `<pid>-<n>` and upstream's own `save_file` documents that they collide when a
+  shell execs without forking. Two backups from different stores can share a
+  basename, so reusing it in the session directory would point two journal
+  records at one file and restore the wrong bytes. `evac_name` draws a fresh
+  number from the shared counter, which also makes a concurrent double
+  evacuation merely wasteful instead of wrong.
+- **Do not "optimize" the `EEXIST` case into a success record.** It is tempting
+  to treat a destination that already exists as "another thread got there
+  first", but with colliding basenames that assumption is false, and it is
+  false exactly when it silently corrupts a restore.
 - **Watch `errno` everywhere in Task 4.** The retry path calls at least four
   syscalls between the failing `rmdir` and the caller's return. Invariant 1 is
   about more than the return value.
