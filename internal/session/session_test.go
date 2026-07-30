@@ -202,3 +202,100 @@ func TestLatestUndoneFallsBackToMarkerMtime(t *testing.T) {
 		t.Fatalf("redo targeted %s, want %s (marked undone last)", got.ID, older.ID)
 	}
 }
+
+func TestRemoveDeletesDistributedBackups(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	s, err := Create("rm -rf project")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// a backup the way the shim will place it once stores are per-filesystem
+	vol := t.TempDir()
+	store := filepath.Join(vol, ".undo", s.ID)
+	if err := os.MkdirAll(store, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	backup := filepath.Join(store, "1234-1")
+	if err := os.WriteFile(backup, []byte("saved"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeJournal(t, s, "unlink\t"+filepath.Join(vol, "gone.txt")+"\t"+backup+"\n")
+
+	reloaded, err := Get(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reloaded.Remove(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(backup); !os.IsNotExist(err) {
+		t.Error("the distributed backup was left behind")
+	}
+	if _, err := os.Lstat(store); !os.IsNotExist(err) {
+		t.Error("the empty store directory was left behind")
+	}
+	if _, err := os.Lstat(filepath.Join(vol, ".undo")); !os.IsNotExist(err) {
+		t.Error("the empty .undo directory was left behind")
+	}
+	if _, err := os.Lstat(s.Dir); !os.IsNotExist(err) {
+		t.Error("the session directory was left behind")
+	}
+}
+
+func TestRemoveRefusesPathsOutsideAStore(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	s, err := Create("something")
+	if err != nil {
+		t.Fatal(err)
+	}
+	vol := t.TempDir()
+	precious := filepath.Join(vol, "precious.txt")
+	if err := os.WriteFile(precious, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A journal naming an arbitrary path as its backup. Nothing about this is
+	// exotic: a truncated write or a hand-edited journal produces it.
+	writeJournal(t, s, "unlink\t"+filepath.Join(vol, "gone.txt")+"\t"+precious+"\n")
+
+	reloaded, err := Get(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reloaded.Remove(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(precious); err != nil {
+		t.Fatal("purge deleted a path that was not inside a store")
+	}
+}
+
+func TestRemoveLeavesAnotherSessionsStoreAlone(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	mine, err := Create("mine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	vol := t.TempDir()
+	// a store belonging to a different session, sharing the same .undo parent
+	other := filepath.Join(vol, ".undo", "9999999999999999")
+	if err := os.MkdirAll(other, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	otherBackup := filepath.Join(other, "1-1")
+	if err := os.WriteFile(otherBackup, []byte("theirs"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeJournal(t, mine, "unlink\t"+filepath.Join(vol, "x.txt")+"\t"+otherBackup+"\n")
+
+	reloaded, err := Get(mine.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reloaded.Remove(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(otherBackup); err != nil {
+		t.Fatal("removing one session deleted another session's backup")
+	}
+}

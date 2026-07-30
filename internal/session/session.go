@@ -286,8 +286,80 @@ func GC(keep int, maxBytes int64) (int, error) {
 	return removed, nil
 }
 
-// Remove deletes a session and its backups entirely.
+// backupPaths returns the backup locations this session's journal names.
+// The shim records them as absolute paths, so they may be anywhere.
+func (s *Session) backupPaths() []string {
+	var out []string
+	for _, e := range s.Entries {
+		var p string
+		switch e.Op {
+		case journal.OpUnlink, journal.OpMod:
+			if len(e.Fields) > 1 {
+				p = e.Fields[1]
+			}
+		case journal.OpRename:
+			if len(e.Fields) > 2 {
+				p = e.Fields[2]
+			}
+		}
+		if p == "" || p == "-" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// inStore reports whether path sits directly inside a store directory
+// belonging to session id -- that is, whether it looks like
+// <root>/.undo/<id>/<name>.
+//
+// Backup paths come from the journal, which for this purpose is untrusted:
+// a truncated write, a corrupted file, or a hand edit can name any path at
+// all, and purge must not turn into an arbitrary rm. This is the check that
+// makes deleting a journal-supplied path safe, so it is deliberately strict
+// and structural rather than a prefix test.
+func inStore(path, id string) bool {
+	if id == "" || !filepath.IsAbs(path) || path != filepath.Clean(path) {
+		return false
+	}
+	dir := filepath.Dir(path)
+	return filepath.Base(dir) == id && filepath.Base(filepath.Dir(dir)) == ".undo"
+}
+
+// removeDistributedBackups deletes the backups the shim placed outside the
+// session directory, on the filesystem of the file each one protects, then
+// removes the store directories they leave empty.
+//
+// Best-effort on purpose. A backup on a filesystem that is not mounted right
+// now cannot be removed, and refusing to drop the session over it would leave
+// a session nothing can ever delete. The gc orphan sweep is the backstop for
+// exactly that case.
+func (s *Session) removeDistributedBackups() {
+	prefix := s.Dir + string(os.PathSeparator)
+	stores := make(map[string]bool)
+	for _, p := range s.backupPaths() {
+		if strings.HasPrefix(p, prefix) {
+			continue // inside the session dir; RemoveAll gets it
+		}
+		if !inStore(p, s.ID) {
+			continue // not ours to delete
+		}
+		os.Remove(p)
+		stores[filepath.Dir(p)] = true
+	}
+	for d := range stores {
+		// Both only succeed when empty, which is what keeps a store shared
+		// with another session, and a .undo shared with another store, intact.
+		os.Remove(d)
+		os.Remove(filepath.Dir(d))
+	}
+}
+
+// Remove deletes a session and its backups entirely, including the ones held
+// on other filesystems. The journal names those, so it has to go last.
 func (s *Session) Remove() error {
+	s.removeDistributedBackups()
 	return os.RemoveAll(s.Dir)
 }
 
