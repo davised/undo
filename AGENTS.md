@@ -116,3 +116,11 @@ Portable lessons:
   only its short header. Always dispatch through `ocrun`, which declares a stall
   after N seconds of zero new output. If one stalls, apply the approved plan
   directly and still run the codex gate — the gate must not be skipped.
+- **Never put a pipeline on the end of an `ocrun` dispatch.** `ocrun ... | tail`
+  reports `tail`'s exit status, hiding `ocrun`'s 124 (stall) or 125 (max wall
+  time), so a hung provider reads as a clean run that produced nothing. Check
+  `$OCRUN_DIR` instead: `sample.txt`, `sockets.txt` and `opencode.log.tail` are
+  written only when `ocrun` kills something, and a trailing
+  `message=stream providerID=... modelID=...` in the log with nothing after it
+  means the provider never answered — retry on a different agent/model rather
+  than rewriting the prompt.
