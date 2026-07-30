@@ -137,6 +137,17 @@ func copyTree(src, dst string) error {
 	if err != nil {
 		return err
 	}
+	// A move must not merge. os.Rename refuses a non-empty destination with
+	// ENOTEMPTY, so the cross-device fallback has to refuse it too -- otherwise
+	// the same call means "move" on one filesystem and "union these two trees"
+	// on another, and the second reports success while leaving a directory that
+	// is neither what was backed up nor what was there before.
+	//
+	// Only ever fires at the top level: in recursion dst was just created by
+	// its parent, so the ReadDir below fails and the check passes.
+	if ents, rerr := os.ReadDir(dst); rerr == nil && len(ents) > 0 {
+		return fmt.Errorf("cannot move %s onto %s: destination is not empty", src, dst)
+	}
 	// Create it traversable first; the real mode goes on at the end, since a
 	// read-only or non-executable directory cannot be populated.
 	if err := os.MkdirAll(dst, 0o700); err != nil {

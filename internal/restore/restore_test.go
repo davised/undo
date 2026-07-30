@@ -384,3 +384,31 @@ func TestMoveAnyRefusesToMergeIntoExistingDirectory(t *testing.T) {
 		t.Error("source was removed even though the move failed")
 	}
 }
+
+func TestCopyAcrossRefusesNonEmptyDestinationDirectory(t *testing.T) {
+	work := t.TempDir()
+	src := filepath.Join(work, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(src, "a.txt"), "from src")
+	dst := filepath.Join(work, "dst")
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(dst, "stale.txt"), "left over from an earlier failure")
+
+	// This is the cross-device path: os.Rename would have returned EXDEV, so
+	// copyAcross runs. It must refuse a non-empty destination for the same
+	// reason rename does -- a move that silently unions two trees and reports
+	// success is worse than one that fails.
+	if err := copyAcross(src, dst); err == nil {
+		t.Fatal("copyAcross merged into a non-empty destination and reported success")
+	}
+	if !present(src) {
+		t.Error("source was removed even though the move failed")
+	}
+	if !present(filepath.Join(dst, "stale.txt")) {
+		t.Error("pre-existing destination content was disturbed")
+	}
+}
