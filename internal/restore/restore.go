@@ -42,8 +42,8 @@ func exists(path string) bool {
 	return err == nil
 }
 
-// moveAny renames src onto dst, copying across filesystems if the
-// session store lives on a different device than the touched path.
+// moveAny renames src onto dst, falling back to a copy when the two are on
+// different filesystems.
 func moveAny(src, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
@@ -51,16 +51,55 @@ func moveAny(src, dst string) error {
 	if err := os.Rename(src, dst); err == nil {
 		return nil
 	}
+	return copyAcross(src, dst)
+}
+
+// copyAcross reproduces src at dst and then removes src. It is moveAny's
+// cross-device fallback, split out so it can be tested without two
+// filesystems mounted.
+//
+// os.Open follows symlinks and os.OpenFile's mode is masked by the umask, so
+// a naive copy turns a symlink into a regular file and drifts permissions.
+// Neither shows while the store shares a filesystem with its files, because
+// then os.Rename always succeeds and this never runs.
+func copyAcross(src, dst string) error {
+	fi, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	switch {
+	case fi.Mode()&os.ModeSymlink != 0:
+		target, err := os.Readlink(src)
+		if err != nil {
+			return err
+		}
+		os.Remove(dst)
+		if err := os.Symlink(target, dst); err != nil {
+			return err
+		}
+	case fi.IsDir():
+		if err := copyTree(src, dst); err != nil {
+			return err
+		}
+	case fi.Mode().IsRegular():
+		if err := copyFile(src, dst, fi); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("cannot move %s across filesystems: %s is not a regular file, directory, or symlink",
+			src, fi.Mode().Type())
+	}
+	return os.RemoveAll(src)
+}
+
+// copyFile writes src's contents, mode and mtime to dst.
+func copyFile(src, dst string, fi os.FileInfo) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	st, err := in.Stat()
-	if err != nil {
-		return err
-	}
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, st.Mode().Perm())
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, fi.Mode().Perm())
 	if err != nil {
 		return err
 	}
@@ -71,8 +110,61 @@ func moveAny(src, dst string) error {
 	if err := out.Close(); err != nil {
 		return err
 	}
-	os.Chtimes(dst, st.ModTime(), st.ModTime())
-	return os.Remove(src)
+	// OpenFile's mode is masked by the umask; set it explicitly.
+	if err := os.Chmod(dst, fi.Mode().Perm()); err != nil {
+		return err
+	}
+	// Timestamps are a nicety: filesystems that refuse them should not fail
+	// the restore.
+	os.Chtimes(dst, fi.ModTime(), fi.ModTime())
+	return nil
+}
+
+// copyTree recursively reproduces the directory src at dst.
+func copyTree(src, dst string) error {
+	fi, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	// Create it traversable first; the real mode goes on at the end, since a
+	// read-only or non-executable directory cannot be populated.
+	if err := os.MkdirAll(dst, 0o700); err != nil {
+		return err
+	}
+	ents, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	for _, e := range ents {
+		s := filepath.Join(src, e.Name())
+		d := filepath.Join(dst, e.Name())
+		efi, err := e.Info()
+		if err != nil {
+			return err
+		}
+		switch {
+		case efi.Mode()&os.ModeSymlink != 0:
+			target, err := os.Readlink(s)
+			if err != nil {
+				return err
+			}
+			if err := os.Symlink(target, d); err != nil {
+				return err
+			}
+		case efi.IsDir():
+			if err := copyTree(s, d); err != nil {
+				return err
+			}
+		case efi.Mode().IsRegular():
+			if err := copyFile(s, d, efi); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("cannot copy %s: %s is not a regular file, directory, or symlink",
+				s, efi.Mode().Type())
+		}
+	}
+	return os.Chmod(dst, fi.Mode().Perm())
 }
 
 // swapAny exchanges the contents of a and b, tolerating one side
@@ -295,7 +387,7 @@ func Run(s *session.Session, dir Direction, opts Options) (*Result, error) {
 						skip("directory not empty, use --force to move it aside")
 						continue
 					}
-					err = os.Rename(field(0), slot(s, i))
+					err = moveAny(field(0), slot(s, i))
 				}
 			} else {
 				if exists(field(0)) {
@@ -306,7 +398,7 @@ func Run(s *session.Session, dir Direction, opts Options) (*Result, error) {
 					continue
 				}
 				if exists(slot(s, i)) {
-					err = os.Rename(slot(s, i), field(0))
+					err = moveAny(slot(s, i), field(0))
 				} else {
 					err = os.Mkdir(field(0), 0o755)
 				}

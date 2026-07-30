@@ -209,6 +209,95 @@ func TestExchange(t *testing.T) {
 	}
 }
 
+func TestCopyAcrossPreservesSymlink(t *testing.T) {
+	work := t.TempDir()
+	target := filepath.Join(work, "target.txt")
+	write(t, target, "pointed at")
+	link := filepath.Join(work, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(work, "moved")
+
+	if err := copyAcross(link, dst); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Lstat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("a symlink was restored as a regular file")
+	}
+	got, err := os.Readlink(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != target {
+		t.Errorf("link target = %q, want %q", got, target)
+	}
+	if present(link) {
+		t.Error("source should be gone after a move")
+	}
+}
+
+func TestCopyAcrossPreservesMode(t *testing.T) {
+	work := t.TempDir()
+	src := filepath.Join(work, "script")
+	write(t, src, "#!/bin/sh\n")
+	if err := os.Chmod(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(work, "moved")
+
+	if err := copyAcross(src, dst); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// OpenFile's mode argument is masked by the umask, so this fails unless
+	// the mode is set explicitly afterwards.
+	if fi.Mode().Perm() != 0o755 {
+		t.Errorf("mode = %o, want 755", fi.Mode().Perm())
+	}
+}
+
+func TestCopyAcrossMovesDirectoryTree(t *testing.T) {
+	work := t.TempDir()
+	src := filepath.Join(work, "tree")
+	if err := os.MkdirAll(filepath.Join(src, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(src, "top.txt"), "top")
+	write(t, filepath.Join(src, "sub", "deep.txt"), "deep")
+	if err := os.Symlink("top.txt", filepath.Join(src, "rel")); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(work, "parked")
+
+	if err := copyAcross(src, dst); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, filepath.Join(dst, "top.txt")); got != "top" {
+		t.Errorf("top.txt = %q", got)
+	}
+	if got := read(t, filepath.Join(dst, "sub", "deep.txt")); got != "deep" {
+		t.Errorf("sub/deep.txt = %q", got)
+	}
+	fi, err := os.Lstat(filepath.Join(dst, "rel"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Error("symlink inside the tree was dereferenced")
+	}
+	if present(src) {
+		t.Error("source tree should be gone after a move")
+	}
+}
+
 func TestSelectiveReplayLeavesStateAndOthers(t *testing.T) {
 	work := t.TempDir()
 	f1 := filepath.Join(work, "one.txt")
@@ -233,5 +322,39 @@ func TestSelectiveReplayLeavesStateAndOthers(t *testing.T) {
 	}
 	if s.Undone {
 		t.Error("selective replay must not change session state")
+	}
+}
+
+func TestMkdirForceParksAndRestoresPopulatedDirectory(t *testing.T) {
+	work := t.TempDir()
+	made := filepath.Join(work, "made")
+	if err := os.MkdirAll(filepath.Join(made, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(made, "sub", "kept.txt"), "do not lose me")
+	s := newSession(t, []journal.Entry{{Op: journal.OpMkdir, Fields: []string{made}}})
+
+	// undo: the directory is not empty, so --force parks it in the store
+	res, err := Run(s, Undo, Options{Force: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Done != 1 {
+		t.Fatalf("Done = %d, want 1 (skipped: %v)", res.Done, res.Skipped)
+	}
+	if present(made) {
+		t.Fatal("undo --force should have moved the directory aside")
+	}
+	parked := filepath.Join(s.Dir, "data", "undo-0", "sub", "kept.txt")
+	if got := read(t, parked); got != "do not lose me" {
+		t.Fatalf("parked content = %q", got)
+	}
+
+	// redo: it comes back with its contents
+	if _, err := Run(s, Redo, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, filepath.Join(made, "sub", "kept.txt")); got != "do not lose me" {
+		t.Fatalf("after redo = %q", got)
 	}
 }
