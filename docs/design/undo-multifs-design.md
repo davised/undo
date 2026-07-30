@@ -43,11 +43,31 @@ are, however, false, and were corrected after review:
   the shim must record it at save time. The field is appended, and
   `journal.Read` already tolerates trailing fields, so older readers degrade
   gracefully.
-- **Restore does not already tolerate cross-device moves.** `moveAny` does,
-  but five call sites bypass it and call `os.Rename` directly
-  (`restore.go:283–285`, `:303`, `:314`), plus `swapAny` at `:90`. These fail
-  `EXDEV` once the store is on a different filesystem from the target and must
-  be converted. This is required work, not an inherited property.
+- **Restore does not already tolerate cross-device moves.** `moveAny` does, but
+  two call sites bypass it and call `os.Rename` directly — the `OpMkdir`
+  parking and unparking paths (`restore.go:298`, `:309`). These fail `EXDEV`
+  once the store is on a different filesystem from the target and must be
+  converted. This is required work, not an inherited property.
+
+  Corrected after review, twice. An earlier revision claimed five bypassing
+  call sites plus `swapAny`. Two of those were the `OpExchange` renames, which
+  upstream has since routed through `swapAny` (`ec4de57`) — and which could not
+  have hit `EXDEV` anyway, since the kernel only permits `RENAME_EXCHANGE` when
+  both paths are on one filesystem. `swapAny`'s own two `os.Rename` calls move
+  between `a` and `a + ".undo-swap"`: same directory by construction, so they
+  are equally incapable of returning `EXDEV`. Leave them alone.
+
+  The remaining two sites are harder than the count suggests, because they move
+  **directories**, and `moveAny`'s copy fallback works only on regular files —
+  `io.Copy` from a directory fails `EISDIR`. They need a recursive helper, not a
+  redirect to `moveAny`.
+
+  `moveAny` itself has two latent cross-device defects that only surface once
+  the store is on another filesystem: it opens `src` with `os.Open`, which
+  follows symlinks, so a symlink is restored as a regular file holding its
+  target's contents; and it creates `dst` with `os.OpenFile`, whose mode
+  argument is masked by the process umask, so permissions are not faithfully
+  preserved.
 
 ## Failure modes on a multi-filesystem host
 
@@ -155,9 +175,37 @@ remains a known, documented gap rather than a solved problem.
 - Create the store lazily, on the first backup that actually needs it.
 - Never create it inside the operated path (the guard above).
 - On `rmdir`/`unlinkat(AT_REMOVEDIR)` failure, if the target directory's only
-  remaining entry is our own store, remove the store and retry once.
+  remaining entry is our own store, get the store out of the way and retry once.
 
 The last item is the only one that fully closes the hole, and it is required.
+
+**Getting the store out of the way must not destroy it.** An earlier revision
+said "remove the store and retry", which is wrong: that store holds the backups
+for everything the command just deleted under that directory. Honoring
+Invariant 1 that way trades away the entire purpose of the tool, silently, in
+precisely the case — a recursive delete — where the user is most likely to want
+an undo.
+
+The store is instead **renamed up one level**, from `<P>/.undo/<session-id>` to
+`<parent>/.undo/<session-id>`. Both are on the same filesystem, so this is a
+metadata operation rather than a copy, and the backups survive. A `storemv`
+journal record maps the old path prefix to the new one, so the CLI can still
+find them; the journal stays append-only.
+
+Three consequences the implementation must handle:
+
+- **The resolver cache must be updated to the new root**, or the next save
+  recreates `<P>` — leaving behind the very directory the command just removed.
+  A concurrent thread can still lose this race; that is the same limitation the
+  thread-local cache already accepts, and it is documented rather than fixed
+  with a lock inside an interposer.
+- **Relocations chain.** `rm -rf a/b/c` relocates at `c`, then at `b`, then at
+  `a`. The `storemv` records compose in journal order.
+- **There is a terminal case.** When the parent is not ours or is not writable,
+  the store cannot move. Only then is it removed, and a `lost` record is
+  written for every backup it held, so the loss is visible instead of silent.
+  This is the case where a user deletes their entire top-level directory on a
+  volume, and it is the one place where Invariant 1 genuinely costs data.
 
 **Which path drives selection for renames.** A rename has a source, a
 destination, and possibly an overwritten destination inode. The backup taken
@@ -293,6 +341,23 @@ journal, so a lost or truncated journal orphans them beyond the reach of GC.
 `undo gc` gains a sweep that removes `.undo/<session-id>/` directories under
 known store roots whose session no longer exists. Without it, storage leaks
 are unrecoverable without manual cleanup.
+
+**How the sweep knows the roots.** Every backup path has the form
+`<root>/.undo/<session-id>/<name>`, so the roots are recoverable from the
+journals of surviving sessions by truncating at the `.undo` component — no new
+shim write path, and nothing extra to keep consistent. Because a root must stay
+sweepable after the last session that used it has been pruned, `undo gc` unions
+what it finds into a persistent registry beside the session store.
+
+A registry entry is dropped only when its root is reachable *and* holds no
+`.undo` directory. An unreachable root is kept: an unmounted volume must not be
+mistaken for a reclaimed one.
+
+The sweep removes a directory only when it sits directly under a `.undo`
+directory, its name has the shape of a session id, and no session by that name
+exists. On node-local filesystems this reclaims only on the node that created
+the store, since no other node can see the path — a documented limit rather
+than a solvable one.
 
 ### 5. Make unprotected files visible
 
