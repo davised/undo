@@ -291,12 +291,32 @@ static const char *session_id(void)
     return (slash && slash[1]) ? slash + 1 : NULL;
 }
 
+/* True when `path` is a directory in its own right -- not a symlink to one --
+ * belonging to the effective uid. lstat does not follow the final component,
+ * so a symlink reports S_IFLNK and fails S_ISDIR. */
+static int own_real_dir(const char *path)
+{
+    struct stat st;
+    if (lstat(path, &st) != 0)
+        return 0;
+    return S_ISDIR(st.st_mode) && st.st_uid == geteuid();
+}
+
 /* Create <root>/.undo/<session-id>/ and return it in `out`.
  *
  * real_mkdir rather than mkdir(): mkdir is itself interposed, and creating a
  * store directory must never be journaled as user activity. Callers already
  * hold in_shim, which would suppress it anyway; going through real_mkdir means
- * this does not silently depend on that. */
+ * this does not silently depend on that.
+ *
+ * Both components are validated after the mkdir, because EEXIST is the normal
+ * case and says nothing about what already exists there. The store root is the
+ * caller's own directory but may still be group-writable on shared storage, so
+ * another user can pre-create .undo -- or the entirely predictable
+ * .undo/<session-id> -- as a symlink. mkdir then returns EEXIST and every
+ * subsequent backup, which is a copy of a file the user just deleted, gets
+ * written wherever that link points. Failing here falls back to the session
+ * directory, which costs a hardlink and leaks nothing. */
 static int ensure_store(const char *root, char *out)
 {
     const char *sid = session_id();
@@ -308,9 +328,13 @@ static int ensure_store(const char *root, char *out)
     REAL(mkdir, int, const char *, mode_t);
     if (real_mkdir(undo, 0700) != 0 && errno != EEXIST)
         return -1;
+    if (!own_real_dir(undo))
+        return -1;
     if ((size_t)snprintf(out, PATH_MAX, "%s/%s", undo, sid) >= PATH_MAX)
         return -1;
     if (real_mkdir(out, 0700) != 0 && errno != EEXIST)
+        return -1;
+    if (!own_real_dir(out))
         return -1;
     return 0;
 }

@@ -77,5 +77,25 @@ fi
 chmod 700 "$FS_A/ro"
 [[ ! -e $FS_A/ro/sub/f.txt ]] || fail "the rm did not actually happen"
 
+echo "== a symlinked store is refused rather than written through"
+# On shared storage the store root is the user's own directory but may still be
+# group-writable, so another user can pre-create .undo -- or the entirely
+# predictable .undo/<session-id> -- as a symlink. mkdir then returns EEXIST and
+# every backup, which is a copy of a file the user just deleted, would be
+# written wherever that link points.
+rm -rf "$FS_A/.undo"
+rm -rf /tmp/attacker-dir && mkdir -p /tmp/attacker-dir
+ln -s /tmp/attacker-dir "$FS_A/.undo"
+mkdir -p "$FS_A/sym"
+echo secret >"$FS_A/sym/victim.txt"
+run_armed "rm $FS_A/sym/victim.txt"
+[[ -z $(ls -A /tmp/attacker-dir) ]] ||
+    fail "a backup was written through a symlinked store: $(ls -A /tmp/attacker-dir)"
+sess=$(latest)
+bak=$(awk -F'\t' '$1=="unlink"{print $3}' "$sess/journal" | tail -1)
+[[ $bak == "$UNDO_DATA_DIR"/* ]] ||
+    fail "expected the session-directory fallback, got $bak"
+rm -f "$FS_A/.undo"
+
 echo
 echo "store placement ok"
