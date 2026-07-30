@@ -358,3 +358,29 @@ func TestMkdirForceParksAndRestoresPopulatedDirectory(t *testing.T) {
 		t.Fatalf("after redo = %q", got)
 	}
 }
+
+func TestMoveAnyRefusesToMergeIntoExistingDirectory(t *testing.T) {
+	work := t.TempDir()
+	src := filepath.Join(work, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(src, "a.txt"), "from src")
+	dst := filepath.Join(work, "dst")
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(dst, "keep.txt"), "already here")
+
+	// Same filesystem, so this rename fails ENOTEMPTY rather than EXDEV. The
+	// copy fallback must not treat that as "cross-device" and merge the trees.
+	if err := moveAny(src, dst); err == nil {
+		t.Fatal("moveAny merged src into a non-empty destination and reported success")
+	}
+	if got := read(t, filepath.Join(dst, "keep.txt")); got != "already here" {
+		t.Errorf("destination content disturbed: %q", got)
+	}
+	if !present(src) {
+		t.Error("source was removed even though the move failed")
+	}
+}

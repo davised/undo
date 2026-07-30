@@ -8,11 +8,13 @@
 package restore
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strconv"
+	"syscall"
 
 	"github.com/edaywalid/undo/internal/journal"
 	"github.com/edaywalid/undo/internal/session"
@@ -48,8 +50,17 @@ func moveAny(src, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
-	if err := os.Rename(src, dst); err == nil {
+	err := os.Rename(src, dst)
+	if err == nil {
 		return nil
+	}
+	// Only a cross-device rename earns the copy fallback. Every other failure
+	// has to surface: rename of a directory onto an existing non-empty one
+	// fails ENOTEMPTY, and treating that as "must be a different filesystem"
+	// makes copyTree merge src into dst, delete src, and report success --
+	// losing whichever side the caller did not expect to keep.
+	if !errors.Is(err, syscall.EXDEV) {
+		return err
 	}
 	return copyAcross(src, dst)
 }
