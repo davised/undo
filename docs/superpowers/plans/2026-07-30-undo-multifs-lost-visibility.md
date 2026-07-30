@@ -4,7 +4,7 @@
 
 **Goal:** Tell the user, before they rely on a restore, which files a session cannot bring back — so a recorded loss stops being a loss they only discover while trying to recover.
 
-**Architecture:** One function on `session.Session` counts the entries that cannot be restored, and three existing CLI surfaces report it: `undo run` after a capture, `undo list` per session, and the pre-revert preview. Nothing about the shim or the journal format changes; this only surfaces what is already recorded.
+**Architecture:** One function on `session.Session` counts the entries that cannot be restored, and three existing CLI surfaces report it: `undo run` after a capture, `undo list` per session, and the pre-revert preview. One shim change comes first, because a rename whose target backup failed is currently journaled identically to a rename that overwrote nothing — a loss the CLI cannot report until the journal distinguishes it. No new journal field or op: it uses a third value of the existing method field.
 
 **Tech Stack:** Go 1.24, bash (e2e suite).
 
@@ -19,32 +19,42 @@ This is design item 5 ("Make unprotected files visible"), listed under phase 3, 
 
 Copied from `docs/design/undo-multifs-design.md` and `AGENTS.md`. Every task inherits these.
 
-- **The shim must never cause the user's command to fail.** No shim change here, and the reporting is deliberately in the CLI: writing to stderr from inside every process a user runs risks corrupting output that scripts parse.
+- **The shim must never cause the user's command to fail.** Task 1 touches the shim but adds no failure path — it changes which string is journaled. The *reporting* stays in the CLI deliberately: writing to stderr from inside every process a user runs risks corrupting output that scripts parse.
 - **No new libc call may raise the glibc symbol floor** above `GLIBC_2.34`.
 - **No site-specific data in this repository.**
-- **The journal format is append-only and additive.** This plan adds no fields and no ops.
+- **The journal format is append-only and additive.** This plan adds no fields and no ops — only a third accepted value, `lost`, of the method field 2b introduced.
 - Every build and test runs through `test/in-container.sh`.
 
 ## What counts as unprotected
 
-Two things, both already in the journal:
+Three journal states, one rule:
 
 | Journal state | Meaning |
 |---|---|
 | `lost` record | the shim could not save a backup at all — over `UNDO_MAX_BYTES`, or unlinkable |
-| backup field `-` with a method other than `none` | a backup existed and was discarded when its store was destroyed |
+| backup field `-`, method `link` or `copy` | a backup existed and was discarded when its store was destroyed |
+| backup field `-`, method `lost` | a target was overwritten and the shim could not save it (Task 1) |
 
-The second condition must test the method. `rename old new - none` is a rename that overwrote nothing and needed no backup; it is fully restorable and must not be counted. `rename old new - link` is a backup that existed and is gone. `unlink` and `mod` records are only ever written with a real backup, so `-` there always means discarded.
+All of these reduce to one rule: **a `-` backup with any method other than
+`none` is unprotected.** The method field is what carries the distinction, and
+it has to be consulted rather than just testing for `-`, because
+`rename old new - none` is a rename that overwrote nothing, needed no backup,
+and restores perfectly. It is the most common entry in a real journal; counting
+it would make the warning fire constantly.
+
+`unlink` and `mod` records are only ever written with a real backup, so `-`
+there always means discarded.
 
 ## File Structure
 
 | File | Status | Responsibility |
 |---|---|---|
+| `shim/undo_shim.c` | modify | record a rename whose target backup failed as method `lost`, not `none` |
 | `internal/session/session.go` | modify | `Unprotected()` — count entries that cannot be restored |
 | `internal/session/session_test.go` | modify (append) | the counting rules, including the rename distinction |
 | `cmd/undo/main.go` | modify | `cmdList` marks affected sessions; `previewSession` warns before the prompt |
 | `cmd/undo/run.go` | modify | `undo run` reports the count after a capture |
-| `test/e2e.sh` | modify (append case 29) | an over-cap overwrite is reported by list and by the preview |
+| `test/e2e.sh` | modify (append cases 29, 30) | a failed rename-target save is recorded; an over-cap overwrite is reported by list and by the preview |
 
 ## Interfaces produced
 
@@ -55,14 +65,146 @@ func (s *Session) Unprotected() int   // entries this session cannot restore
 
 ---
 
-### Task 1: Count what cannot be restored
+### Task 1: Record a rename whose target could not be saved
+
+`handle_rename_pre` sets `kind = 1`, then upgrades to `kind = 2` only when
+`save_file` succeeds on an existing regular destination. When the save *fails*
+— the target is over `UNDO_MAX_BYTES`, or the store is unwritable — `kind`
+stays 1 and `handle_rename_post` writes `rename old new - none`: byte for byte
+what it writes when there was no destination to overwrite at all.
+
+So a rename that clobbered a file whose backup could not be saved is recorded
+as a rename that clobbered nothing. The file is unrecoverable and **nothing in
+the journal says so**. `unlink` and the open family both have a failure path
+that emits a `lost` record; rename never got one.
+
+This is inherited from upstream, not introduced by the multi-filesystem work,
+but it has to be fixed first: the CLI cannot report a loss the journal does not
+distinguish.
+
+The fix is a third method token. Both consumers already handle it —
+`Unprotected()` counts any `-` backup whose method is not `none`, and
+`restore.Run`'s `OpRename` arm already skips and reports exactly that state.
+
+**Files:**
+- Modify: `shim/undo_shim.c` — `handle_rename_pre`, `handle_rename_post`
+- Test: `test/e2e.sh` (append case 29)
+
+**Interfaces:**
+- Consumes: `save_file`'s `method` out-parameter from plan 2b.
+- Produces: the journal state `rename <old> <new> - lost`.
+
+- [ ] **Step 1: Write the failing e2e case**
+
+Append to `test/e2e.sh`, before the closing `echo "all cases passed"`:
+
+```bash
+echo "== case 29: a rename whose target could not be saved is recorded as lost"
+mkdir -p "$PLAY/ren"
+echo "victim content" >"$PLAY/ren/target.txt"
+echo "source" >"$PLAY/ren/src.txt"
+# A cap below the target size makes save_file fail, which is what happens to a
+# large in-place overwrite on a filesystem with no reflink support.
+id=$(date +%s%N | cut -c1-16); sess="$UNDO_DATA_DIR/sessions/$id"
+mkdir -p "$sess/data"; echo "mv over target" >"$sess/cmd"
+env UNDO_SESSION="$sess" UNDO_MAX_BYTES=4 LD_PRELOAD="$LIB" \
+    bash -c "mv $PLAY/ren/src.txt $PLAY/ren/target.txt"
+sleep 0.01
+grep -q '^rename' "$sess/journal" ||
+    fail "no rename record, journal: $(cat "$sess/journal")"
+awk -F'\t' '$1=="rename"{print $5}' "$sess/journal" | grep -qx lost ||
+    fail "rename method = '$(awk -F'\t' '$1=="rename"{print $5}' "$sess/journal")', want lost"
+```
+
+- [ ] **Step 2: Run it and watch it fail**
+
+Run: `test/in-container.sh bash -c 'make >/dev/null 2>&1 && test/e2e.sh'`
+
+Expected: `FAIL: rename method = 'none', want lost`. That literal `none` is the
+defect: it is what the journal also records when nothing was overwritten.
+
+- [ ] **Step 3: Implement**
+
+In `shim/undo_shim.c`, in `handle_rename_pre`, replace the final block:
+
+```c
+    *kind = 1;
+    struct stat st;
+    if (lstat(absnew, &st) == 0 && S_ISREG(st.st_mode)) {
+        if (save_file(absnew, 0, bak, method) == 0)
+            *kind = 2;
+        else
+            /* A target existed and could not be saved. Without this the record
+             * is identical to a rename that overwrote nothing, and the
+             * clobbered file is unrecoverable with nothing saying so. */
+            *method = "lost";
+    }
+```
+
+and in `handle_rename_post`, make the `kind == 1` arm carry the method instead
+of a hardcoded `"none"`:
+
+```c
+        if (kind == 1)
+            jwrite("rename", absold, absnew, "-", method, NULL);
+```
+
+`save_file` sets `*method = "none"` on entry and only changes it on success, so
+a rename with no target to save still records `none`.
+
+- [ ] **Step 4: Run the suite**
+
+Run: `test/in-container.sh make test`
+
+Expected: all cases pass, including 29. Case 3 (`mv over an existing file`)
+covers the ordinary path and must still pass — it has no cap set, so the save
+succeeds and the record keeps a real backup and method.
+
+- [ ] **Step 5: Confirm the floor did not move**
+
+Run:
+
+```bash
+test/in-container.sh bash -c '
+  gcc -shared -fPIC -O2 -Wall -Wextra -o /tmp/libundo.so shim/undo_shim.c -ldl
+  objdump -T /tmp/libundo.so | grep -o "GLIBC_[0-9.]*" | sort -u -V | tail -1'
+```
+
+Expected: `GLIBC_2.34`. No new libc calls are introduced here, so anything else
+means something unrelated changed.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add shim/undo_shim.c test/e2e.sh
+git commit -m 'shim: record a rename whose target backup failed
+
+handle_rename_pre upgrades kind to 2 only when save_file succeeds on an
+existing regular destination. When the save failed -- target over
+UNDO_MAX_BYTES, or an unwritable store -- kind stayed 1 and the record written
+was "rename old new - none", byte for byte what a rename that overwrote
+nothing produces.
+
+So a rename that clobbered an unsaveable file was recorded as a rename that
+clobbered nothing: the file is unrecoverable and the journal did not say so.
+unlink and the open family both emit a lost record on that path; rename never
+had one. Inherited from upstream rather than new here.
+
+Recorded as method "lost" instead, which both consumers already understand:
+the unprotected count is any "-" backup whose method is not none, and restore
+already skips and reports exactly that state rather than half-reverting.'
+```
+
+---
+
+### Task 2: Count what cannot be restored
 
 **Files:**
 - Modify: `internal/session/session.go`
 - Test: `internal/session/session_test.go` (append)
 
 **Interfaces:**
-- Consumes: `journal.Entry.Backup()` and `journal.Entry.Method()` from plan 2b.
+- Consumes: `journal.Entry.Backup()` and `journal.Entry.Method()` from plan 2b, and the `lost` method token from Task 1.
 - Produces: `func (s *Session) Unprotected() int`.
 
 - [ ] **Step 1: Write the failing test**
@@ -186,7 +328,7 @@ cry wolf on the most common entry in any journal.'
 
 ---
 
-### Task 2: Report it on the three surfaces
+### Task 3: Report it on the three surfaces
 
 Three places, chosen because they are where a user forms the belief that they are protected: right after a command is captured, when listing what can be undone, and immediately before confirming a revert.
 
@@ -196,7 +338,7 @@ Three places, chosen because they are where a user forms the belief that they ar
 - Test: `test/e2e.sh` (append case 29)
 
 **Interfaces:**
-- Consumes: `(*Session).Unprotected()` from Task 1.
+- Consumes: `(*Session).Unprotected()` from Task 2.
 - Produces: nothing new.
 
 - [ ] **Step 1: Write the failing e2e case**
@@ -204,7 +346,7 @@ Three places, chosen because they are where a user forms the belief that they ar
 Append to `test/e2e.sh`, before the closing `echo "all cases passed"`:
 
 ```bash
-echo "== case 29: files the shim could not save are reported, not just recorded"
+echo "== case 30: files the shim could not save are reported, not just recorded"
 mkdir -p "$PLAY/cap"
 echo original >"$PLAY/cap/big.bin"
 # UNDO_MAX_BYTES below the file size makes the shim record a lost entry
@@ -283,8 +425,8 @@ contains as a prefix.
 
 Run: `test/in-container.sh make test`
 
-Expected: `go test ./...` passes and every e2e case passes, including 29 and
-the pre-existing case 8.
+Expected: `go test ./...` passes and every e2e case passes, including 29, 30,
+and the pre-existing case 8.
 
 - [ ] **Step 7: Commit**
 
@@ -312,12 +454,16 @@ records; the CLI reports.'
 
 ## Definition of done
 
-- [ ] `test/in-container.sh make test` passes, including new case 29
+- [ ] `test/in-container.sh make test` passes, including new cases 29 and 30
+- [ ] A rename whose target backup failed records method `lost`, not `none`
+- [ ] A rename that overwrote nothing still records method `none`
+- [ ] The shim's glibc floor is still `GLIBC_2.34`
 - [ ] A session with a `lost` record is flagged in `undo list`
 - [ ] The pre-revert preview warns above the confirmation prompt, not below it
 - [ ] `undo run` reports the unprotected count alongside the captured count
 - [ ] A `rename old new - none` entry is **not** counted as unprotected
 - [ ] A `rename old new - link` entry **is** counted
+- [ ] A `rename old new - lost` entry **is** counted, and restore skips and reports it
 - [ ] A journal written before the method field existed counts 0 unprotected
 - [ ] Pre-existing e2e case 8 (`captured 1 change`) still passes
 - [ ] `git ls-files -z | xargs -0 tools/check-no-site-data.sh` exits 0
