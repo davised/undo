@@ -190,7 +190,14 @@ run_armed "for i in 1 2 3 4 5; do echo edit\$i > $PLAY/churn.txt; done"
 last=$(ls "$UNDO_DATA_DIR/sessions" | sort | tail -1)
 sd="$UNDO_DATA_DIR/sessions/$last"
 [[ $(grep -c "churn.txt" "$sd/journal") == 1 ]] || fail "expected 1 mod entry, got $(grep -c churn.txt "$sd/journal")"
-[[ $(ls "$sd/data" | wc -l) == 1 ]] || fail "expected 1 backup, got $(ls "$sd/data" | wc -l)"
+# Counted where the journal says the backup is, not in $sess/data: the store
+# is per-filesystem now, so a backup normally lands in <root>/.undo/<id>/ and
+# only falls back to the session directory. The store directory is per session,
+# so its entry count is the same assertion as before.
+bak=$(awk -F'\t' '$1=="mod"{print $3}' "$sd/journal" | tail -1)
+[[ -n $bak && -f $bak ]] || fail "the backup named by the journal is missing: '$bak'"
+n=$(ls "$(dirname "$bak")" | wc -l)
+[[ $n == 1 ]] || fail "expected 1 backup, got $n"
 "$UNDO" -y >/dev/null
 [[ $(cat "$PLAY/churn.txt") == original ]] || fail "dedup broke restore, got $(cat "$PLAY/churn.txt")"
 
@@ -281,6 +288,74 @@ if cc -o "$WORK/guard" "$WORK/guard.c" 2>/dev/null; then
     "$UNDO" -y >/dev/null 2>&1 || true
     [[ -e $PLAY/guard/keep.txt && $(cat "$PLAY/guard/keep.txt") == precious ]] ||
         fail "an unlink after a failed rmdir was not captured"
+else
+    echo "   (no cc, skipped)"
+fi
+
+echo "== case 25: a deletion is hardlinked into a store beside the file"
+mkdir -p "$PLAY/store-local"
+echo "large enough to matter" >"$PLAY/store-local/big.bin"
+run_armed "rm $PLAY/store-local/big.bin"
+sess=$(ls -1d "$UNDO_DATA_DIR"/sessions/* | tail -1)
+grep -q $'\tlink$' "$sess/journal" ||
+    fail "the unlink record does not end with the save method"
+bak=$(awk -F'\t' '$1=="unlink"{print $3}' "$sess/journal" | tail -1)
+case $bak in
+    */.undo/*) ;;
+    *) fail "backup landed at $bak, not in a .undo store" ;;
+esac
+[[ -f $bak ]] || fail "the backup file is missing"
+"$UNDO" -y >/dev/null
+[[ $(cat "$PLAY/store-local/big.bin") == "large enough to matter" ]] ||
+    fail "restore from a filesystem-local store failed"
+
+echo "== case 26: our own store never makes an rmdir fail"
+mkdir -p "$PLAY/relocate/inner"
+echo "recoverable" >"$PLAY/relocate/inner/doomed.txt"
+run_armed "rm $PLAY/relocate/inner/doomed.txt && rmdir $PLAY/relocate/inner"
+[[ ! -e $PLAY/relocate/inner ]] ||
+    fail "rmdir left the directory behind; the shim broke the command"
+"$UNDO" -y >/dev/null
+[[ $(cat "$PLAY/relocate/inner/doomed.txt") == "recoverable" ]] ||
+    fail "the backup did not survive the store evacuation"
+
+echo "== case 27: rm -rf over the store still undoes"
+mkdir -p "$PLAY/wipe/sub"
+echo "keep me" >"$PLAY/wipe/sub/a.txt"
+echo "me too" >"$PLAY/wipe/b.txt"
+run_armed "rm -rf $PLAY/wipe"
+[[ ! -e $PLAY/wipe ]] || fail "rm -rf did not run"
+"$UNDO" -y >/dev/null
+[[ $(cat "$PLAY/wipe/sub/a.txt") == "keep me" ]] ||
+    fail "a backup inside the destroyed store was not evacuated"
+[[ $(cat "$PLAY/wipe/b.txt") == "me too" ]] ||
+    fail "a backup inside the destroyed store was not evacuated"
+
+echo "== case 28: a genuinely failed rmdir still reports ENOTEMPTY"
+# The evacuation retry calls dir_holds_only -> opendir/readdir/closedir before
+# deciding not to act, and those overwrite errno. A caller whose rmdir really
+# failed must still see why, so the shim captures errno across the whole window.
+mkdir -p "$PLAY/errno/sub"
+touch "$PLAY/errno/keep.txt"
+cat >"$WORK/errnoprobe.c" <<'CEOF'
+#include <errno.h>
+#include <stdio.h>
+#include <unistd.h>
+int main(int c, char **v)
+{
+    (void)c;
+    errno = 0;
+    if (rmdir(v[1]) == 0) {
+        printf("UNEXPECTED-SUCCESS\n");
+        return 1;
+    }
+    printf("%s\n", errno == ENOTEMPTY ? "ENOTEMPTY" : "CLOBBERED");
+    return 0;
+}
+CEOF
+if cc -o "$WORK/errnoprobe" "$WORK/errnoprobe.c" 2>/dev/null; then
+    got=$(run_armed "$WORK/errnoprobe $PLAY/errno")
+    [[ $got == ENOTEMPTY ]] || fail "errno after a failed rmdir reported as $got"
 else
     echo "   (no cc, skipped)"
 fi
