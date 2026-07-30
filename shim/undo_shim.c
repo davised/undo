@@ -94,28 +94,47 @@ static void enc_append(char *dst, size_t cap, size_t *len, const char *s)
     }
 }
 
-/* jwrite("op", field1, field2, NULL) */
-static void jwrite(const char *op, ...)
+/* Formats and appends one record to an already-open journal descriptor.
+ *
+ * Shared so a record destined for another session's journal is encoded by
+ * exactly the same code: a second copy of the percent-encoding is a second
+ * chance for the two to disagree, and the reader would silently mis-decode
+ * paths as a result. */
+static void jwritev(int fd, const char *op, va_list ap)
 {
-    int fd = journal_fd();
     if (fd < 0)
         return;
     char line[4 * PATH_MAX];
     size_t len = 0;
     enc_append(line, sizeof line, &len, op);
-    va_list ap;
-    va_start(ap, op);
     const char *f;
     while ((f = va_arg(ap, const char *)) != NULL) {
         if (len + 1 < sizeof line)
             line[len++] = '\t';
         enc_append(line, sizeof line, &len, f);
     }
-    va_end(ap);
     if (len + 1 < sizeof line)
         line[len++] = '\n';
     ssize_t r = write(fd, line, len);
     (void)r;
+}
+
+/* jwrite("op", field1, field2, NULL) -- to this session's journal */
+static void jwrite(const char *op, ...)
+{
+    va_list ap;
+    va_start(ap, op);
+    jwritev(journal_fd(), op, ap);
+    va_end(ap);
+}
+
+/* the same, to a journal the caller opened */
+static void jwrite_to(int fd, const char *op, ...)
+{
+    va_list ap;
+    va_start(ap, op);
+    jwritev(fd, op, ap);
+    va_end(ap);
 }
 
 /* ---------- path helpers ---------- */
