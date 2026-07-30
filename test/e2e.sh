@@ -204,16 +204,55 @@ else
     echo "   (no cc, skipped)"
 fi
 
-echo "== case 20: undo doctor passes its live self-test"
+echo "== case 20: a failed rmdir does not stop the rest of the command being recorded"
+mkdir -p "$PLAY/full/x" "$PLAY/gone"
+run_armed "rmdir $PLAY/full $PLAY/gone || true"
+[[ -d $PLAY/full && ! -d $PLAY/gone ]] || fail "rmdir did not run as expected"
+"$UNDO" -y >/dev/null
+[[ -d $PLAY/gone ]] || fail "second rmdir was not journaled after the first failed"
+
+# One long-lived process writing the same file under two sessions in a
+# row: what UNDO_CAPTURE_SHELL=1 does, where the shim is loaded into the
+# shell itself rather than into a fresh child per command.
+if command -v python3 >/dev/null 2>&1; then
+    echo "== case 21: one process spanning two sessions backs up in both"
+    f=$PLAY/shared.txt
+    echo v0 >"$f"
+    s1=$UNDO_DATA_DIR/sessions/$(date +%s%N | cut -c1-16); mkdir -p "$s1/data"
+    echo "write v1" >"$s1/cmd"; sleep 0.01
+    s2=$UNDO_DATA_DIR/sessions/$(date +%s%N | cut -c1-16); mkdir -p "$s2/data"
+    echo "write v2" >"$s2/cmd"
+    LD_PRELOAD="$LIB" python3 -c "
+import os, sys
+for sess, body in ((sys.argv[1], 'v1'), (sys.argv[2], 'v2')):
+    os.environ['UNDO_SESSION'] = sess
+    with open(sys.argv[3], 'w') as fh:
+        fh.write(body + '\n')
+" "$s1" "$s2" "$f"
+    [[ $(cat "$f") == v2 ]] || fail "writes did not run"
+    grep -q "shared.txt" "$s2/journal" 2>/dev/null || fail "second session recorded nothing"
+    "$UNDO" -y >/dev/null
+    [[ $(cat "$f") == v1 ]] || fail "second session did not restore v1, got $(cat "$f")"
+else
+    echo "== case 21: skipped (no python3)"
+fi
+
+echo "== case 22: undo run reports a signal death the way a shell does"
+set +e
+"$UNDO" run -- sh -c 'kill -TERM $$' >/dev/null 2>&1
+rc=$?
+set -e
+[[ $rc == 143 ]] || fail "expected 143 from a SIGTERM death, got $rc"
+
+echo "== case 23: undo doctor passes its live self-test"
 out=$("$UNDO" doctor 2>&1) || fail "doctor exited non-zero: $out"
 grep -q "\[ok  \] capture" <<<"$out" || fail "doctor capture check did not pass"
 grep -q "\[ok  \] restore" <<<"$out" || fail "doctor restore check did not pass"
 
-echo "== case 21: a failed rmdir does not silence the rest of the process"
-# The shim uses a thread-local flag to avoid re-entering itself. rmdir used to
-# clear that flag only when the rmdir succeeded and was journaled, so a single
-# ENOTEMPTY left the shim disabled for the remainder of the process and every
-# later change went unrecorded while still happening on disk.
+echo "== case 24: the rmdir guard leak does not cross into other operations"
+# Complements case 20, which covers rmdir -> rmdir. This covers rmdir ->
+# unlink: the reentrancy guard leaking out of a failed rmdir silenced every
+# later operation in that process, not just later rmdirs.
 #
 # This has to be one compiled program: rmdir(1) and rm(1) are separate
 # processes and the flag is thread-local, so a shell-based test would pass
