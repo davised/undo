@@ -186,26 +186,45 @@ Invariant 1 that way trades away the entire purpose of the tool, silently, in
 precisely the case — a recursive delete — where the user is most likely to want
 an undo.
 
-The store is instead **renamed up one level**, from `<P>/.undo/<session-id>` to
-`<parent>/.undo/<session-id>`. Both are on the same filesystem, so this is a
-metadata operation rather than a copy, and the backups survive. A `storemv`
-journal record maps the old path prefix to the new one, so the CLI can still
-find them; the journal stays append-only.
+**A second revision said "rename the store up one level", which cannot work.**
+The store root is the *highest* owned-and-writable ancestor: the walk climbs to
+the mount boundary, overwriting its candidate each time, so by construction
+nothing above the store root is both owned and writable on that device. The
+parent therefore never passes the test that selected the root, and the
+relocation is unreachable code.
 
-Three consequences the implementation must handle:
+The failing `rmdir` is also not the worst case. **A recursive delete of an
+ancestor destroys the store outright** — confirmed by reproduction: a `.undo`
+directory nested under a removed ancestor goes with the tree, backups and all,
+silently. This is reachable wherever per-user directories sit beneath a
+group-owned but group-writable parent, because the walk then terminates inside
+the user's own tree.
 
-- **The resolver cache must be updated to the new root**, or the next save
-  recreates `<P>` — leaving behind the very directory the command just removed.
-  A concurrent thread can still lose this race; that is the same limitation the
-  thread-local cache already accepts, and it is documented rather than fixed
-  with a lock inside an interposer.
-- **Relocations chain.** `rm -rf a/b/c` relocates at `c`, then at `b`, then at
-  `a`. The `storemv` records compose in journal order.
-- **There is a terminal case.** When the parent is not ours or is not writable,
-  the store cannot move. Only then is it removed, and a `lost` record is
-  written for every backup it held, so the loss is visible instead of silent.
-  This is the case where a user deletes their entire top-level directory on a
-  volume, and it is the one place where Invariant 1 genuinely costs data.
+So the backups are **copied to the session directory**, which is off-volume and
+outside any tree the command is deleting, subject to `UNDO_MAX_BYTES` per file.
+Four properties this has to satisfy:
+
+- **Copied, not moved.** On the recursive-delete path the originals must remain
+  for the delete to remove. Moving them makes the command report files that
+  vanished and can change its exit status — the very thing being avoided.
+- **One `storemv` record per backup, not one per store.** A backup over the cap
+  cannot be copied off the volume, and a single per-store prefix record would
+  then point every backup at a location where some of them are not. Per-file, a
+  failure is recorded as `-` and reported, rather than discovered halfway
+  through a restore.
+- **Triggered from two places**: a `rmdir` failing `ENOTEMPTY` with our store as
+  the last entry, and an `unlink` of a file inside our own store. The second is
+  what covers the recursive delete, and it must fire once per store per thread
+  or a large delete re-copies the whole store for every file it removes.
+- **The shim must ignore its own store unconditionally**, not through the
+  `UNDO_DEFAULT_IGNORE`-disableable default list. Otherwise a recursive delete
+  reaching `.undo/` makes the shim back up its own backups into the same doomed
+  directory.
+
+This is the one place Invariant 1 genuinely costs something: a free hardlinked
+backup becomes real bytes on the session filesystem. It is bounded by the cap,
+and it happens only when the user is deleting their own top-level directory on
+a volume.
 
 **Which path drives selection for renames.** A rename has a source, a
 destination, and possibly an overwritten destination inode. The backup taken
@@ -416,6 +435,7 @@ is reported:
 | `FICLONE` unsupported | read/write copy, capped | no (still protected) |
 | File exceeds cap | nothing saved, `lost` record | **yes, loudly** |
 | Store unwritable or quota exhausted | nothing saved, `lost` record | **yes, loudly** |
+| The command deletes the store itself | backups copied to the session dir, capped | only over the cap, `storemv <path> -` |
 
 ## Testing
 
@@ -436,6 +456,11 @@ is reported:
 - **`rmdir` must still succeed** when the only thing left in the target
   directory is undo's own store. This is the concrete form of Invariant 1 and
   the one most likely to regress.
+- **A recursive delete over the store must still undo.** Deleting a tree that
+  contains the store exercises the evacuation path; the files removed must
+  still be restorable, and the delete itself must report no missing files and
+  return its usual exit status. The second half is what catches an
+  implementation that moves the backups out instead of copying them.
 - **Save-method recording**, asserting a hardlinked backup is still identified
   as a hardlink after the original is unlinked — the failure that killed the
   `st_nlink` approach.

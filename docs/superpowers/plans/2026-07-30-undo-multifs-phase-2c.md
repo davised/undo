@@ -46,7 +46,7 @@ backup layout. Nothing here works before that lands.
 | `internal/session/session.go` | modify | `sessionSize` replacing `dirSize`; `storeRoots`; `Roots`/`saveRoots` registry; `SweepOrphans`; `GC` gains an age limit |
 | `internal/session/session_test.go` | modify (append) | accounting by method, age eviction, sweep, and the guards on it |
 | `cmd/undo/main.go` | modify | `UNDO_MAX_AGE`; `cmdGC` calls the sweep and reports what it reclaimed |
-| `test/e2e.sh` | modify (append case 27) | a large hardlinked backup survives gc while a large copied one does not |
+| `test/e2e.sh` | modify (append case 28) | a large hardlinked backup survives gc while a large copied one does not |
 | `test/multifs-gc.sh` | create | the sweep reclaiming a store on the other filesystem |
 
 ## Configuration
@@ -501,12 +501,23 @@ func rootsFile() string {
 	return filepath.Join(filepath.Dir(Root()), "roots")
 }
 
-// sessionID reports whether name has the shape session.Create produces:
-// unix seconds followed by six digits of microseconds, all decimal.
+// sessionIDLen is the width Create produces: fmt.Sprintf("%d%06d", unix,
+// nanos/1000) -- ten digits of unix seconds through the year 2286, then six of
+// microseconds.
+const sessionIDLen = 16
+
+// sessionID reports whether name has exactly the shape Create produces.
 //
-// The sweep deletes directories, so this is a guard, not a formatting detail.
+// The sweep calls os.RemoveAll on whatever this approves, so it is a deletion
+// fence, not a formatting detail. Anything looser -- "all digits", "not a
+// dotfile" -- turns a shared .undo directory into a hazard, because a numeric
+// directory belonging to something else would qualify.
+//
+// Being too strict fails closed: an orphan survives and is reclaimed by hand.
+// Being too loose deletes someone else's data. If Create's format ever
+// changes, update this and accept that older orphans stop being swept.
 func sessionID(name string) bool {
-	if len(name) < 7 || len(name) > 32 {
+	if len(name) != sessionIDLen {
 		return false
 	}
 	for i := 0; i < len(name); i++ {
@@ -515,6 +526,18 @@ func sessionID(name string) bool {
 		}
 	}
 	return true
+}
+
+// ownedByCaller reports whether path belongs to the user running this process.
+// A second fence on the sweep: a store directory undo created is always ours,
+// so anything else under a .undo directory is not the sweep's to remove.
+func ownedByCaller(path string) bool {
+	fi, err := os.Lstat(path)
+	if err != nil || !fi.IsDir() {
+		return false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	return ok && int(st.Uid) == os.Getuid()
 }
 
 // storeRoots extracts the filesystem-local store roots a journal implies.
@@ -630,7 +653,8 @@ func SweepOrphans() (int, error) {
 		}
 		live := 0
 		for _, e := range ents {
-			if !e.IsDir() || !sessionID(e.Name()) {
+			cand := filepath.Join(undoDir, e.Name())
+			if !e.IsDir() || !sessionID(e.Name()) || !ownedByCaller(cand) {
 				live++ // not ours; its presence keeps the root registered
 				continue
 			}
@@ -638,7 +662,7 @@ func SweepOrphans() (int, error) {
 				live++
 				continue
 			}
-			if os.RemoveAll(filepath.Join(undoDir, e.Name())) == nil {
+			if os.RemoveAll(cand) == nil {
 				removed++
 			}
 		}
@@ -675,7 +699,8 @@ them. Immediately after `all, err := List()` and its error check, add:
 	rememberRoots(roots)
 ```
 
-`sort` and `strings` are already imported.
+`sort` and `strings` are already imported; add `syscall` (already imported by
+`session.go` for `Live()`).
 
 - [ ] **Step 4: Run the tests**
 
@@ -733,7 +758,7 @@ dropping it would strand its contents permanently.'
 ### Task 3: Prove the accounting end to end
 
 **Files:**
-- Modify: `test/e2e.sh` (append case 27)
+- Modify: `test/e2e.sh` (append case 28)
 - Create: `test/multifs-gc.sh`
 
 **Interfaces:**
@@ -742,10 +767,10 @@ dropping it would strand its contents permanently.'
 
 - [ ] **Step 1: Append the e2e case**
 
-Append to `test/e2e.sh`, after case 26:
+Append to `test/e2e.sh`, after case 27 (plan 2b added 25, 26 and 27):
 
 ```bash
-echo "== case 27: gc keeps a big hardlinked backup and prunes a big copied one"
+echo "== case 28: gc keeps a big hardlinked backup and prunes a big copied one"
 mkdir -p "$PLAY/acct"
 dd if=/dev/zero of="$PLAY/acct/deleted.bin" bs=1M count=4 status=none
 dd if=/dev/zero of="$PLAY/acct/rewritten.bin" bs=1M count=4 status=none
@@ -767,9 +792,9 @@ UNDO_MAX_STORE=1048576 "$UNDO" gc >/dev/null
 
 Run: `test/in-container.sh test/e2e.sh`
 
-Expected: all cases pass including 27.
+Expected: all cases pass including 28.
 
-If case 27 fails because the `rm` produced a copy rather than a hardlink, the
+If case 28 fails because the `rm` produced a copy rather than a hardlink, the
 store did not land on `$PLAY`'s filesystem — check the journal's method field
 before changing the test. `awk -F'\t' '$1=="unlink"{print $4}'` on the session's
 journal says which happened.
@@ -855,7 +880,7 @@ git ls-files -z | xargs -0 tools/check-no-site-data.sh; echo "tree exit=$?"
 git add test/e2e.sh test/multifs-gc.sh
 git commit -m 'test: accounting by save method, and the orphan sweep
 
-Case 27 is the executable form of the finding the design rests on: with a
+Case 28 is the executable form of the finding the design rests on: with a
 budget far below either backup, the hardlinked one survives and the copied
 one is pruned. Before this, both were charged full logical size and the
 hardlink -- the free mechanism -- was evicted first.
@@ -869,7 +894,7 @@ live session'"'"'s store left alone.'
 
 ## Definition of done
 
-- [ ] `test/in-container.sh make test` passes, including new e2e case 27
+- [ ] `test/in-container.sh make test` passes, including new e2e case 28
 - [ ] `test/in-container.sh --privileged bash -c 'make && test/multifs.sh test/multifs-gc.sh'` prints `orphan sweep ok`
 - [ ] 2a and 2b harnesses still pass: `multifs-restore.sh` and `multifs-store.sh`
 - [ ] A hardlinked backup contributes 0 bytes to `allocatedBytes()`, a copied one contributes its size
@@ -899,9 +924,13 @@ live session'"'"'s store left alone.'
   session takes its journal with it, and that journal is the only record of
   where its backups lived. Recording afterwards loses exactly the roots that
   most need sweeping.
-- **`sessionID` is a safety fence, not formatting.** The sweep calls
-  `os.RemoveAll` on directories it finds on disk. Loosening this check to
-  something like "not a dotfile" turns a shared `.undo` directory into a hazard.
+- **`sessionID` and `ownedByCaller` are safety fences, not formatting.** The
+  sweep calls `os.RemoveAll` on directories it finds on disk, so both must hold
+  before anything is removed: the exact 16-digit shape `Create` produces, and
+  ownership by the calling user. Loosening either -- "all digits", "not a
+  dotfile" -- turns a shared `.undo` directory into a hazard, because a numeric
+  directory belonging to something else would qualify. Erring strict fails
+  closed: an orphan survives and gets cleaned by hand.
 - **Keeping unreachable roots is deliberate and will look like a leak.** The
   registry grows on a machine with many network mounts and never shrinks while
   they are down. That is the correct trade: forgetting a root strands its

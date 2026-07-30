@@ -10,9 +10,10 @@ was saved so the collector can tell a free one from an expensive one.
 the file to the highest ancestor that is on the same filesystem, owned by the
 caller, and writable, then places backups in `<root>/.undo/<session-id>/`. Three
 things guard the consequences: a containment check so the store is never inside
-the tree being destroyed, a relocation path so creating the store can never make
-an `rmdir` fail, and a `storemv` journal record so the CLI can follow a store
-that moved. Every backup-bearing journal record gains a trailing method field.
+the tree being destroyed, an evacuation path so the backups get off the volume
+before the store is destroyed, and a `storemv` journal record so the CLI can
+follow a backup that moved. Every backup-bearing journal record gains a trailing
+method field.
 
 **Tech Stack:** C (the `LD_PRELOAD` shim, glibc target 2.34), Go 1.24 (journal
 reader and restore), bash (e2e and the two-filesystem harness).
@@ -54,13 +55,13 @@ placement assertion in this plan runs inside it.
 
 | File | Status | Responsibility |
 |---|---|---|
-| `shim/undo_shim.c` | modify | path helpers, store resolver + cache, store creation, method recording, rmdir relocation |
+| `shim/undo_shim.c` | modify | path helpers, store resolver + cache, store creation, method recording, store evacuation |
 | `internal/journal/journal.go` | modify | `OpStoreMove` constant, `Method()` accessor, `ResolveStoreMoves` |
 | `internal/journal/journal_test.go` | modify (append) | method parsing, prefix rewriting, chained and discarded moves |
 | `internal/session/session.go` | modify | `load` applies `ResolveStoreMoves` |
 | `internal/restore/restore.go` | modify | treat a `-` backup as discarded rather than chasing it; ignore `storemv` records |
 | `test/e2e.sh` | modify (append cases 25-27) | the contract cases upstream requires |
-| `test/multifs-store.sh` | create | placement, containment, and relocation on two real filesystems |
+| `test/multifs-store.sh` | create | placement, containment, and evacuation on two real filesystems |
 
 ## Journal format changes
 
@@ -73,16 +74,21 @@ breaking.
 | `unlink` | `path`, `backup` | `path`, `backup`, **`method`** |
 | `mod` | `path`, `backup` | `path`, `backup`, **`method`** |
 | `rename` | `old`, `new`, `backup`\|`-` | `old`, `new`, `backup`\|`-`, **`method`** |
-| `storemv` | — | **new**: `old-prefix`, `new-prefix`\|`-` |
+| `storemv` | — | **new**: `old-path`, `new-path`\|`-` |
 
 `method` is one of `link` (hardlink — allocates nothing), `copy` (full byte
 copy), or `none` (no backup was taken). `reflink` is reserved for phase 3. A
 record with no method field at all is read as `copy`, which is exactly today's
 accounting, so existing journals keep their current behavior.
 
-A `storemv` destination of `-` means the store could not be moved and was
-discarded; the affected backups are rewritten to `-` so restore reports them
-as gone rather than chasing a path that no longer exists.
+`storemv` is written **per backup**, not per store. A backup over
+`UNDO_MAX_BYTES` cannot be copied off the volume, and a single per-store prefix
+record would then point every backup at a location where some of them are not.
+A destination of `-` means that backup could not be saved and is gone; it is
+rewritten to `-` so restore reports it rather than chasing a missing path.
+
+The resolver matches on `/` component boundaries, so an exact per-file path and
+a directory prefix both work through the same code.
 
 ## Interfaces produced by this plan
 
@@ -94,7 +100,9 @@ static int  resolve_store_root(const char *abs, char *out);   /* 0 on success */
 static int  ensure_store(const char *root, char *out);        /* creates <root>/.undo/<sid> */
 static int  backup_name(const char *abs, char *out);          /* was: backup_name(char *out) */
 static int  save_file(const char *abs, int need_copy, char *bak, const char **method);
-static int  relocate_store_out_of(const char *dir);           /* 1 if something moved */
+static int  in_our_store(const char *abs, char *root_out);    /* 1 if abs is our backup */
+static void evacuate_store(const char *root, int remove_after);
+static int  dir_holds_only(const char *dir, const char *name);
 ```
 
 ```go
@@ -789,63 +797,247 @@ so an older CLI reads these journals unchanged.'
 
 ---
 
-### Task 4: Never let store creation make an `rmdir` fail
+### Task 4: Get the backups out before the store is destroyed
 
-Creating `.undo/` inside a directory can make an otherwise-successful `rmdir`
-fail with `ENOTEMPTY`. That is a direct violation of the first invariant: the
-user's command fails because undo was loaded.
+Two ways the store can be taken out from under itself, both reachable on a
+volume where per-user directories sit beneath a group-owned parent — the walk
+terminates inside the user's tree, so the store lands there:
 
-The reachable shape is a volume where per-user directories sit beneath a
-group-owned parent. For a file at `<vol>/<user>/project/deep/a.txt`, if
-`<vol>/<user>` is not owned by the caller, the walk stops at
-`<vol>/<user>/project` and the store lands there — inside the tree a subsequent
-`rm -rf` is removing. The containment guard does not catch this, because the
-store root is an *ancestor* of each file being unlinked, not a descendant.
+1. **`rmdir` fails `ENOTEMPTY` because our `.undo/` is the last entry.** The
+   user's command fails because undo was loaded, which is the one thing the
+   shim must never do.
+2. **`rm -rf` of an ancestor deletes the store outright**, backups and all.
+   Confirmed by reproduction: a `.undo` directory nested under a removed
+   ancestor goes with the tree. This is the larger of the two, and it is silent.
 
-The store is therefore **moved up one level and the `rmdir` retried**, not
-deleted: that store holds the backups for everything just deleted under the
-directory, and discarding it would trade the entire purpose of the tool for the
-invariant. A `storemv` record tells the CLI where the backups went.
+**There is nowhere better on that filesystem to put them.** The store root is
+the *highest* owned-and-writable ancestor — the walk climbs to the mount
+boundary and overwrites its candidate each time — so by construction nothing
+above the store root is both owned and writable on that device. Moving the
+store up one level therefore cannot work: the parent never passes the test that
+chose the root in the first place. An earlier revision of this plan tried it and
+was dead code.
+
+So the backups are **copied to the session directory**, which is off-volume and
+outside any tree the command is deleting, subject to `UNDO_MAX_BYTES` per file.
+Anything over the cap, or that fails to copy, gets a `storemv <old> -` record so
+the loss is reported rather than silent. Copied rather than moved: on the
+`rm -rf` path the originals must stay for `rm` to delete, or `rm` reports
+missing files and the exit status changes.
+
+This is the one place the never-fail invariant genuinely costs something — a
+hardlinked backup becomes real bytes on the session filesystem. It is bounded by
+the cap, and it only happens when the user is deleting their own top-level
+directory on a volume.
 
 **Files:**
-- Modify: `shim/undo_shim.c` — `rmdir` (561-575), `unlinkat` (577-598)
-- Test: `test/e2e.sh` (append case 26)
+- Modify: `shim/undo_shim.c` — `ignored` (297-335), `handle_unlink_pre` (401-424), `rmdir` (561-575), `unlinkat` (577-598)
+- Test: `test/e2e.sh` (append cases 26 and 27)
 
 **Interfaces:**
-- Consumes: `session_id`, `ensure_store`, `resolve_store_root`, `store_cache_put` from Tasks 2-3.
-- Produces: `relocate_store_out_of(const char *dir)` returning 1 when something moved, and `storemv` journal records.
+- Consumes: `session_id`, `ensure_store`, `copy_file`, `jwrite` from earlier tasks.
+- Produces: `in_our_store(const char *abs, char *root_out)`, `evacuate_store(const char *root, int remove_after)`, and per-backup `storemv` records.
 
-- [ ] **Step 1: Write the failing e2e case**
+- [ ] **Step 1: Write the failing e2e cases**
 
-Append to `test/e2e.sh`:
+Append to `test/e2e.sh`, after case 25:
 
 ```bash
 echo "== case 26: our own store never makes an rmdir fail"
-# A directory the user owns, whose parent they do not own, is where the walk
-# terminates -- so the store lands inside the tree that is about to be removed.
 mkdir -p "$PLAY/relocate/inner"
 echo "recoverable" >"$PLAY/relocate/inner/doomed.txt"
-run_armed "rm -rf $PLAY/relocate/inner"
+run_armed "rm $PLAY/relocate/inner/doomed.txt && rmdir $PLAY/relocate/inner"
 [[ ! -e $PLAY/relocate/inner ]] ||
-    fail "rm -rf left the directory behind; the shim broke the command"
+    fail "rmdir left the directory behind; the shim broke the command"
 "$UNDO" -y >/dev/null
 [[ $(cat "$PLAY/relocate/inner/doomed.txt") == "recoverable" ]] ||
-    fail "the backup did not survive the store relocation"
+    fail "the backup did not survive the store evacuation"
+
+echo "== case 27: rm -rf over the store still undoes"
+mkdir -p "$PLAY/wipe/sub"
+echo "keep me" >"$PLAY/wipe/sub/a.txt"
+echo "me too" >"$PLAY/wipe/b.txt"
+run_armed "rm -rf $PLAY/wipe"
+[[ ! -e $PLAY/wipe ]] || fail "rm -rf did not run"
+"$UNDO" -y >/dev/null
+[[ $(cat "$PLAY/wipe/sub/a.txt") == "keep me" ]] ||
+    fail "a backup inside the destroyed store was not evacuated"
+[[ $(cat "$PLAY/wipe/b.txt") == "me too" ]] ||
+    fail "a backup inside the destroyed store was not evacuated"
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+- [ ] **Step 2: Run them and watch them fail**
 
 Run: `test/in-container.sh test/e2e.sh`
 
-Expected: FAIL. Which of the two assertions fires depends on where the walk
-lands in the container's temp directory; either proves the hole. If **both**
-pass already, the store did not land inside the removed tree — force it by
-setting `UNDO_SESSION`'s volume so the walk terminates there, and say so in the
-commit rather than deleting the case.
+Expected: FAIL on one or both. Which assertion fires depends on where the walk
+lands in the container's temp directory. If **both pass already**, the store did
+not land inside the removed tree and the cases are proving nothing — check with
+`awk -F'\t' '$1=="unlink"{print $3}'` on the session journal, and adjust the
+fixture so the store root really is inside the tree before continuing.
 
-- [ ] **Step 3: Implement the relocation**
+- [ ] **Step 3: Stop the shim journaling its own store**
 
-In `shim/undo_shim.c`, insert before the interposed functions (before line 546):
+`rm -rf` walking into `.undo/` currently makes the shim back up each backup
+into the same doomed store. In `shim/undo_shim.c`, add an unconditional check at
+the top of `ignored` (line 297), before the `use_default` block:
+
+```c
+static int ignored(const char *abs)
+{
+    /* Our own store, always. Not part of default_ignores, which
+     * UNDO_DEFAULT_IGNORE=0 turns off: backing up our own backups is never
+     * something a user should be able to switch on. */
+    if (seg_match(abs, ".undo", 5))
+        return 1;
+
+    static int loaded, use_default = 1;
+    ...
+```
+
+- [ ] **Step 4: Implement the evacuation**
+
+Insert after `ensure_store`:
+
+```c
+/* If `abs` is a backup inside this session's own store, fill `root_out` with
+ * that store's root and return 1.
+ *
+ * Backups live at <root>/.undo/<session-id>/<name>, so this is a structural
+ * match on the two components before the basename. */
+static int in_our_store(const char *abs, char *root_out)
+{
+    const char *sid = session_id();
+    if (!sid)
+        return 0;
+    size_t sidlen = strlen(sid);
+
+    const char *p = abs;
+    while ((p = strstr(p, "/.undo/")) != NULL) {
+        const char *after = p + 7; /* strlen("/.undo/") */
+        if (strncmp(after, sid, sidlen) == 0 && after[sidlen] == '/') {
+            size_t rootlen = (size_t)(p - abs);
+            if (rootlen == 0 || rootlen >= PATH_MAX)
+                return 0;
+            memcpy(root_out, abs, rootlen);
+            root_out[rootlen] = 0;
+            return 1;
+        }
+        p += 7;
+    }
+    return 0;
+}
+
+/* Roots already evacuated by this thread, so a recursive delete does not
+ * re-copy the whole store once per file it removes. */
+#define EVAC_SLOTS 8
+static __thread char evac_done[EVAC_SLOTS][PATH_MAX];
+static __thread int evac_next;
+
+static int evac_seen(const char *root)
+{
+    for (int i = 0; i < EVAC_SLOTS; i++)
+        if (evac_done[i][0] && strcmp(evac_done[i], root) == 0)
+            return 1;
+    snprintf(evac_done[evac_next], PATH_MAX, "%s", root);
+    evac_next = (evac_next + 1) % EVAC_SLOTS;
+    return 0;
+}
+
+/* Copy every backup in <root>/.undo/<session-id>/ to the session directory,
+ * recording where each one went, because the store is about to be destroyed.
+ *
+ * Copied, not moved: on the rm -rf path the originals must stay for rm to
+ * delete. Moving them makes rm report missing files and changes the command's
+ * exit status, which is exactly what the shim must never do.
+ *
+ * One storemv record per backup rather than one prefix record for the store:
+ * a file over UNDO_MAX_BYTES cannot be copied, and a prefix record would then
+ * point every backup at a location where some of them are not. Per-file, a
+ * failure is recorded as "-" and reported honestly.
+ *
+ * With remove_after set the originals are removed and the store directories
+ * taken down, which is what lets a failing rmdir be retried.
+ */
+static void evacuate_store(const char *root, int remove_after)
+{
+    const char *dir = session_dir();
+    const char *sid = session_id();
+    if (!dir || !sid)
+        return;
+    if (!remove_after && evac_seen(root))
+        return;
+
+    char store[PATH_MAX];
+    if ((size_t)snprintf(store, sizeof store, "%s/.undo/%s", root, sid) >=
+        sizeof store)
+        return;
+
+    DIR *d = opendir(store);
+    if (!d)
+        return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+            continue;
+        char from[PATH_MAX], to[PATH_MAX];
+        if ((size_t)snprintf(from, sizeof from, "%s/%s", store, e->d_name) >=
+                sizeof from ||
+            (size_t)snprintf(to, sizeof to, "%s/data/%s", dir, e->d_name) >=
+                sizeof to)
+            continue;
+        /* copy_file enforces UNDO_MAX_BYTES and refuses non-regular files */
+        if (copy_file(from, to) == 0)
+            jwrite("storemv", from, to, NULL);
+        else
+            jwrite("storemv", from, "-", NULL);
+        if (remove_after) {
+            REAL(unlink, int, const char *);
+            real_unlink(from);
+        }
+    }
+    closedir(d);
+
+    if (remove_after) {
+        char undo[PATH_MAX];
+        REAL(rmdir, int, const char *);
+        real_rmdir(store);
+        if ((size_t)snprintf(undo, sizeof undo, "%s/.undo", root) < sizeof undo)
+            real_rmdir(undo);
+    }
+}
+```
+
+Add `#include <dirent.h>` to the include block at the top of the file.
+
+- [ ] **Step 5: Trigger it when a backup of ours is being deleted**
+
+In `handle_unlink_pre`, immediately after `abs_path` succeeds and **before** the
+`ignored` check — `.undo` is now always ignored, so the check would otherwise
+return first:
+
+```c
+static void handle_unlink_pre(int dirfd, const char *path, char *abs,
+                              char *bak, char *lnk, int *kind,
+                              const char **method)
+{
+    *kind = 0;
+    *method = "none";
+    if (abs_path(dirfd, path, abs) != 0)
+        return;
+    /* Something is deleting our own backups -- a recursive delete that reached
+     * the store. Get them off this filesystem before they go. */
+    char root[PATH_MAX];
+    if (in_our_store(abs, root))
+        evacuate_store(root, 0);
+    if (ignored(abs))
+        return;
+    ...
+```
+
+- [ ] **Step 6: Trigger it when our store blocks an `rmdir`**
+
+Add a helper beside `evacuate_store`:
 
 ```c
 /* True when `dir` contains exactly one entry and it is named `name`. */
@@ -867,98 +1059,7 @@ static int dir_holds_only(const char *dir, const char *name)
     closedir(d);
     return seen && !other;
 }
-
-/* An rmdir failed and our own store is the only thing left in the directory.
- * Move the store up one level and let the caller retry.
- *
- * Renamed rather than removed: the store holds the backups for everything the
- * command just deleted under this directory, and deleting it to satisfy "the
- * shim must never make the command fail" would trade away the entire point of
- * the tool, silently, in the case where an undo is most wanted. Both paths are
- * on one filesystem, so the rename is a metadata operation, not a copy.
- *
- * A storemv record maps the old prefix to the new one so the CLI can still
- * find the backups. When the parent is not ours or is not writable the store
- * cannot move; only then is it discarded, and the record carries "-" so the
- * loss is visible rather than silent.
- *
- * Returns 1 if the directory should now be removable. */
-static int relocate_store_out_of(const char *dir)
-{
-    const char *sid = session_id();
-    if (!sid || !dir_holds_only(dir, ".undo"))
-        return 0;
-
-    char from[PATH_MAX], parent[PATH_MAX], to[PATH_MAX], oldpfx[PATH_MAX];
-    if ((size_t)snprintf(oldpfx, sizeof oldpfx, "%s/.undo/%s", dir, sid) >=
-        sizeof oldpfx)
-        return 0;
-    if ((size_t)snprintf(from, sizeof from, "%s/.undo", dir) >= sizeof from)
-        return 0;
-
-    snprintf(parent, sizeof parent, "%s", dir);
-    char *slash = strrchr(parent, '/');
-    if (!slash || slash == parent)
-        return 0; /* no usable parent */
-    *slash = 0;
-
-    REAL(rename, int, const char *, const char *);
-    struct stat pst, dst_;
-    int moved = 0;
-    if (stat(parent, &pst) == 0 && stat(dir, &dst_) == 0 &&
-        pst.st_dev == dst_.st_dev && pst.st_uid == geteuid() &&
-        (pst.st_mode & S_IWUSR) && ensure_store(parent, to) == 0) {
-        /* ensure_store made <parent>/.undo/<sid>; rmdir it so the rename can
-         * put ours in its place. Both are ours and empty-or-not accordingly. */
-        REAL(rmdir, int, const char *);
-        real_rmdir(to);
-        char src[PATH_MAX];
-        if ((size_t)snprintf(src, sizeof src, "%s/%s", from, sid) < sizeof src &&
-            real_rename(src, to) == 0) {
-            jwrite("storemv", oldpfx, to, NULL);
-            /* The cache still names `dir` as this filesystem's root. Left
-             * alone, the next save recreates <dir>/.undo -- putting back the
-             * directory the command just removed. */
-            store_cache_put(dst_.st_dev, parent);
-            moved = 1;
-        }
-    }
-
-    if (!moved) {
-        /* Terminal case: the parent is not ours, or not writable. The user is
-         * removing their whole owned subtree on this volume. Report the loss
-         * rather than leaving the command broken. */
-        jwrite("storemv", oldpfx, "-", NULL);
-    }
-
-    /* Whether it moved or not, our directory must be gone for the retry to
-     * succeed. rmdir only removes it if it is empty, which after a successful
-     * rename it is; on the terminal path anything left is deliberately
-     * discarded. */
-    char sdir[PATH_MAX];
-    if ((size_t)snprintf(sdir, sizeof sdir, "%s/%s", from, sid) < sizeof sdir) {
-        REAL(unlinkat, int, int, const char *, int);
-        DIR *d = opendir(sdir);
-        if (d) {
-            struct dirent *e;
-            while ((e = readdir(d)) != NULL) {
-                if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
-                    continue;
-                real_unlinkat(dirfd(d), e->d_name, 0);
-            }
-            closedir(d);
-        }
-    }
-    REAL(rmdir, int, const char *);
-    real_rmdir(sdir);
-    real_rmdir(from);
-    return 1;
-}
 ```
-
-Add `#include <dirent.h>` to the include block at the top of the file.
-
-- [ ] **Step 4: Wire it into `rmdir` and `unlinkat`**
 
 Replace `rmdir` (561-575):
 
@@ -973,91 +1074,96 @@ int rmdir(const char *path)
     int ok;
     handle_rmdir_pre(AT_FDCWD, path, abs, mode, &ok);
     int rc = real_rmdir(path);
-    if (rc != 0 && errno == ENOTEMPTY && ok && relocate_store_out_of(abs))
-        rc = real_rmdir(path);
-    if (rc == 0 && ok)
-        jwrite("rmdir", abs, mode, NULL);
-    in_shim = 0;
-    return rc;
-}
-```
-
-In `unlinkat` (577-598), apply the same retry in the `AT_REMOVEDIR` branch:
-
-```c
-    int rc = real_unlinkat(dirfd, path, flags);
-    if (flags & AT_REMOVEDIR) {
-        if (rc != 0 && errno == ENOTEMPTY && dirok &&
-            relocate_store_out_of(abs))
-            rc = real_unlinkat(dirfd, path, flags);
-        if (rc == 0 && dirok)
-            jwrite("rmdir", abs, mode, NULL);
-    } else {
-        handle_unlink_post(rc, abs, bak, lnk, kind, method);
-    }
-```
-
-**`errno` must survive.** The retry path runs `opendir`, `stat`, `rename`, and
-`rmdir`, all of which overwrite `errno`. When the retry does not fix things, the
-caller must still see the original failure. Capture and restore it:
-
-```c
-    int rc = real_rmdir(path);
     int saved = errno;
-    if (rc != 0 && saved == ENOTEMPTY && ok && relocate_store_out_of(abs)) {
+    if (rc != 0 && saved == ENOTEMPTY && ok && dir_holds_only(abs, ".undo")) {
+        evacuate_store(abs, 1);
         rc = real_rmdir(path);
         saved = errno;
     }
     if (rc == 0 && ok)
         jwrite("rmdir", abs, mode, NULL);
     in_shim = 0;
+    errno = saved; /* opendir, copy, unlink and rmdir all clobber it */
+    return rc;
+}
+```
+
+In `unlinkat` (577-598), apply the same shape in the `AT_REMOVEDIR` branch, and
+capture `errno` around the whole thing:
+
+```c
+    int rc = real_unlinkat(dirfd, path, flags);
+    int saved = errno;
+    if (flags & AT_REMOVEDIR) {
+        if (rc != 0 && saved == ENOTEMPTY && dirok &&
+            dir_holds_only(abs, ".undo")) {
+            evacuate_store(abs, 1);
+            rc = real_unlinkat(dirfd, path, flags);
+            saved = errno;
+        }
+        if (rc == 0 && dirok)
+            jwrite("rmdir", abs, mode, NULL);
+    } else {
+        handle_unlink_post(rc, abs, bak, lnk, kind, method);
+    }
+    in_shim = 0;
     errno = saved;
     return rc;
 ```
 
-Use this form in both functions.
+**`errno` matters as much as the return value here.** The retry path runs
+`opendir`, `copy_file`, `unlink`, and `rmdir` between the failing call and the
+caller's return. A caller whose `rmdir` genuinely failed must still see
+`ENOTEMPTY`, not whatever the last internal syscall left behind.
 
-- [ ] **Step 5: Run the suite**
+- [ ] **Step 7: Run the suite**
 
 Run: `test/in-container.sh make test`
 
-Expected: all cases pass, including 25 and 26.
+Expected: all cases pass, including 25, 26, and 27.
 
-- [ ] **Step 6: Confirm the floor**
+- [ ] **Step 8: Confirm the floor**
 
-Run the `objdump` command from Task 1 Step 5. `opendir`, `readdir`, `closedir`,
-and `dirfd` are the new symbols; all are `GLIBC_2.2.5`. Expected: `GLIBC_2.34`
-or lower. **If `readdir` resolved to a 64-bit variant that raised the floor,
-stop** — that is exactly the class of regression the constraint exists for.
+Run the `objdump` command from Task 1 Step 5. The new symbols are `opendir`,
+`readdir`, and `closedir`, all `GLIBC_2.2.5`. Expected: `GLIBC_2.34` or lower.
+**If `readdir` resolved to a variant that raised the floor, stop** — that is
+precisely the regression class the constraint exists for.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add shim/undo_shim.c
-git commit -m 'shim: move the store out of the way rather than breaking rmdir
+git add shim/undo_shim.c test/e2e.sh
+git commit -m 'shim: evacuate backups before their own store is destroyed
 
-Creating .undo/ inside a directory can make an otherwise-successful rmdir
-fail ENOTEMPTY -- the user'"'"'s command failing because undo was loaded, which
-is the one thing the shim must never do. It is reachable on any volume where
-per-user directories sit under a group-owned parent: the walk terminates
-inside the tree, and rm -rf then trips over the store.
+Two ways the store gets taken out from under itself on a volume where
+per-user directories sit under a group-owned parent, which is where the walk
+terminates inside the user tree:
 
-The store is renamed up one level and the rmdir retried. Not deleted: it
-holds the backups for everything just removed under that directory, and
-discarding it to satisfy the invariant would trade away the entire purpose of
-the tool, silently, in the case where an undo is most wanted. Both paths are
-on one filesystem, so this is a metadata operation.
+  - rmdir fails ENOTEMPTY because our .undo is the last entry left, so the
+    user command fails because undo was loaded;
+  - rm -rf of an ancestor deletes the store outright, silently, backups and
+    all.
 
-A storemv record maps the old prefix to the new one. When the parent is not
-ours or not writable the store cannot move, and the record carries "-" so the
-loss is reported instead of silent -- that is the user removing their whole
-owned subtree on a volume, and it is the one place the invariant costs data.
+There is nowhere better on that filesystem to move them. The store root is
+the HIGHEST owned and writable ancestor, so by construction nothing above it
+is both owned and writable -- moving the store up one level cannot work,
+because the parent never passes the test that chose the root.
 
-The resolver cache is repointed at the parent on the way out. Left alone, the
-next save would recreate the store under the directory that was just removed,
-putting back the directory rm -rf had deleted.
+So the backups are copied to the session directory, which is off-volume and
+outside any tree being deleted, capped by UNDO_MAX_BYTES. Copied rather than
+moved: on the rm -rf path the originals have to stay for rm to delete, or rm
+reports missing files and the exit status changes.
 
-errno is captured across the retry: opendir, stat, rename, and rmdir all
+One storemv record per backup, not one prefix record per store: a file over
+the cap cannot be copied, and a prefix record would then point every backup
+at a location where some of them are not. Per-file, a failure is recorded as
+"-" and reported instead of discovered during a restore.
+
+.undo is now ignored unconditionally rather than via default_ignores, which
+UNDO_DEFAULT_IGNORE=0 disables. Backing up our own backups is not something
+a user should be able to switch on.
+
+errno is captured across the retry: opendir, copy_file, unlink and rmdir all
 clobber it, and a caller whose rmdir genuinely failed must still see why.'
 ```
 
@@ -1354,8 +1460,8 @@ git add internal/journal/journal.go internal/journal/journal_test.go \
 git commit -m 'journal: read the save method, and follow a store that moved
 
 The shim now appends a method field to every backup-bearing record and writes
-a storemv record when it has to move a store out of a directory being
-removed. Method() reads the former, defaulting to "copy" for journals written
+a storemv record for each backup it has to copy off a volume whose store is
+being destroyed. Method() reads the former, defaulting to "copy" for journals written
 before the field existed -- the pessimistic answer, and exactly the
 accounting those journals were written under.
 
@@ -1373,7 +1479,7 @@ selective replay after it.'
 
 ---
 
-### Task 6: Prove placement, containment, and relocation on two filesystems
+### Task 6: Prove placement, containment, and evacuation on two filesystems
 
 **Files:**
 - Create: `test/multifs-store.sh`
@@ -1444,7 +1550,7 @@ echo "recoverable" >"$FS_A/user/tree/sub/x.txt"
 run_armed "rm -rf $FS_A/user/tree"
 [[ ! -e $FS_A/user/tree ]] || fail "rm -rf left the tree behind"
 
-echo "== and the backup survived the relocation"
+echo "== and the backup survived the evacuation"
 sess=$(latest)
 "$UNDO" apply "$(basename "$sess")" -y >/dev/null || fail "undo failed"
 [[ $(cat "$FS_A/user/tree/sub/x.txt") == "recoverable" ]] ||
@@ -1500,7 +1606,7 @@ Run it again. Expected: the new assertion passes.
 tools/check-no-site-data.sh test/multifs-store.sh && echo "scan clean"
 git ls-files -z | xargs -0 tools/check-no-site-data.sh; echo "tree exit=$?"
 git add test/multifs-store.sh
-git commit -m 'test: store placement, containment, and relocation on two filesystems
+git commit -m 'test: store placement, containment, and evacuation on two filesystems
 
 Puts the session directory on one tmpfs and the files on the other, so a
 backup that is not filesystem-local is provably a cross-device copy rather
@@ -1510,7 +1616,7 @@ instead of a tautology.
 Covers the four properties the design rests on: the store lands on the
 file'"'"'s own filesystem, a deletion is hardlinked, the store is never inside
 the tree being operated on, and rm -rf of the store'"'"'s own directory still
-succeeds with the backup surviving the relocation. Plus the invariant: an
+succeeds with the backup surviving the evacuation. Plus the invariant: an
 unwritable store costs a backup, never the command.'
 ```
 
@@ -1518,14 +1624,17 @@ unwritable store costs a backup, never the command.'
 
 ## Definition of done
 
-- [ ] `test/in-container.sh make test` passes, including new e2e cases 25 and 26
+- [ ] `test/in-container.sh make test` passes, including new e2e cases 25, 26 and 27
 - [ ] `test/in-container.sh --privileged bash -c 'make && test/multifs.sh test/multifs-store.sh'` prints `store placement ok`
 - [ ] `test/in-container.sh --privileged bash -c 'make && test/multifs.sh test/multifs-restore.sh'` still prints `cross-device restore ok` (2a did not regress)
 - [ ] The shim's glibc floor is still `GLIBC_2.34` or lower after every task
 - [ ] A deletion on a filesystem other than the session store's is recorded with method `link`, not `copy`
-- [ ] `rm -rf` of the directory hosting the store succeeds, and the backups are still restorable afterwards
+- [ ] `rmdir` of a directory whose last entry is our store succeeds, and the backups are still restorable afterwards
+- [ ] `rm -rf` of a tree containing the store succeeds, and the files it deleted are still restorable
+- [ ] `rm -rf` of a tree containing the store reports no missing files and returns its normal exit status — the backups are copied out, not moved out
+- [ ] A backup over `UNDO_MAX_BYTES` in a destroyed store yields `storemv <path> -`, and restore reports it rather than failing on a missing path
 - [ ] An unwritable store leaves the user's command's exit status untouched
-- [ ] `errno` after a genuinely failed `rmdir` is still `ENOTEMPTY`, not something the retry path left behind
+- [ ] `errno` after a genuinely failed `rmdir` is still `ENOTEMPTY`, not something the evacuation path left behind
 - [ ] A journal with no method field still restores, and reads as method `copy`
 - [ ] `git ls-files -z | xargs -0 tools/check-no-site-data.sh` exits 0
 - [ ] `tools/check-ere.sh` passes
@@ -1552,14 +1661,17 @@ unwritable store costs a backup, never the command.'
   strict ancestor of the path — the guard cannot fire for an ordinary file
   unlink. It exists for rename destinations, for paths carrying `..`, and as the
   check applied to the `$UNDO_SESSION/data` fallback. **The mechanism that
-  actually handles `rm -rf` is the relocation in Task 4**, not this guard. Do not
+  actually handles `rm -rf` is the evacuation in Task 4**, not this guard. Do not
   conclude the guard is dead code and remove it, and do not conclude it is
   sufficient and skip Task 4.
-- **`store_cache_put` after a relocation is not optional.** Without it the next
-  save recreates `<dir>/.undo`, which means `rm -rf` leaves behind the directory
-  it just deleted. A concurrent thread can still lose this race; that is the
-  documented cost of a thread-local cache and is not to be fixed with a lock
-  inside an interposer.
+- **Backups are copied out, never moved out.** On the `rm -rf` path the
+  originals have to stay so `rm` can delete them. Moving them makes `rm` report
+  files that vanished and can change its exit status, which is the invariant
+  this whole task exists to protect.
+- **The evacuation is once per store per thread** (`evac_seen`), or a recursive
+  delete re-copies the entire store once for every file it removes. The
+  `remove_after` path deliberately bypasses that check, because it runs at most
+  once per directory and must be exhaustive.
 - **Watch `errno` everywhere in Task 4.** The retry path calls at least four
   syscalls between the failing `rmdir` and the caller's return. Invariant 1 is
   about more than the return value.
