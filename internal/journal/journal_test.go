@@ -53,3 +53,79 @@ func TestDescribe(t *testing.T) {
 		}
 	}
 }
+
+func TestMethodDefaultsToCopy(t *testing.T) {
+	cases := []struct {
+		name string
+		e    Entry
+		want string
+	}{
+		{"unlink hardlinked", Entry{Op: OpUnlink, Fields: []string{"/f", "/b", "link"}}, "link"},
+		{"mod copied", Entry{Op: OpMod, Fields: []string{"/f", "/b", "copy"}}, "copy"},
+		{"rename with backup", Entry{Op: OpRename, Fields: []string{"/a", "/b", "/bak", "link"}}, "link"},
+		{"rename without", Entry{Op: OpRename, Fields: []string{"/a", "/b", "-", "none"}}, "none"},
+		// A journal written before the field existed must keep its old
+		// accounting, which counted everything at full size.
+		{"legacy unlink", Entry{Op: OpUnlink, Fields: []string{"/f", "/b"}}, "copy"},
+		{"no backup at all", Entry{Op: OpCreate, Fields: []string{"/f"}}, "none"},
+	}
+	for _, c := range cases {
+		if got := c.e.Method(); got != c.want {
+			t.Errorf("%s: Method() = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestResolveStoreMovesRewritesLaterOnly(t *testing.T) {
+	in := []Entry{
+		{Op: OpUnlink, Fields: []string{"/v/p/a.txt", "/v/p/.undo/S/1-1", "link"}},
+		{Op: OpStoreMove, Fields: []string{"/v/p/.undo/S", "/v/.undo/S"}},
+		// taken after the move: already correct, must not be rewritten twice
+		{Op: OpUnlink, Fields: []string{"/v/p/b.txt", "/v/.undo/S/1-2", "link"}},
+	}
+	out := ResolveStoreMoves(in)
+	if len(out) != len(in) {
+		t.Fatalf("len = %d, want %d: indices are load-bearing", len(out), len(in))
+	}
+	if got := out[0].Fields[1]; got != "/v/.undo/S/1-1" {
+		t.Errorf("backup before the move = %q, want /v/.undo/S/1-1", got)
+	}
+	if got := out[2].Fields[1]; got != "/v/.undo/S/1-2" {
+		t.Errorf("backup after the move = %q, should be untouched", got)
+	}
+}
+
+func TestResolveStoreMovesChains(t *testing.T) {
+	in := []Entry{
+		{Op: OpUnlink, Fields: []string{"/v/a/b/c/x", "/v/a/b/c/.undo/S/1-1", "link"}},
+		{Op: OpStoreMove, Fields: []string{"/v/a/b/c/.undo/S", "/v/a/b/.undo/S"}},
+		{Op: OpStoreMove, Fields: []string{"/v/a/b/.undo/S", "/v/a/.undo/S"}},
+	}
+	out := ResolveStoreMoves(in)
+	if got := out[0].Fields[1]; got != "/v/a/.undo/S/1-1" {
+		t.Errorf("chained move = %q, want /v/a/.undo/S/1-1", got)
+	}
+}
+
+func TestResolveStoreMovesMarksDiscarded(t *testing.T) {
+	in := []Entry{
+		{Op: OpUnlink, Fields: []string{"/v/p/a.txt", "/v/p/.undo/S/1-1", "link"}},
+		{Op: OpStoreMove, Fields: []string{"/v/p/.undo/S", "-"}},
+	}
+	out := ResolveStoreMoves(in)
+	if got := out[0].Fields[1]; got != "-" {
+		t.Errorf("discarded backup = %q, want %q", got, "-")
+	}
+}
+
+func TestResolveStoreMovesRespectsComponentBoundaries(t *testing.T) {
+	in := []Entry{
+		// /v/p2 must not be rewritten by a move of /v/p
+		{Op: OpUnlink, Fields: []string{"/v/x", "/v/p2/.undo/S/1-1", "link"}},
+		{Op: OpStoreMove, Fields: []string{"/v/p/.undo/S", "/v/.undo/S"}},
+	}
+	out := ResolveStoreMoves(in)
+	if got := out[0].Fields[1]; got != "/v/p2/.undo/S/1-1" {
+		t.Errorf("unrelated prefix was rewritten to %q", got)
+	}
+}

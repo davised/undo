@@ -87,7 +87,7 @@ func load(dir string) (*Session, error) {
 		}
 		return nil, err
 	}
-	s.Entries = entries
+	s.Entries = journal.ResolveStoreMoves(entries)
 	return s, nil
 }
 

@@ -289,6 +289,10 @@ func Run(s *session.Session, dir Direction, opts Options) (*Result, error) {
 
 		case journal.OpUnlink:
 			if dir == Undo {
+				if field(1) == "" || field(1) == "-" {
+					skip("the backup was discarded when its directory was removed")
+					continue
+				}
 				if exists(field(0)) && !opts.Force {
 					skip("path exists again, use --force to overwrite")
 					continue
@@ -335,6 +339,10 @@ func Run(s *session.Session, dir Direction, opts Options) (*Result, error) {
 
 		case journal.OpMod:
 			// symmetric: swap the on-disk file with the backup
+			if field(1) == "" || field(1) == "-" {
+				skip("the backup was discarded when its directory was removed")
+				continue
+			}
 			if !act() {
 				continue
 			}
@@ -479,6 +487,10 @@ func Run(s *session.Session, dir Direction, opts Options) (*Result, error) {
 			if dir == Undo {
 				skip("the shim could not save a backup (too big or unlinkable)")
 			}
+			continue
+
+		case journal.OpStoreMove:
+			// bookkeeping, not a change to replay
 			continue
 
 		default:
