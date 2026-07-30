@@ -350,6 +350,17 @@ func Run(s *session.Session, dir Direction, opts Options) (*Result, error) {
 
 		case journal.OpRename:
 			old, new_, bak := field(0), field(1), field(2)
+			// A "-" backup with a real save method means the backup existed
+			// and was discarded when its store was destroyed. That is not the
+			// same as a rename that overwrote nothing, and must not be
+			// replayed as if it were: undo would move the file back and
+			// silently leave the overwritten one gone while counting the entry
+			// restored, and redo under --force would delete whatever occupies
+			// the target now.
+			if bak == "-" && e.Method() != "none" {
+				skip("the overwritten file's backup was discarded when its store was removed")
+				continue
+			}
 			hasBak := bak != "-" && bak != ""
 			if dir == Undo {
 				if exists(old) && !opts.Force {

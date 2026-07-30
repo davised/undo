@@ -412,3 +412,51 @@ func TestCopyAcrossRefusesNonEmptyDestinationDirectory(t *testing.T) {
 		t.Error("pre-existing destination content was disturbed")
 	}
 }
+
+// A rename that overwrote a file, whose backup was discarded when its store
+// was destroyed. The backup field reads "-" after ResolveStoreMoves, but the
+// method field still says a backup existed -- so this is not the same as a
+// rename that never needed one, and must not be replayed as if it were.
+func TestRenameWithDiscardedBackupIsReportedNotHalfDone(t *testing.T) {
+	work := t.TempDir()
+	oldp := filepath.Join(work, "a.txt")
+	newp := filepath.Join(work, "b.txt")
+	write(t, newp, "moved content")
+	s := newSession(t, []journal.Entry{
+		{Op: journal.OpRename, Fields: []string{oldp, newp, "-", "link"}},
+	})
+
+	res, err := Run(s, Undo, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Done != 0 || len(res.Skipped) != 1 {
+		t.Fatalf("want 0 done / 1 skipped, got %d done / %d skipped: %v",
+			res.Done, len(res.Skipped), res.Skipped)
+	}
+	if !present(newp) {
+		t.Error("the rename was half-reverted, leaving the overwritten file gone for good")
+	}
+}
+
+// The genuine no-backup rename -- nothing was overwritten -- must still revert.
+func TestRenameWithoutBackupStillReverts(t *testing.T) {
+	work := t.TempDir()
+	oldp := filepath.Join(work, "a.txt")
+	newp := filepath.Join(work, "b.txt")
+	write(t, newp, "moved content")
+	s := newSession(t, []journal.Entry{
+		{Op: journal.OpRename, Fields: []string{oldp, newp, "-", "none"}},
+	})
+
+	res, err := Run(s, Undo, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Done != 1 {
+		t.Fatalf("Done = %d, want 1 (skipped: %v)", res.Done, res.Skipped)
+	}
+	if read(t, oldp) != "moved content" {
+		t.Error("a rename with no overwritten target did not revert")
+	}
+}
