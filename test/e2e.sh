@@ -360,5 +360,49 @@ else
     echo "   (no cc, skipped)"
 fi
 
+echo "== case 29: a rename whose target could not be saved is recorded as lost"
+# Two conditions must hold for save_file to fail: the link() attempt must cross
+# filesystems (so it gets EXDEV) and the copy fallback must hit the
+# UNDO_MAX_BYTES cap.  We use /dev/shm (tmpfs) for the renamed files, and we
+# sabotage the store that resolve_store_root would create there by planting a
+# regular file at /dev/shm/.undo, which makes ensure_store fail and forces
+# save_file to use the overlay-backed session data dir -- cross-device link.
+RAM=/dev/shm/undo-case29
+rm -rf "$RAM"
+mkdir -p "$RAM/ren"
+echo "victim content" >"$RAM/ren/target.txt"
+echo "source" >"$RAM/ren/src.txt"
+touch /dev/shm/.undo
+id=$(date +%s%N | cut -c1-16); sess="$UNDO_DATA_DIR/sessions/$id"
+mkdir -p "$sess/data"; echo "mv over target" >"$sess/cmd"
+env UNDO_SESSION="$sess" UNDO_MAX_BYTES=4 LD_PRELOAD="$LIB" \
+    bash -c "mv $RAM/ren/src.txt $RAM/ren/target.txt"
+sleep 0.01
+rm -f /dev/shm/.undo
+grep -q '^rename' "$sess/journal" ||
+    fail "no rename record, journal: $(cat "$sess/journal")"
+awk -F'\t' '$1=="rename"{print $5}' "$sess/journal" | grep -qx lost ||
+    fail "rename method = '$(awk -F'\t' '$1=="rename"{print $5}' "$sess/journal")', want lost"
+
+echo "== case 30: files the shim could not save are reported, not just recorded"
+mkdir -p "$PLAY/cap"
+echo original >"$PLAY/cap/big.bin"
+# A cap below the file size makes the shim record a lost entry instead of a
+# backup, which is what happens to a large in-place overwrite on a filesystem
+# with no reflink support.
+id=$(date +%s%N | cut -c1-16); sess="$UNDO_DATA_DIR/sessions/$id"
+mkdir -p "$sess/data"; echo "overwrite big.bin" >"$sess/cmd"
+env UNDO_SESSION="$sess" UNDO_MAX_BYTES=4 LD_PRELOAD="$LIB" \
+    bash -c "echo replaced > $PLAY/cap/big.bin"
+sleep 0.01
+grep -q "^lost" "$sess/journal" ||
+    fail "expected a lost record, journal: $(cat "$sess/journal")"
+
+out=$("$UNDO" list)
+grep -q "unprotected" <<<"$out" || fail "undo list did not flag the session: $out"
+
+out=$("$UNDO" -n 2>&1)
+grep -q "cannot be restored" <<<"$out" || fail "the preview did not warn: $out"
+
 echo
 echo "all cases passed"

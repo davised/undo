@@ -119,8 +119,13 @@ func cmdRun(argv []string) {
 
 	// reload to see what the shim recorded
 	if fresh, err := session.Get(s.ID); err == nil && len(fresh.Entries) > 0 {
-		fmt.Fprintf(os.Stderr, "undo: captured %d change(s), run 'undo' to revert\n",
-			len(fresh.Entries))
+		// Keeps "captured N change(s)" as a prefix: e2e case 8 greps for it,
+		// and the count is what the user reads first either way.
+		msg := fmt.Sprintf("undo: captured %d change(s)", len(fresh.Entries))
+		if n := fresh.Unprotected(); n > 0 {
+			msg += fmt.Sprintf(", %d NOT protected", n)
+		}
+		fmt.Fprintln(os.Stderr, msg+", run 'undo' to revert")
 	} else {
 		s.Remove()
 	}

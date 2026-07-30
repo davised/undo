@@ -133,8 +133,12 @@ func cmdList() {
 		if len(cmd) > 60 {
 			cmd = cmd[:57] + "..."
 		}
-		fmt.Printf("%s %s  %s  %3d changes  %s\n",
-			mark, shortID(s.ID), when(s.ID), len(s.Entries), cmd)
+		note := ""
+		if n := s.Unprotected(); n > 0 {
+			note = fmt.Sprintf("  (%d unprotected)", n)
+		}
+		fmt.Printf("%s %s  %s  %3d changes  %s%s\n",
+			mark, shortID(s.ID), when(s.ID), len(s.Entries), cmd, note)
 	}
 	if shown == 0 {
 		fmt.Println("no sessions recorded (is the shell hook sourced?)")
@@ -187,6 +191,13 @@ func previewSession(s *session.Session, full bool) {
 	}
 	if n := len(s.Entries) - len(show); n > 0 {
 		fmt.Printf("  ... and %d more (undo show %s)\n", n, shortID(s.ID))
+	}
+	// Last, so it sits directly above the "revert this?" prompt in cmdApply:
+	// the point is that the user reads it while deciding, not afterwards.
+	if n := s.Unprotected(); n > 0 {
+		fmt.Printf("\n  warning: %d change(s) cannot be restored - "+
+			"the backup was too large to save, or was discarded when its "+
+			"store was removed\n", n)
 	}
 }
 
