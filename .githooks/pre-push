@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Refuse to push if any tracked file carries site-identifying data.
+#
+# Scans the whole tracked tree rather than a diff range: the repo is small,
+# grep is fast, and there is no base-ref edge case to get wrong. A diff-based
+# hook silently skips anything committed before the range it picked.
+#
+# Deliberately avoids mapfile and other bash 4 features -- macOS still ships
+# bash 3.2 as /bin/bash, and a hook that dies on syntax protects nothing.
+set -uo pipefail
+
+root=$(git rev-parse --show-toplevel) || exit 0
+cd "$root" || exit 0
+
+[ -x tools/check-no-site-data.sh ] || exit 0
+
+# Verify the scanner itself is sound before trusting its verdict: a pattern
+# that fails to compile makes it pass everything.
+if ! tools/check-ere.sh >/dev/null 2>&1; then
+    echo "pre-push: scanner patterns are invalid POSIX ERE; refusing to push" >&2
+    echo "          run tools/check-ere.sh to see which" >&2
+    exit 1
+fi
+
+git ls-files -z | xargs -0 tools/check-no-site-data.sh

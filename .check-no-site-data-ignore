@@ -1,0 +1,20 @@
+# Files exempt from tools/check-no-site-data.sh.
+#
+# Keep this list short and justify every entry. Exempting a file is in the
+# same category as pushing with --no-verify: it is sometimes correct, and it
+# is always worth a second pair of eyes. Everything listed here is read by
+# nobody's scanner, so a real leak added to one of these files ships.
+#
+# One glob per line, matched against the repo-relative path.
+
+# Implementation plans quote the scanner's own test fixtures verbatim -- the
+# sample hostnames, documentation-reserved addresses, and placeholder mount
+# and home paths it is built to detect -- so they necessarily trip the scanner
+# they describe. Every such value is invented or reserved for documentation.
+# Exempting these is preferable to weakening the patterns, which would blind
+# the scanner to the real thing.
+#
+# Note this file is deliberately NOT self-exempt: the exemption list is
+# security-relevant, so it has to survive its own scan. Describe fixtures here
+# rather than reproducing them.
+docs/superpowers/plans/*.md

@@ -1,0 +1,24 @@
+name: no-site-data
+
+# The pre-push hook is local and bypassable with --no-verify, so the same
+# check runs here where it cannot be skipped.
+
+on:
+  push:
+    branches: [main, 'hpc/**']
+  pull_request:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: scanner patterns are valid POSIX ERE
+        run: tools/check-ere.sh
+
+      - name: scanner self-test
+        run: tools/check-no-site-data.test.sh
+
+      - name: scan every tracked file
+        run: git ls-files -z | xargs -0 tools/check-no-site-data.sh
