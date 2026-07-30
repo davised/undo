@@ -940,6 +940,11 @@ static void handle_rename_pre(int olddirfd, const char *oldp, int newdirfd,
     if (lstat(absnew, &st) == 0 && S_ISREG(st.st_mode)) {
         if (save_file(absnew, 0, bak, method) == 0)
             *kind = 2;
+        else
+            /* A target existed and could not be saved. Without this the record
+             * is identical to a rename that overwrote nothing, and the
+             * clobbered file is unrecoverable with nothing saying so. */
+            *method = "lost";
     }
 }
 
@@ -949,7 +954,7 @@ static void handle_rename_post(int rc, const char *absold,
 {
     if (rc == 0) {
         if (kind == 1)
-            jwrite("rename", absold, absnew, "-", "none", NULL);
+            jwrite("rename", absold, absnew, "-", method, NULL);
         else if (kind == 2)
             jwrite("rename", absold, absnew, bak, method, NULL);
         else if (kind == 3)
