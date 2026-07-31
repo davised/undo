@@ -16,6 +16,7 @@
 package session
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -450,7 +451,30 @@ func dirSize(dir string) int64 {
 // a command deleting 100k files produces 100k hardlink records and zero round
 // trips here, while copies are capped at UNDO_MAX_BYTES each and far rarer.
 func (s *Session) allocatedBytes() int64 {
-	total := dirSize(s.Dir)
+	return dirSize(s.Dir) + chargeTotal(s.distributedCharges())
+}
+
+// backupCharge is one backup held outside the session directory, and what it
+// costs. The size is captured up front because it cannot be recovered later: a
+// backup on a volume that has gone away still occupies space, and stat will
+// not say how much.
+type backupCharge struct {
+	path string
+	size int64
+}
+
+func chargeTotal(cs []backupCharge) int64 {
+	var total int64
+	for _, c := range cs {
+		total += c.size
+	}
+	return total
+}
+
+// distributedCharges lists this session's backups outside its own directory.
+// Hardlinks are excluded for the reason above.
+func (s *Session) distributedCharges() []backupCharge {
+	var out []backupCharge
 	prefix := s.Dir + string(os.PathSeparator)
 	for _, e := range s.Entries {
 		if m := e.Method(); m == "link" || m == "none" {
@@ -461,10 +485,10 @@ func (s *Session) allocatedBytes() int64 {
 			continue // no backup, discarded, or already counted by dirSize
 		}
 		if fi, err := os.Lstat(b); err == nil && fi.Mode().IsRegular() {
-			total += fi.Size()
+			out = append(out, backupCharge{b, fi.Size()})
 		}
 	}
-	return total
+	return out
 }
 
 // GC removes empty sessions and prunes the oldest until at most keep
@@ -492,7 +516,10 @@ func GC(keep int, maxBytes int64, maxAge time.Duration) (int, error) {
 		return 0, err
 	}
 
-	removed, kept := 0, 0
+	// seen counts sessions considered, not sessions retained, and is
+	// deliberately not decremented on removal: keep means "the newest N", so
+	// everything past position N goes regardless of what was freed ahead of it.
+	removed, seen := 0, 0
 	var total int64
 	now := time.Now()
 	for _, s := range all { // newest first
@@ -518,20 +545,36 @@ func GC(keep int, maxBytes int64, maxAge time.Duration) (int, error) {
 			}
 			continue
 		}
-		kept++
-		total += s.allocatedBytes()
+		seen++
+		dirBytes := dirSize(s.Dir)
+		charges := s.distributedCharges()
+		total += dirBytes + chargeTotal(charges)
 
 		// The newest session is the one `undo` with no arguments targets,
 		// so it always survives. Dropping it because a single big delete
 		// blew the size budget would silently remove exactly the undo the
 		// user is about to reach for.
-		if kept == 1 {
+		if seen == 1 {
 			continue
 		}
 		tooOld := maxAge > 0 && now.Sub(s.Started()) > maxAge
-		if kept > keep || total > maxBytes || tooOld {
+		if seen > keep || total > maxBytes || tooOld {
 			if s.Remove() == nil {
 				removed++
+				// Give back only what is verifiably gone. RemoveAll took the
+				// session directory. For the backups outside it, only ENOENT
+				// proves deletion: removeDistributedBackups is best effort,
+				// and a volume that has gone away answers something else
+				// entirely. Crediting those bytes back would let the store sit
+				// over budget while gc believed it had made room -- so a
+				// backup we cannot prove is gone keeps being charged.
+				freed := dirBytes
+				for _, c := range charges {
+					if _, err := os.Lstat(c.path); errors.Is(err, fs.ErrNotExist) {
+						freed += c.size
+					}
+				}
+				total -= freed
 			}
 		}
 	}

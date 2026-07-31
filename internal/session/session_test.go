@@ -1062,6 +1062,108 @@ func TestGCKeepsASessionRunningOnAnotherNode(t *testing.T) {
 	}
 }
 
+// GC walks newest first and keeps a running total. When it prunes a session
+// that total must come down, or every older session is evicted for space that
+// is no longer occupied -- including sessions that allocate nothing at all.
+func TestGCDoesNotEvictForSpaceItAlreadyFreed(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	vol := t.TempDir()
+
+	// Backups must sit at <root>/.undo/<session-id>/<name> or Remove will not
+	// touch them (see inStore), and the test would pass for the wrong reason.
+
+	// oldest: costs nothing, its backup is a hardlink
+	cheap := mustSession(t, "rm cheap")
+	cheapBak := filepath.Join(vol, ".undo", cheap.ID, "1-1")
+	writeBackup(t, cheapBak, 8)
+	writeJournal(t, cheap, "unlink\t/a\t"+cheapBak+"\tlink\n")
+
+	// newer: one big copy, alone over the budget
+	big := mustSession(t, "sort -o big big")
+	bigBak := filepath.Join(vol, ".undo", big.ID, "1-1")
+	writeBackup(t, bigBak, 8192)
+	writeJournal(t, big, "mod\t/b\t"+bigBak+"\tcopy\n")
+
+	// newest: exempt from eviction, so it is not what evicts the others
+	newest := mustSession(t, "rm newest")
+	writeJournal(t, newest, "unlink\t/c\t-\tnone\n")
+
+	if _, err := GC(30, 3000, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(bigBak); err == nil {
+		t.Error("the over-budget session should have been pruned")
+	}
+	if _, err := os.Stat(cheap.Dir); err != nil {
+		t.Error("a session that allocates nothing was evicted for space gc had already freed")
+	}
+}
+
+// A backup Remove could not delete still occupies space. Crediting it back
+// would let the store sit over budget while gc believed it had made room.
+//
+// The undeletable backup is arranged with a symlinked store directory, which
+// removeDistributedBackups refuses to delete through (safeStore). That works
+// regardless of the uid running the test, unlike a read-only parent, which
+// root ignores.
+func TestGCDoesNotCreditBackupsItFailedToDelete(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	vol := t.TempDir()
+	elsewhere := t.TempDir()
+
+	cheap := mustSession(t, "rm cheap")
+	writeJournal(t, cheap, "unlink\t/a\t-\tnone\n")
+
+	big := mustSession(t, "sort -o big big")
+	realStore := filepath.Join(elsewhere, "store")
+	if err := os.MkdirAll(realStore, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	survivor := filepath.Join(realStore, "1-1")
+	writeBackup(t, survivor, 8192)
+	if err := os.MkdirAll(filepath.Join(vol, ".undo"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realStore, filepath.Join(vol, ".undo", big.ID)); err != nil {
+		t.Fatal(err)
+	}
+	writeJournal(t, big, "mod\t/b\t"+filepath.Join(vol, ".undo", big.ID, "1-1")+"\tcopy\n")
+
+	newest := mustSession(t, "rm newest")
+	writeJournal(t, newest, "unlink\t/c\t-\tnone\n")
+
+	if _, err := GC(30, 3000, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(survivor); err != nil {
+		t.Fatalf("setup: the backup was meant to survive Remove: %v", err)
+	}
+	if _, err := os.Stat(cheap.Dir); err == nil {
+		t.Error("gc credited back bytes it never freed and stopped pruning; " +
+			"the store is now over budget and believes it is not")
+	}
+}
+
+// The count limit and the byte limit are separate rules; this one covers the
+// count so a change to either is not masked by the other.
+func TestGCKeepsNoMoreThanKeepSessions(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	for i := 0; i < 5; i++ {
+		s := mustSession(t, fmt.Sprintf("rm f%d", i))
+		writeJournal(t, s, "unlink\t/f\t-\tnone\n")
+	}
+	if _, err := GC(2, 1<<30, 0); err != nil {
+		t.Fatal(err)
+	}
+	all, err := List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) > 2 {
+		t.Errorf("gc left %d sessions, keep was 2", len(all))
+	}
+}
+
 // mustSession creates a done session. Create's own collision loop guarantees
 // ids are distinct and ordered, so no sleep is needed between calls.
 func mustSession(t *testing.T, cmd string) *Session {
