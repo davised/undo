@@ -442,5 +442,27 @@ env UNDO_SESSION="$cdir" LD_PRELOAD="$LIB" \
 [[ ! -e $UNDO_DATA_DIR/journal ]] ||
     fail "a .. component created a journal outside the sessions directory"
 
+echo "== case 32: gc keeps a big hardlinked backup and prunes a big copied one"
+mkdir -p "$PLAY/acct"
+dd if=/dev/zero of="$PLAY/acct/deleted.bin" bs=1M count=4 status=none
+dd if=/dev/zero of="$PLAY/acct/rewritten.bin" bs=1M count=4 status=none
+# The copied session goes first, so it is the OLDER of the two. gc walks
+# newest-first and keeps a running total that is not reduced when a session is
+# pruned, so a big copy evicts everything older than it -- including sessions
+# that cost nothing. Ordering the hardlink after the copy is what makes this
+# case test the accounting rather than that eviction rule.
+run_armed "echo small > $PLAY/acct/rewritten.bin"
+mod_sess=$(ls "$UNDO_DATA_DIR/sessions" | sort | tail -1)
+run_armed "rm $PLAY/acct/deleted.bin"
+del_sess=$(ls "$UNDO_DATA_DIR/sessions" | sort | tail -1)
+run_armed "touch $PLAY/acct/newest.txt"   # so neither of the above is newest
+
+# a budget far below either backup's logical size: only the copy should count
+UNDO_MAX_STORE=1048576 "$UNDO" gc >/dev/null
+[[ -d $UNDO_DATA_DIR/sessions/$del_sess ]] ||
+    fail "gc pruned a hardlinked backup, which allocates nothing"
+[[ ! -d $UNDO_DATA_DIR/sessions/$mod_sess ]] ||
+    fail "gc kept a copied backup that blew the byte budget"
+
 echo
 echo "all cases passed"
