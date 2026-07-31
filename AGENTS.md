@@ -124,3 +124,10 @@ Portable lessons:
   `message=stream providerID=... modelID=...` in the log with nothing after it
   means the provider never answered — retry on a different agent/model rather
   than rewriting the prompt.
+- **Always end a `codex exec` dispatch with `< /dev/null`.** It treats non-TTY
+  stdin as additional prompt input and blocks until EOF, so a backgrounded run
+  hangs on an open pipe and is eventually killed having produced nothing. The
+  only clue is its first line, `Reading additional input from stdin...`, which a
+  trailing pipeline would also swallow. When any dispatch dies with no output,
+  read the output file before re-running it — twice in a row is a diagnosis, not
+  flakiness.
