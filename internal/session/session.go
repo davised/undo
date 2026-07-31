@@ -108,6 +108,15 @@ func (s *Session) withinGrace() bool {
 // data loss.
 const minForeignGrace = 15 * time.Minute
 
+// maxGraceSeconds is the largest grace that fits in a time.Duration, which
+// counts nanoseconds in an int64 -- about 292 years.
+//
+// Anything past it must saturate rather than wrap. A wrapped value is
+// negative, so it falls under the floor and silently becomes 15 minutes: the
+// exact opposite of what someone setting an enormous number is asking for,
+// and it would collect running commands after a quarter of an hour.
+const maxGraceSeconds = int64(1<<63-1) / int64(time.Second)
+
 // foreignGrace is how long a session from another node is presumed to be
 // running when it has no done marker.
 //
@@ -116,7 +125,11 @@ const minForeignGrace = 15 * time.Minute
 // cheap. The bound is real: a command running longer than this becomes
 // collectible while still running. Raise it where jobs outlive it.
 func foreignGrace() time.Duration {
-	g := time.Duration(envSeconds("UNDO_FOREIGN_GRACE", 7*24*60*60)) * time.Second
+	secs := envSeconds("UNDO_FOREIGN_GRACE", 7*24*60*60)
+	if secs >= maxGraceSeconds {
+		return time.Duration(1<<63 - 1)
+	}
+	g := time.Duration(secs) * time.Second
 	if g < minForeignGrace {
 		return minForeignGrace
 	}

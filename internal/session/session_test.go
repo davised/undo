@@ -962,6 +962,21 @@ func TestForeignGraceHasAFloor(t *testing.T) {
 	}
 }
 
+// A grace too large for a time.Duration must saturate rather than wrap. The
+// wrapped value is negative, falls under the floor, and silently becomes 15
+// minutes -- the exact opposite of what setting an enormous number asks for,
+// and it would collect running commands after a quarter of an hour.
+func TestForeignGraceSaturatesInsteadOfWrapping(t *testing.T) {
+	t.Setenv("UNDO_FOREIGN_GRACE", "10000000000") // ~317 years, overflows
+	got := foreignGrace()
+	if got <= 0 {
+		t.Fatalf("grace = %v, which wrapped negative", got)
+	}
+	if got < 100*365*24*time.Hour {
+		t.Errorf("grace = %v; an enormous setting collapsed instead of saturating", got)
+	}
+}
+
 // A foreign session that finished normally left a done marker, and that is
 // conclusive from any node -- no grace needed.
 func TestLiveHonoursDoneOnAForeignSession(t *testing.T) {
