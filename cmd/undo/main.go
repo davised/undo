@@ -61,6 +61,11 @@ func cmdGC(auto bool) {
 		fatal(err)
 	}
 	fmt.Printf("removed %d session(s)\n", removed)
+
+	swept, serr := session.SweepOrphans()
+	if serr == nil && swept > 0 {
+		fmt.Printf("reclaimed %d orphaned backup store(s)\n", swept)
+	}
 }
 
 func cmdPurge(yes, force bool) {

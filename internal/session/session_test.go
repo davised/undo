@@ -481,3 +481,185 @@ func TestGCKeepsBigHardlinkAndPrunesBigCopy(t *testing.T) {
 		t.Error("a large hardlinked backup should not be charged against the byte budget")
 	}
 }
+
+func TestSweepRemovesOrphanedStores(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	vol := t.TempDir()
+
+	live, _ := Create("rm keep.txt")
+	live.MarkDone()
+	lb := filepath.Join(vol, ".undo", live.ID, "1-1")
+	writeBackup(t, lb, 16)
+	writeJournal(t, live, "unlink\t"+filepath.Join(vol, "keep.txt")+"\t"+lb+"\tlink\n")
+
+	// a store whose session directory no longer exists: exactly what a lost
+	// journal leaves behind
+	orphan := filepath.Join(vol, ".undo", "1700000000000001")
+	writeBackup(t, filepath.Join(orphan, "1-1"), 16)
+
+	// teach the registry about this root by running a gc first
+	if _, err := GC(30, 1<<30, 0); err != nil {
+		t.Fatal(err)
+	}
+	n, err := SweepOrphans()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("swept %d stores, want 1", n)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Error("the orphaned store survived the sweep")
+	}
+	if _, err := os.Stat(lb); err != nil {
+		t.Error("the sweep removed a store belonging to a live session")
+	}
+}
+
+func TestSweepIgnoresNonSessionDirectories(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	vol := t.TempDir()
+
+	s, _ := Create("rm x")
+	s.MarkDone()
+	b := filepath.Join(vol, ".undo", s.ID, "1-1")
+	writeBackup(t, b, 16)
+	writeJournal(t, s, "unlink\t"+filepath.Join(vol, "x")+"\t"+b+"\tlink\n")
+
+	// something else living under .undo that is not ours to delete
+	notOurs := filepath.Join(vol, ".undo", "notes")
+	writeBackup(t, filepath.Join(notOurs, "readme"), 4)
+
+	if _, err := GC(30, 1<<30, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SweepOrphans(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(notOurs, "readme")); err != nil {
+		t.Error("the sweep deleted a directory whose name is not a session id")
+	}
+}
+
+func TestRootsRegistrySurvivesSessionPruning(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	vol := t.TempDir()
+
+	s, _ := Create("rm y")
+	s.MarkDone()
+	b := filepath.Join(vol, ".undo", s.ID, "1-1")
+	writeBackup(t, b, 16)
+	writeJournal(t, s, "unlink\t"+filepath.Join(vol, "y")+"\t"+b+"\tlink\n")
+
+	if _, err := GC(30, 1<<30, 0); err != nil {
+		t.Fatal(err)
+	}
+	// drop every session; the root must still be known
+	if err := os.RemoveAll(Root()); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range Roots() {
+		if r == vol {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("root %q was forgotten once its sessions were gone; Roots() = %v", vol, Roots())
+	}
+}
+
+func TestSweepKeepsUnreachableRoots(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	gone := filepath.Join(t.TempDir(), "unmounted")
+	if err := rememberRoots([]string{gone}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SweepOrphans(); err != nil {
+		t.Fatal(err)
+	}
+	// An unmounted volume must not be mistaken for a reclaimed one: forgetting
+	// it strands whatever it holds forever.
+	found := false
+	for _, r := range Roots() {
+		if r == gone {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("an unreachable root was dropped from the registry")
+	}
+}
+
+// SweepOrphans deletes directories it finds on disk rather than paths a
+// journal named, so its fences are the whole safety argument. This lays out
+// everything that must survive it beside the one thing that must not.
+func TestSweepOrphansRefusesEverythingItShould(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	vol := t.TempDir()
+	undo := filepath.Join(vol, ".undo")
+
+	// a live session, so the root gets registered and stays registered
+	live, err := Create("rm keep.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	live.MarkDone()
+	lb := filepath.Join(undo, live.ID, "1-1")
+	writeBackup(t, lb, 16)
+	writeJournal(t, live, "unlink\t"+filepath.Join(vol, "keep.txt")+"\t"+lb+"\tlink\n")
+
+	// (1) the genuine orphan: right shape, ours, no session behind it
+	orphan := filepath.Join(undo, "1700000000000001")
+	writeBackup(t, filepath.Join(orphan, "1-1"), 16)
+
+	// (2) a name that is not a session id
+	notes := filepath.Join(undo, "notes")
+	writeBackup(t, filepath.Join(notes, "readme"), 4)
+
+	// (3) numeric but the wrong width -- the shape Create never emits
+	shortNum := filepath.Join(undo, "12345")
+	writeBackup(t, filepath.Join(shortNum, "x"), 4)
+
+	// (4) a symlink wearing a session-id name, pointing at data we must not touch
+	outside := t.TempDir()
+	precious := filepath.Join(outside, "precious.txt")
+	if err := os.WriteFile(precious, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(undo, "1700000000000002")); err != nil {
+		t.Fatal(err)
+	}
+
+	// (5) a plain file with a session-id name
+	stray := filepath.Join(undo, "1700000000000003")
+	if err := os.WriteFile(stray, []byte("not a store"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := GC(30, 1<<30, 0); err != nil {
+		t.Fatal(err)
+	}
+	n, err := SweepOrphans()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if n != 1 {
+		t.Errorf("swept %d, want exactly 1 (the genuine orphan)", n)
+	}
+	if _, err := os.Lstat(orphan); !os.IsNotExist(err) {
+		t.Error("the genuine orphan was not reclaimed")
+	}
+	for _, keep := range []struct{ what, path string }{
+		{"a live session's store", lb},
+		{"a non-session name", filepath.Join(notes, "readme")},
+		{"a numeric name of the wrong width", filepath.Join(shortNum, "x")},
+		{"data behind a symlinked store", precious},
+		{"a plain file named like a session", stray},
+	} {
+		if _, err := os.Lstat(keep.path); err != nil {
+			t.Errorf("sweep removed %s (%s)", keep.what, keep.path)
+		}
+	}
+}

@@ -233,6 +233,42 @@ func TightenPerms() {
 	os.Chmod(Root(), 0o700)
 }
 
+// storeDirName is the per-filesystem store directory the shim creates.
+const storeDirName = ".undo"
+
+// rootsFile is the registry of store roots, kept beside the sessions
+// directory so it outlives any individual session.
+func rootsFile() string {
+	return filepath.Join(filepath.Dir(Root()), "roots")
+}
+
+// sessionIDLen is the width Create produces: fmt.Sprintf("%d%06d", unix,
+// nanos/1000) -- ten digits of unix seconds through the year 2286, then six of
+// microseconds.
+const sessionIDLen = 16
+
+// sessionID reports whether name has exactly the shape Create produces.
+//
+// The sweep calls os.RemoveAll on whatever this approves, so it is a deletion
+// fence, not a formatting detail. Anything looser -- "all digits", "not a
+// dotfile" -- turns a shared .undo directory into a hazard, because a numeric
+// directory belonging to something else would qualify.
+//
+// Being too strict fails closed: an orphan survives and is reclaimed by hand.
+// Being too loose deletes someone else's data. If Create's format ever
+// changes, update this and accept that older orphans stop being swept.
+func sessionID(name string) bool {
+	if len(name) != sessionIDLen {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if name[i] < '0' || name[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func dirSize(dir string) int64 {
 	var total int64
 	filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
@@ -289,6 +325,15 @@ func GC(keep int, maxBytes int64, maxAge time.Duration) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+
+	// Learn the roots before anything is pruned: a session removed below takes
+	// its journal, and with it the only record of where its backups lived.
+	var roots []string
+	for _, s := range all {
+		roots = append(roots, storeRoots(s.Entries)...)
+	}
+	rememberRoots(roots)
+
 	removed, kept := 0, 0
 	var total int64
 	now := time.Now()
@@ -351,6 +396,151 @@ func (s *Session) backupPaths() []string {
 		out = append(out, p)
 	}
 	return out
+}
+
+// storeRoots extracts the filesystem-local store roots a journal implies.
+// Backups are written to <root>/.undo/<session-id>/<name>, so the root is
+// whatever precedes the .undo component.
+func storeRoots(entries []journal.Entry) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, e := range entries {
+		p := e.Backup()
+		if p == "" || p == "-" || !filepath.IsAbs(p) {
+			continue
+		}
+		// <root>/.undo/<id>/<name> -> <root>
+		idDir := filepath.Dir(p)
+		undoDir := filepath.Dir(idDir)
+		if filepath.Base(undoDir) != storeDirName {
+			continue
+		}
+		root := filepath.Dir(undoDir)
+		if root == "" || root == "/" || seen[root] {
+			continue
+		}
+		seen[root] = true
+		out = append(out, root)
+	}
+	return out
+}
+
+// Roots returns the store roots this installation knows about.
+func Roots() []string {
+	b, err := os.ReadFile(rootsFile())
+	if err != nil {
+		return nil
+	}
+	var out []string
+	seen := make(map[string]bool)
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || !filepath.IsAbs(line) || seen[line] {
+			continue
+		}
+		seen[line] = true
+		out = append(out, line)
+	}
+	return out
+}
+
+// rememberRoots adds roots to the registry, keeping what is already there.
+//
+// The registry exists because a root has to stay sweepable after the last
+// session that used it is pruned -- which is exactly when its orphans become
+// unreachable by any other means.
+func rememberRoots(roots []string) error {
+	if len(roots) == 0 {
+		return nil
+	}
+	all := Roots()
+	seen := make(map[string]bool, len(all))
+	for _, r := range all {
+		seen[r] = true
+	}
+	changed := false
+	for _, r := range roots {
+		if !filepath.IsAbs(r) || seen[r] {
+			continue
+		}
+		seen[r] = true
+		all = append(all, r)
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	sort.Strings(all)
+	if err := os.MkdirAll(filepath.Dir(rootsFile()), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(rootsFile(), []byte(strings.Join(all, "\n")+"\n"), 0o600)
+}
+
+// SweepOrphans removes store directories whose session no longer exists, and
+// forgets roots that are reachable and hold nothing.
+//
+// Deletion here is driven by directory names on disk rather than by a journal,
+// so it is fenced three ways: the directory must sit directly under a .undo
+// directory beneath a registered root, its name must have the shape of a
+// session id, and no session by that name may exist.
+//
+// A root that cannot be read is kept, not forgotten. An unmounted volume is
+// indistinguishable from an empty one from here, and dropping it would strand
+// whatever it holds permanently. On node-local filesystems this reclaims only
+// on the node that created the store, since no other node can see the path.
+func SweepOrphans() (int, error) {
+	roots := Roots()
+	if len(roots) == 0 {
+		return 0, nil
+	}
+	removed := 0
+	var keep []string
+	for _, root := range roots {
+		undoDir := filepath.Join(root, storeDirName)
+		ents, err := os.ReadDir(undoDir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// Reachable and empty: only then is it safe to forget.
+				if _, serr := os.Stat(root); serr == nil {
+					continue
+				}
+			}
+			keep = append(keep, root) // unreadable, unmounted, or in use
+			continue
+		}
+		live := 0
+		for _, e := range ents {
+			cand := filepath.Join(undoDir, e.Name())
+			if !sessionID(e.Name()) || !realDir(cand) || !ownedByCaller(cand) {
+				live++ // not ours; its presence keeps the root registered
+				continue
+			}
+			if _, err := os.Stat(filepath.Join(Root(), e.Name())); err == nil {
+				live++
+				continue
+			}
+			if os.RemoveAll(cand) == nil {
+				removed++
+			}
+		}
+		if live > 0 {
+			keep = append(keep, root)
+			continue
+		}
+		os.Remove(undoDir) // only succeeds when empty
+	}
+	if len(keep) != len(roots) {
+		sort.Strings(keep)
+		body := ""
+		if len(keep) > 0 {
+			body = strings.Join(keep, "\n") + "\n"
+		}
+		if err := os.WriteFile(rootsFile(), []byte(body), 0o600); err != nil {
+			return removed, err
+		}
+	}
+	return removed, nil
 }
 
 // Unprotected counts the entries this session cannot restore.
