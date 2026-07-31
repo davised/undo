@@ -16,7 +16,6 @@
 package session
 
 import (
-	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -559,18 +558,19 @@ func GC(keep int, maxBytes int64, maxAge time.Duration) (int, error) {
 		}
 		tooOld := maxAge > 0 && now.Sub(s.Started()) > maxAge
 		if seen > keep || total > maxBytes || tooOld {
-			if s.Remove() == nil {
+			if gone, err := s.removeReporting(); err == nil {
 				removed++
-				// Give back only what is verifiably gone. RemoveAll took the
-				// session directory. For the backups outside it, only ENOENT
-				// proves deletion: removeDistributedBackups is best effort,
-				// and a volume that has gone away answers something else
-				// entirely. Crediting those bytes back would let the store sit
-				// over budget while gc believed it had made room -- so a
-				// backup we cannot prove is gone keeps being charged.
+				// Give back only what was actually unlinked. RemoveAll took
+				// the session directory, so those bytes count. For backups
+				// outside it, removeDistributedBackups is best effort, and a
+				// path that has stopped resolving is not proof: a filesystem
+				// unmounted mid-sweep answers the same way while still holding
+				// the bytes. Crediting those would leave the store over budget
+				// believing it had made room, so only a successful unlink
+				// counts and anything else keeps being charged.
 				freed := dirBytes
 				for _, c := range charges {
-					if _, err := os.Lstat(c.path); errors.Is(err, fs.ErrNotExist) {
+					if gone[c.path] {
 						freed += c.size
 					}
 				}
@@ -852,8 +852,12 @@ func safeStore(storeDir string) bool {
 		realDir(filepath.Dir(storeDir))
 }
 
-func (s *Session) removeDistributedBackups() {
+// It reports the paths it actually unlinked. Only a successful unlink proves
+// the space came back: a path that has merely stopped resolving may be on a
+// filesystem that went away mid-sweep, still holding the bytes.
+func (s *Session) removeDistributedBackups() map[string]bool {
 	prefix := s.Dir + string(os.PathSeparator)
+	gone := make(map[string]bool)
 	stores := make(map[string]bool)
 	for _, p := range s.backupPaths() {
 		if strings.HasPrefix(p, prefix) {
@@ -865,7 +869,9 @@ func (s *Session) removeDistributedBackups() {
 		if !safeStore(filepath.Dir(p)) {
 			continue // right shape, wrong thing on disk
 		}
-		os.Remove(p)
+		if os.Remove(p) == nil {
+			gone[p] = true
+		}
 		stores[filepath.Dir(p)] = true
 	}
 	for d := range stores {
@@ -874,13 +880,21 @@ func (s *Session) removeDistributedBackups() {
 		os.Remove(d)
 		os.Remove(filepath.Dir(d))
 	}
+	return gone
 }
 
 // Remove deletes a session and its backups entirely, including the ones held
 // on other filesystems. The journal names those, so it has to go last.
 func (s *Session) Remove() error {
-	s.removeDistributedBackups()
-	return os.RemoveAll(s.Dir)
+	_, err := s.removeReporting()
+	return err
+}
+
+// removeReporting is Remove, also reporting which distributed backups it
+// unlinked so a caller tracking space can credit only those.
+func (s *Session) removeReporting() (map[string]bool, error) {
+	gone := s.removeDistributedBackups()
+	return gone, os.RemoveAll(s.Dir)
 }
 
 // MarkUndone records that a session was reverted, and when.
