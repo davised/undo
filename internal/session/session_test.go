@@ -1032,6 +1032,50 @@ func TestLiveProbesThePidOnItsOwnHost(t *testing.T) {
 	}
 }
 
+// The reproduced defect, at the level it actually bit: ordinary retention, no
+// budget pressure, and a command running on another node loses its session and
+// its backups mid-flight.
+func TestGCKeepsASessionRunningOnAnotherNode(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	vol := t.TempDir()
+
+	running := foreignSession(t, time.Hour)
+	bak := filepath.Join(vol, ".undo", running.ID, "1360-1")
+	writeBackup(t, bak, 64)
+	writeJournal(t, running,
+		"unlink\t"+filepath.Join(vol, "gone.txt")+"\t"+bak+"\tlink\n")
+
+	// the user's login shell meanwhile: more finished commands than keep
+	for i := 0; i < 5; i++ {
+		s := mustSession(t, fmt.Sprintf("rm filler-%d", i))
+		writeJournal(t, s, "unlink\t/x\t-\tnone\n")
+	}
+
+	if _, err := GC(2, 1<<30, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(running.Dir); err != nil {
+		t.Error("gc deleted the session of a command still running on another node")
+	}
+	if _, err := os.Stat(bak); err != nil {
+		t.Error("gc deleted the backup of a command still running on another node")
+	}
+}
+
+// mustSession creates a done session. Create's own collision loop guarantees
+// ids are distinct and ordered, so no sleep is needed between calls.
+func mustSession(t *testing.T, cmd string) *Session {
+	t.Helper()
+	s, err := Create(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkDone(); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
 // A session that has been created but has not yet recorded anything, and has
 // not been marked done, may be moments from its first entry -- or may be one
 // whose creator is on another node and still writing it out. Deleting it takes

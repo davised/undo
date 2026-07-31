@@ -487,5 +487,41 @@ bin_origin=$(cat "$UNDO_DATA_DIR/sessions/$run_sess/host" 2>/dev/null || true)
 [[ $hook_origin == "$bin_origin" ]] ||
     fail "hook origin [$hook_origin] != binary origin [$bin_origin]"
 
+echo "== case 34: a command running on another node keeps its backups"
+make_tree
+run_armed "rm $PLAY/top.txt"
+last=$(ls "$UNDO_DATA_DIR/sessions" | sort | tail -1)
+sess=$UNDO_DATA_DIR/sessions/$last
+bak=$(awk -F'\t' '$1=="unlink"{print $3}' "$sess/journal" | head -1)
+[[ -e $bak ]] || fail "case 34 setup: no backup was taken"
+# what this session looks like from a different node of the cluster
+printf 'othernode\tnot-our-boot-id\tpid:[999]\n' >"$sess/host"
+echo 2147483647 >"$sess/pid"
+rm -f "$sess/done"
+for i in 1 2 3 4 5; do
+    echo "filler $i" >"$PLAY/filler-$i.txt"
+    run_armed "rm $PLAY/filler-$i.txt"
+done
+UNDO_KEEP=2 "$UNDO" gc >/dev/null
+[[ -d $sess ]] || fail "gc deleted a session still running on another node"
+[[ -e $bak ]] || fail "gc deleted the backup of a command still running elsewhere"
+
+echo "== case 35: a foreign session past its grace is collectible again"
+# Built with an explicitly old id rather than by aging a fresh session: the
+# grace has a 15-minute floor, so "wait for it to expire" is not a test.
+old=$(( $(date +%s) - 3600 ))000000
+oldsess=$UNDO_DATA_DIR/sessions/$old
+mkdir -p "$oldsess/data"
+echo "a command that died on another node" >"$oldsess/cmd"
+printf 'othernode\tnot-our-boot-id\tpid:[999]\n' >"$oldsess/host"
+echo 2147483647 >"$oldsess/pid"
+oldstore=$PLAY/.undo/$old
+mkdir -p "$oldstore"
+echo "backed up" >"$oldstore/1-1"
+printf 'unlink\t%s\t%s\tlink\n' "$PLAY/oldfile.txt" "$oldstore/1-1" >"$oldsess/journal"
+UNDO_KEEP=2 UNDO_FOREIGN_GRACE=1800 "$UNDO" gc >/dev/null
+[[ ! -d $oldsess ]] || fail "a foreign session past its grace must be collectible"
+[[ ! -e $oldstore/1-1 ]] || fail "its backup should have been reclaimed too"
+
 echo
 echo "all cases passed"
