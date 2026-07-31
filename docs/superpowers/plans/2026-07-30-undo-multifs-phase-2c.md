@@ -36,8 +36,20 @@ task inherits these.
 
 ## Depends on
 
-Plan 2b, specifically `journal.Method()` and the `<root>/.undo/<session-id>/`
-backup layout. Nothing here works before that lands.
+Plan 2b, specifically `journal.Entry.Method()`, `journal.Entry.Backup()` and the
+`<root>/.undo/<session-id>/` backup layout.
+
+**Landed since this plan was first written, and assumed by it:**
+
+- A third method token, `lost`, for a rename whose overwritten target could not
+  be saved. `allocatedBytes` needs no special case: its backup field is `-`, so
+  it is skipped like any other absent backup.
+- `Unprotected()` on `Session`, and `realDir` / `ownedByCaller` / `safeStore`
+  from plan 2a's symlink fix. The sweep reuses the last two rather than
+  redefining them.
+- Foreign-store `storemv <path> -` records, which mark another session's
+  backups gone. Those sessions' entries resolve to `-` and are already excluded
+  from the byte budget.
 
 ## File Structure
 
@@ -46,7 +58,7 @@ backup layout. Nothing here works before that lands.
 | `internal/session/session.go` | modify | `sessionSize` replacing `dirSize`; `storeRoots`; `Roots`/`saveRoots` registry; `SweepOrphans`; `GC` gains an age limit |
 | `internal/session/session_test.go` | modify (append) | accounting by method, age eviction, sweep, and the guards on it |
 | `cmd/undo/main.go` | modify | `UNDO_MAX_AGE`; `cmdGC` calls the sweep and reports what it reclaimed |
-| `test/e2e.sh` | modify (append case 28) | a large hardlinked backup survives gc while a large copied one does not |
+| `test/e2e.sh` | modify (append case 32) | a large hardlinked backup survives gc while a large copied one does not |
 | `test/multifs-gc.sh` | create | the sweep reclaiming a store on the other filesystem |
 
 ## Configuration
@@ -528,18 +540,6 @@ func sessionID(name string) bool {
 	return true
 }
 
-// ownedByCaller reports whether path belongs to the user running this process.
-// A second fence on the sweep: a store directory undo created is always ours,
-// so anything else under a .undo directory is not the sweep's to remove.
-func ownedByCaller(path string) bool {
-	fi, err := os.Lstat(path)
-	if err != nil || !fi.IsDir() {
-		return false
-	}
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	return ok && int(st.Uid) == os.Getuid()
-}
-
 // storeRoots extracts the filesystem-local store roots a journal implies.
 // Backups are written to <root>/.undo/<session-id>/<name>, so the root is
 // whatever precedes the .undo component.
@@ -654,7 +654,7 @@ func SweepOrphans() (int, error) {
 		live := 0
 		for _, e := range ents {
 			cand := filepath.Join(undoDir, e.Name())
-			if !e.IsDir() || !sessionID(e.Name()) || !ownedByCaller(cand) {
+			if !sessionID(e.Name()) || !realDir(cand) || !ownedByCaller(cand) {
 				live++ // not ours; its presence keeps the root registered
 				continue
 			}
@@ -699,8 +699,12 @@ them. Immediately after `all, err := List()` and its error check, add:
 	rememberRoots(roots)
 ```
 
-`sort` and `strings` are already imported; add `syscall` (already imported by
-`session.go` for `Live()`).
+`sort`, `strings` and `syscall` are already imported.
+
+**`ownedByCaller` and `realDir` already exist**, added by the symlink fix in
+plan 2a. Use them; do not define a second copy, which will not compile. Note
+that the existing `ownedByCaller` does not itself require a directory — pair it
+with `realDir` as the sweep does below.
 
 - [ ] **Step 4: Run the tests**
 
@@ -758,7 +762,7 @@ dropping it would strand its contents permanently.'
 ### Task 3: Prove the accounting end to end
 
 **Files:**
-- Modify: `test/e2e.sh` (append case 28)
+- Modify: `test/e2e.sh` (append case 32)
 - Create: `test/multifs-gc.sh`
 
 **Interfaces:**
@@ -767,10 +771,11 @@ dropping it would strand its contents permanently.'
 
 - [ ] **Step 1: Append the e2e case**
 
-Append to `test/e2e.sh`, after case 27 (plan 2b added 25, 26 and 27):
+Append to `test/e2e.sh`, after case 31. Cases 25-31 landed with plan 2b, the
+visible-loss work, and the foreign-store record.
 
 ```bash
-echo "== case 28: gc keeps a big hardlinked backup and prunes a big copied one"
+echo "== case 32: gc keeps a big hardlinked backup and prunes a big copied one"
 mkdir -p "$PLAY/acct"
 dd if=/dev/zero of="$PLAY/acct/deleted.bin" bs=1M count=4 status=none
 dd if=/dev/zero of="$PLAY/acct/rewritten.bin" bs=1M count=4 status=none
@@ -794,7 +799,7 @@ Run: `test/in-container.sh test/e2e.sh`
 
 Expected: all cases pass including 28.
 
-If case 28 fails because the `rm` produced a copy rather than a hardlink, the
+If case 32 fails because the `rm` produced a copy rather than a hardlink, the
 store did not land on `$PLAY`'s filesystem — check the journal's method field
 before changing the test. `awk -F'\t' '$1=="unlink"{print $4}'` on the session's
 journal says which happened.
@@ -894,7 +899,7 @@ live session'"'"'s store left alone.'
 
 ## Definition of done
 
-- [ ] `test/in-container.sh make test` passes, including new e2e case 28
+- [ ] `test/in-container.sh make test` passes, including new e2e case 32
 - [ ] `test/in-container.sh --privileged bash -c 'make && test/multifs.sh test/multifs-gc.sh'` prints `orphan sweep ok`
 - [ ] 2a and 2b harnesses still pass: `multifs-restore.sh` and `multifs-store.sh`
 - [ ] A hardlinked backup contributes 0 bytes to `allocatedBytes()`, a copied one contributes its size
