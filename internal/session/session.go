@@ -9,9 +9,10 @@
 //	           nanosecond time of the undo so redo can find the session that
 //	           was undone last rather than the one that ran last
 //	pid      - the pid of the shell or runner that started the command
-//	host     - the kernel instance that created the session: hostname, a tab,
-//	           and the boot id. Homes are shared across nodes, so a pid alone
-//	           does not say whether the command is still running; see Live.
+//	host     - the scope in which the pid above means something: hostname,
+//	           boot id and pid namespace, tab separated. Homes are shared
+//	           across nodes, so a pid alone does not say whether the command
+//	           is still running; see Live.
 package session
 
 import (
@@ -37,18 +38,99 @@ type Session struct {
 	UndoneAt time.Time // when the undo happened, zero if not undone
 	Done     bool      // the command finished (done marker present)
 	Pid      int       // shell or runner pid, 0 for pre-lock sessions
-	Origin   string    // host+boot id that created it, empty for older sessions
+	Origin   string    // where its pid is meaningful, empty for older sessions
 	Entries  []journal.Entry
 }
 
 // Live reports whether the session's command may still be running.
-// Sessions without a pid file (old format) are assumed finished.
+//
+// A pid is only meaningful within the kernel instance and namespace that
+// issued it, and homes are shared across nodes, so the local probe is trusted
+// only when the origin matches. A session from elsewhere cannot be probed at
+// all: it is treated as running until it outlives foreignGrace, because
+// deleting a running command's backups destroys data while keeping a finished
+// session merely wastes space.
+//
+// Sessions written before origins were recorded have none, and keep the old
+// pid-probe behaviour so a rollout does not strand what is already on disk.
 func (s *Session) Live() bool {
-	if s.Done || s.Pid <= 0 {
+	if s.Done {
+		return false
+	}
+	// The pid is not consulted for a session from elsewhere -- not even to
+	// notice it is missing. load turns an absent, truncated or unparsable pid
+	// file into zero, and on a store shared between nodes that is an ordinary
+	// sight rather than an error: a session whose creator is still writing it.
+	// Checking Pid <= 0 first would call those finished and collect them.
+	//
+	// An empty local identity means we could not establish which kernel
+	// instance we are, so nothing can be classified. Neither signal is sound
+	// alone there -- the grace alone would let a local running command be
+	// purged once it aged out, and the probe alone would collect a foreign one
+	// -- so a session is finished only when both agree it is.
+	local := thisHost()
+	if local == "" {
+		return s.probe() || s.withinGrace()
+	}
+	if s.Origin != "" && s.Origin != local {
+		return s.withinGrace()
+	}
+	return s.probe()
+}
+
+// probe asks the kernel whether this session's pid is still around. Only
+// meaningful for a session issued by this kernel instance.
+func (s *Session) probe() bool {
+	if s.Pid <= 0 {
 		return false
 	}
 	err := syscall.Kill(s.Pid, 0)
 	return err == nil || err == syscall.EPERM
+}
+
+// withinGrace reports whether a session from another kernel instance is young
+// enough to still be presumed running.
+func (s *Session) withinGrace() bool {
+	started := s.Started()
+	if started.IsZero() {
+		return true // unreadable id: nothing to age it out by, so do not
+	}
+	return time.Since(started) < foreignGrace()
+}
+
+// minForeignGrace floors the grace period.
+//
+// The age of a foreign session is its id -- the creating node's wall clock --
+// measured against ours. Skew between the two is therefore an error in the
+// age, and a grace shorter than the skew would collect a command that started
+// moments ago. Clusters keep clocks synchronised to well inside this floor;
+// the floor is what stops a mistuned grace from turning ordinary skew into
+// data loss.
+const minForeignGrace = 15 * time.Minute
+
+// foreignGrace is how long a session from another node is presumed to be
+// running when it has no done marker.
+//
+// Normal termination writes that marker, so this only has to cover abnormal
+// ends -- a killed job, a crashed node -- which makes a generous default
+// cheap. The bound is real: a command running longer than this becomes
+// collectible while still running. Raise it where jobs outlive it.
+func foreignGrace() time.Duration {
+	g := time.Duration(envSeconds("UNDO_FOREIGN_GRACE", 7*24*60*60)) * time.Second
+	if g < minForeignGrace {
+		return minForeignGrace
+	}
+	return g
+}
+
+// envSeconds reads a positive integer from the environment, or returns def.
+func envSeconds(name string, def int64) int64 {
+	if v := os.Getenv(name); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
 }
 
 var (
@@ -405,6 +487,19 @@ func GC(keep int, maxBytes int64, maxAge time.Duration) (int, error) {
 			continue
 		}
 		if len(s.Entries) == 0 {
+			// A done marker is conclusive: the command finished and recorded
+			// nothing. Without one, an empty session may simply be one whose
+			// creator has not written its first record yet, and on a store
+			// shared between nodes that setup is not always visible promptly.
+			//
+			// The bound is foreignGrace and not something shorter because the
+			// only clock available here is the creating node's, embedded in
+			// the id. A one-minute window judged by a clock a minute behind is
+			// no window at all. This is the same bound already accepted for
+			// "cannot tell whether it is running", applied to the same doubt.
+			if !s.Done && time.Since(s.Started()) < foreignGrace() {
+				continue
+			}
 			if s.Remove() == nil {
 				removed++
 			}

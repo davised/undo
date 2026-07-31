@@ -4,7 +4,6 @@
 zmodload zsh/datetime 2>/dev/null
 
 : ${UNDO_DATA_DIR:=${XDG_DATA_HOME:-$HOME/.local/share}/undo}
-: ${UNDO_KEEP:=30}
 
 # locate the shim: explicit override, user install, next to the undo
 # binary (homebrew), then system paths
@@ -22,8 +21,10 @@ fi
 command mkdir -p -- $UNDO_DATA_DIR/sessions 2>/dev/null
 command chmod 700 -- $UNDO_DATA_DIR $UNDO_DATA_DIR/sessions 2>/dev/null
 
-# identifies this kernel instance; see Session.Live. Computed once: a reboot
-# ends this shell, and the hostname does not change under it.
+# Identifies the scope in which this shell's pid means something: hostname,
+# boot id, pid namespace. See Session.Live. Computed once -- a reboot ends this
+# shell, and neither the hostname nor the namespace changes under it.
+#
 # Every part or none, matching composeHost on the Go side: a partial identity
 # would not equal what the binary computes, and the session would then read as
 # foreign on the very host that created it.
@@ -93,19 +94,16 @@ _undo_precmd() {
     : >| $_undo_session/done
     unset _undo_session
 
-    # prune: the CLI enforces count and size budgets; fall back to a
-    # count-only prune when undo is not in PATH
+    # prune: the CLI enforces count and size budgets. Without it in PATH,
+    # fall back to clearing only what is provably finished and empty.
     if (( $+commands[undo] )); then
         command undo gc --auto 2>/dev/null
     else
-        local -a sessions
-        sessions=($UNDO_DATA_DIR/sessions/*(N/On))
+        # only finished, empty sessions -- see the bash hook for why
         local d
-        local -i n=0
-        for d in $sessions; do
-            if [[ ! -s $d/journal ]] || (( ++n > UNDO_KEEP )); then
-                command rm -rf -- $d
-            fi
+        for d in $UNDO_DATA_DIR/sessions/*(N/); do
+            [[ -f $d/done ]] || continue
+            [[ -s $d/journal ]] || command rm -rf -- $d
         done
     fi
 }

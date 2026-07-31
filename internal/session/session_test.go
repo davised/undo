@@ -1,9 +1,11 @@
 package session
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -847,5 +849,191 @@ func TestUnameMatchesGoHostname(t *testing.T) {
 	if got := strings.TrimSpace(string(out)); got != name {
 		t.Errorf("uname -n = %q but os.Hostname = %q; the hooks and the binary "+
 			"would disagree about which sessions are local", got, name)
+	}
+}
+
+// foreignSession builds a session that looks like one written by another node:
+// an origin that is not ours, a pid that does not resolve here, no done marker.
+func foreignSession(t *testing.T, age time.Duration) *Session {
+	t.Helper()
+	start := time.Now().Add(-age)
+	id := fmt.Sprintf("%d%06d", start.Unix(), start.Nanosecond()/1000)
+	dir := filepath.Join(Root(), id)
+	if err := os.MkdirAll(filepath.Join(dir, "data"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// a pid that is not running here; above every pid_max
+	if err := os.WriteFile(filepath.Join(dir, "pid"), []byte("2147483647\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "host"),
+		[]byte("othernode\tnot-our-boot-id\tpid:[999]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func TestLiveTreatsAForeignRunningSessionAsLive(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	s := foreignSession(t, time.Hour)
+	if !s.Live() {
+		t.Error("a session from another node with no done marker was read as finished; " +
+			"gc would delete the backups of a command that is still running")
+	}
+}
+
+// A foreign session whose pid file has not been written yet -- or was written
+// short, or cannot be parsed -- loads with Pid 0. That must not be read as
+// "finished": on a shared store it is the ordinary look of a session whose
+// creator is still setting it up.
+func TestLiveDoesNotConsultThePidOfAForeignSession(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	s := foreignSession(t, time.Minute)
+	if err := os.Remove(filepath.Join(s.Dir, "pid")); err != nil {
+		t.Fatal(err)
+	}
+	s, err := load(s.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Pid != 0 {
+		t.Fatalf("setup: want Pid 0, got %d", s.Pid)
+	}
+	if !s.Live() {
+		t.Error("a foreign session with no readable pid was called finished")
+	}
+}
+
+// The grace is what keeps an abandoned foreign session from being pinned
+// forever: past it, the session is collectible again.
+func TestLiveExpiresAForeignSessionPastTheGrace(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	t.Setenv("UNDO_FOREIGN_GRACE", "3600")
+	s := foreignSession(t, 2*time.Hour)
+	if s.Live() {
+		t.Error("a foreign session older than the grace must be collectible")
+	}
+}
+
+// withLocalHost forces thisHost's answer for one test. hostOnce is marked done
+// so the real lookup cannot overwrite it afterwards.
+func withLocalHost(t *testing.T, id string) {
+	t.Helper()
+	hostOnce.Do(func() {})
+	prev := hostID
+	hostID = id
+	t.Cleanup(func() { hostID = prev })
+}
+
+// With no local identity nothing can be classified, so neither signal is sound
+// alone: a session is finished only when the probe and the grace agree.
+// Otherwise a local command that outlived the grace could be purged, or an
+// undo applied over it, while it was still writing.
+func TestLiveWithNoLocalIdentityNeedsBothSignals(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	withLocalHost(t, "")
+
+	// far past any grace, but its pid is ours and demonstrably running
+	s := foreignSession(t, 30*24*time.Hour)
+	if err := os.WriteFile(filepath.Join(s.Dir, "pid"),
+		[]byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := load(s.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.Live() {
+		t.Error("a running pid must still count as live when the local identity " +
+			"is unknown; purge and apply would act on a running command")
+	}
+}
+
+// The grace cannot be tuned below the floor: a grace shorter than the clock
+// skew between two nodes would collect a command that just started.
+func TestForeignGraceHasAFloor(t *testing.T) {
+	t.Setenv("UNDO_FOREIGN_GRACE", "1")
+	if got := foreignGrace(); got != minForeignGrace {
+		t.Errorf("grace = %v, want the floor %v", got, minForeignGrace)
+	}
+}
+
+// A foreign session that finished normally left a done marker, and that is
+// conclusive from any node -- no grace needed.
+func TestLiveHonoursDoneOnAForeignSession(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	s := foreignSession(t, time.Minute)
+	if err := os.WriteFile(filepath.Join(s.Dir, "done"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := load(s.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Live() {
+		t.Error("a foreign session with a done marker is finished")
+	}
+}
+
+// Sessions written before this change have no origin. They must keep the old
+// behaviour exactly, or a rollout strands every session already on disk.
+func TestLiveFallsBackToTheProbeWithoutAnOrigin(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	s := foreignSession(t, time.Minute)
+	if err := os.Remove(filepath.Join(s.Dir, "host")); err != nil {
+		t.Fatal(err)
+	}
+	s, err := load(s.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Live() {
+		t.Error("without an origin the pid probe decides, and this pid is not running")
+	}
+}
+
+// Same host: the probe is meaningful and must still be what decides.
+func TestLiveProbesThePidOnItsOwnHost(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	s := foreignSession(t, time.Minute)
+	if err := os.WriteFile(filepath.Join(s.Dir, "host"),
+		[]byte(thisHost()+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.Dir, "pid"),
+		[]byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := load(s.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.Live() {
+		t.Error("our own running pid on our own host must read as live")
+	}
+}
+
+// A session that has been created but has not yet recorded anything, and has
+// not been marked done, may be moments from its first entry -- or may be one
+// whose creator is on another node and still writing it out. Deleting it takes
+// the directory the command is about to journal into.
+func TestGCSparesAYoungSessionThatHasRecordedNothingYet(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	starting, err := Create("a command that has not touched a file yet")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(starting.Dir, "pid")); err != nil {
+		t.Fatal(err) // as a reader sees it before the pid is written
+	}
+	if _, err := GC(30, 1<<30, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(starting.Dir); err != nil {
+		t.Error("gc deleted a session that was still being set up")
 	}
 }

@@ -3,7 +3,6 @@
 #   source ~/.local/share/undo/undo.fish
 
 set -q UNDO_DATA_DIR; or set -g UNDO_DATA_DIR (set -q XDG_DATA_HOME; and echo $XDG_DATA_HOME; or echo $HOME/.local/share)/undo
-set -q UNDO_KEEP; or set -g UNDO_KEEP 30
 
 if not set -q UNDO_LIB
     set -l bin (command -v undo 2>/dev/null)
@@ -119,17 +118,10 @@ function _undo_postexec --on-event fish_postexec
         command undo gc --auto 2>/dev/null
         return
     end
-    # fallback: drop empty sessions, prune the oldest beyond UNDO_KEEP
-    set -l all
+    # fallback: only finished, empty sessions -- see the bash hook for why
     for d in $UNDO_DATA_DIR/sessions/*/
-        if not test -s $d/journal
+        if test -f $d/done; and not test -s $d/journal
             command rm -rf -- $d
-        else
-            set -a all $d
         end
-    end
-    set -l n (count $all)
-    if test $n -gt $UNDO_KEEP
-        command rm -rf -- $all[1..(math $n - $UNDO_KEEP)]
     end
 end

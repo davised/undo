@@ -4,7 +4,6 @@
 
 [[ -n ${EPOCHREALTIME-} ]] || return 0
 : "${UNDO_DATA_DIR:=${XDG_DATA_HOME:-$HOME/.local/share}/undo}"
-: "${UNDO_KEEP:=30}"
 
 if [[ -z ${UNDO_LIB-} ]]; then
     _undo_bin=$(command -v undo 2>/dev/null)
@@ -96,19 +95,18 @@ _undo_precmd() {
         command undo gc --auto 2>/dev/null
         return 0
     fi
-    # fallback: drop empty sessions, prune the oldest beyond UNDO_KEEP
+    # fallback: only sessions this shell can prove are finished and empty.
+    # Without a done marker a session may belong to a command still running --
+    # on this machine or another one, since the store is shared. Pruning by
+    # count is gone: it had no liveness check at all, and it removed session
+    # directories without their distributed backups, stranding those where
+    # only `undo gc` can still find them.
     local d
     for d in "$UNDO_DATA_DIR"/sessions/*/; do
         [[ -d $d ]] || continue
+        [[ -f $d/done ]] || continue
         [[ -s $d/journal ]] || rm -rf -- "$d"
     done
-    local -a all=("$UNDO_DATA_DIR"/sessions/*/)
-    local n=${#all[@]} i
-    if [[ -d ${all[0]-} ]] && ((n > UNDO_KEEP)); then
-        for ((i = 0; i < n - UNDO_KEEP; i++)); do
-            rm -rf -- "${all[i]}"
-        done
-    fi
 }
 
 # lets `undo doctor` tell an inactive hook from a missing install

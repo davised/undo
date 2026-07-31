@@ -283,6 +283,7 @@ Environment variables, set before sourcing the hook:
 | `UNDO_KEEP` | `30` | how many commands are kept (see [storage](#storage-and-disk-space)) |
 | `UNDO_MAX_STORE` | 1 GiB | total store size budget in bytes; oldest pruned first |
 | `UNDO_MAX_BYTES` | 256 MiB | largest file the shim will copy for an in-place overwrite; deletions are hardlinked with no size limit |
+| `UNDO_FOREIGN_GRACE` | 7 days | seconds a session created on another machine is presumed still running when it has no completion marker; values under 15 minutes are raised to it. Only matters when the store is on a shared home directory — see [shared home directories](#shared-home-directories) |
 | `UNDO_DATA_DIR` | `~/.local/share/undo` | where sessions live |
 | `UNDO_IGNORE` | from config file | colon-separated ignore patterns, overrides `~/.config/undo/ignore` |
 | `UNDO_IGNORE_FILE` | `~/.config/undo/ignore` | where the ignore list is read from |
@@ -297,6 +298,25 @@ Installer-only variables, for `install.sh`:
 | `PREFIX` | install location, default `~/.local` |
 | `UNDO_MODIFY_RC` | set to `1` to add the hook line without being asked (for scripted installs) |
 | `UNDO_NO_MODIFY_RC` | set to `1` to never touch your shell rc |
+
+## Shared home directories
+
+On a cluster where `$HOME` is the same filesystem on every node, one session
+store is written and garbage collected by processes on many machines at once.
+A session records the pid of the shell that started it, and a pid only means
+something on the machine that issued it — so `undo` also records which kernel
+instance a session came from, and never probes a pid that belongs to a
+different one.
+
+A session from another machine cannot be checked directly. If it finished
+normally it left a completion marker, which is conclusive from anywhere. If it
+did not, `undo` presumes it is still running until it is older than
+`UNDO_FOREIGN_GRACE`, so that garbage collection never deletes the backups of
+a command in flight.
+
+That bound is real: **a command running longer than the grace can have its
+backups collected while it is still running.** The default is a week. If you
+run jobs longer than that, raise it above your longest walltime.
 
 ## What it cannot catch
 
