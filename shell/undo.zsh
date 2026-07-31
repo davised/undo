@@ -22,6 +22,19 @@ fi
 command mkdir -p -- $UNDO_DATA_DIR/sessions 2>/dev/null
 command chmod 700 -- $UNDO_DATA_DIR $UNDO_DATA_DIR/sessions 2>/dev/null
 
+# identifies this kernel instance; see Session.Live. Computed once: a reboot
+# ends this shell, and the hostname does not change under it.
+# Both halves or none, matching composeHost in the Go side: a partial identity
+# would not equal what the binary computes, and the session would then read as
+# foreign on the very host that created it.
+_undo_boot=
+[[ -r /proc/sys/kernel/random/boot_id ]] && read -r _undo_boot < /proc/sys/kernel/random/boot_id
+typeset -g _undo_origin=
+if [[ -n ${HOST:-} && -n $_undo_boot ]]; then
+    typeset -g _undo_origin=$HOST$'\t'$_undo_boot
+fi
+unset _undo_boot
+
 # extra ignore patterns from the config file, colon-joined for the shim.
 # The shim always ignores node_modules/.cache/__pycache__/.git on top.
 : ${UNDO_IGNORE_FILE:=${XDG_CONFIG_HOME:-$HOME/.config}/undo/ignore}
@@ -51,6 +64,7 @@ _undo_preexec() {
     command mkdir -p -- $dir/data 2>/dev/null || return 0
     print -r -- $1 >| $dir/cmd
     print -r -- $$ >| $dir/pid
+    [[ -n $_undo_origin ]] && print -r -- $_undo_origin >| $dir/host
 
     typeset -g _undo_session=$dir
     export UNDO_SESSION=$dir

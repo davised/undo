@@ -27,6 +27,28 @@ test -r "$UNDO_LIB"; or return
 command mkdir -p $UNDO_DATA_DIR/sessions 2>/dev/null
 command chmod 700 $UNDO_DATA_DIR $UNDO_DATA_DIR/sessions 2>/dev/null
 
+# identifies this kernel instance; see Session.Live. Computed once: a reboot
+# ends this shell, and the hostname does not change under it.
+#
+# uname -n, not hostname: uname -n is gethostname(2), which is what bash's
+# $HOSTNAME, zsh's $HOST and Go's os.Hostname all report. `hostname` may print
+# the FQDN instead, and a session that disagrees with the binary about its own
+# host reads as foreign on the machine that created it.
+# Both halves or none, matching composeHost in the Go side: a partial identity
+# would not equal what the binary computes, and the session would then read as
+# foreign on the very host that created it.
+set -l _undo_boot ""
+if test -r /proc/sys/kernel/random/boot_id
+    # no -l: that would declare a fresh local inside this block and leave the
+    # outer one empty
+    read _undo_boot </proc/sys/kernel/random/boot_id
+end
+set -l _undo_name (uname -n)
+set -g _undo_origin ""
+if test -n "$_undo_name" -a -n "$_undo_boot"
+    set -g _undo_origin (string join \t $_undo_name $_undo_boot)
+end
+
 # extra ignore patterns from the config file, colon-joined for the shim.
 # The shim always ignores node_modules/.cache/__pycache__/.git on top.
 set -q UNDO_IGNORE_FILE; or set -g UNDO_IGNORE_FILE (set -q XDG_CONFIG_HOME; and echo $XDG_CONFIG_HOME; or echo $HOME/.config)/undo/ignore
@@ -48,6 +70,9 @@ function _undo_preexec --on-event fish_preexec
     command mkdir -p $dir/data 2>/dev/null; or return
     printf '%s\n' $argv[1] >$dir/cmd
     printf '%s\n' $fish_pid >$dir/pid
+    if test -n "$_undo_origin"
+        printf '%s\n' $_undo_origin >$dir/host
+    end
 
     set -g _undo_session $dir
     set -gx UNDO_SESSION $dir

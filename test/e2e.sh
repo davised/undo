@@ -23,6 +23,9 @@ run_armed() {
     local sess=$UNDO_DATA_DIR/sessions/$id
     mkdir -p "$sess/data"
     echo "$*" >"$sess/cmd"
+    # a hook records which kernel instance made the session; so must this,
+    # or no e2e case ever exercises the same-host path with an origin present
+    printf '%s\t%s\n' "$(uname -n)" "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" >"$sess/host"
     env UNDO_SESSION="$sess" LD_PRELOAD="$LIB" bash -c "$*"
     sleep 0.01 # keep session ids strictly ordered
 }
@@ -463,6 +466,24 @@ UNDO_MAX_STORE=1048576 "$UNDO" gc >/dev/null
     fail "gc pruned a hardlinked backup, which allocates nothing"
 [[ ! -d $UNDO_DATA_DIR/sessions/$mod_sess ]] ||
     fail "gc kept a copied backup that blew the byte budget"
+
+echo "== case 33: the shell hook and the binary agree about this host"
+# The hook and the binary each compose the origin themselves. If they disagree
+# -- a different hostname source, or one of them emitting half an identity when
+# the boot id is unreadable -- every session made by the hook reads as foreign
+# on the machine that created it: pinned for the whole grace, and undo refusing
+# to revert it. Found the hard way: the first version of the hooks wrote
+# "<host><tab>" with an empty boot id, which the binary refuses to produce.
+hook_origin=$(env UNDO_DATA_DIR="$WORK/store" UNDO_LIB="$LIB" \
+    bash -c ". $ROOT/shell/undo.bash; printf %s \"\${_undo_origin-}\"")
+echo scratch >"$PLAY/hostcheck.txt"
+"$UNDO" run -- rm "$PLAY/hostcheck.txt" >/dev/null 2>&1
+run_sess=$(ls "$UNDO_DATA_DIR/sessions" | sort | tail -1)
+bin_origin=$(cat "$UNDO_DATA_DIR/sessions/$run_sess/host" 2>/dev/null || true)
+[[ -n $bin_origin ]] || fail "the binary recorded no origin"
+[[ -n $hook_origin ]] || fail "the bash hook produced no origin"
+[[ $hook_origin == "$bin_origin" ]] ||
+    fail "hook origin [$hook_origin] != binary origin [$bin_origin]"
 
 echo
 echo "all cases passed"

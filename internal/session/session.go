@@ -8,6 +8,10 @@
 //	undone   - marker written after a successful undo, holding the RFC3339
 //	           nanosecond time of the undo so redo can find the session that
 //	           was undone last rather than the one that ran last
+//	pid      - the pid of the shell or runner that started the command
+//	host     - the kernel instance that created the session: hostname, a tab,
+//	           and the boot id. Homes are shared across nodes, so a pid alone
+//	           does not say whether the command is still running; see Live.
 package session
 
 import (
@@ -18,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,6 +37,7 @@ type Session struct {
 	UndoneAt time.Time // when the undo happened, zero if not undone
 	Done     bool      // the command finished (done marker present)
 	Pid      int       // shell or runner pid, 0 for pre-lock sessions
+	Origin   string    // host+boot id that created it, empty for older sessions
 	Entries  []journal.Entry
 }
 
@@ -43,6 +49,44 @@ func (s *Session) Live() bool {
 	}
 	err := syscall.Kill(s.Pid, 0)
 	return err == nil || err == syscall.EPERM
+}
+
+var (
+	hostOnce sync.Once
+	hostID   string
+)
+
+// thisHost identifies the running kernel instance: hostname and boot id.
+//
+// A pid is only meaningful within one of these. If neither can be read the
+// result is empty, which Live treats as "cannot compare" and resolves
+// explicitly.
+func thisHost() string {
+	hostOnce.Do(func() {
+		name, _ := os.Hostname()
+		var boot string
+		if b, err := os.ReadFile("/proc/sys/kernel/random/boot_id"); err == nil {
+			boot = strings.TrimSpace(string(b))
+		}
+		hostID = composeHost(name, boot)
+	})
+	return hostID
+}
+
+// composeHost joins the two halves of a host identity, or returns empty if
+// either is missing.
+//
+// Both or neither. A hostname without a boot id would make a session from
+// before a reboot look local, and Live would then trust a pid that has since
+// been reissued to something else. A boot id without a hostname would make
+// containers sharing a kernel look like one another while their pid namespaces
+// are separate. Half of this is not a weaker version of it; it is a different
+// and wrong answer.
+func composeHost(name, boot string) string {
+	if name == "" || boot == "" {
+		return ""
+	}
+	return name + "\t" + boot
 }
 
 // Root returns the sessions directory, honoring UNDO_DATA_DIR.
@@ -79,6 +123,9 @@ func load(dir string) (*Session, error) {
 	}
 	if b, err := os.ReadFile(filepath.Join(dir, "pid")); err == nil {
 		s.Pid, _ = strconv.Atoi(strings.TrimSpace(string(b)))
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "host")); err == nil {
+		s.Origin = strings.TrimSpace(string(b))
 	}
 	entries, err := journal.Read(filepath.Join(dir, "journal"))
 	if err != nil {
@@ -218,7 +265,13 @@ func Create(cmd string) (*Session, error) {
 	if err := os.WriteFile(filepath.Join(dir, "pid"), []byte(pid+"\n"), 0o600); err != nil {
 		return nil, err
 	}
-	return &Session{ID: id, Dir: dir, Cmd: cmd, Pid: os.Getpid()}, nil
+	// Written as its own file rather than folded into pid: during a rollout
+	// the binary and the shell hooks update at different times, and an older
+	// undo reading a newer session must not trip over a changed pid format.
+	if err := os.WriteFile(filepath.Join(dir, "host"), []byte(thisHost()+"\n"), 0o600); err != nil {
+		return nil, err
+	}
+	return &Session{ID: id, Dir: dir, Cmd: cmd, Pid: os.Getpid(), Origin: thisHost()}, nil
 }
 
 // MarkDone records that the session's command finished.

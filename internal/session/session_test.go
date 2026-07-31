@@ -2,7 +2,9 @@ package session
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -732,5 +734,101 @@ func TestGCRefusesToPruneWhenTheRegistryCannotBeSaved(t *testing.T) {
 	}
 	if _, err := os.Stat(old.Dir); err != nil {
 		t.Error("GC pruned a session after failing to record where its backups live")
+	}
+}
+
+func TestCreateRecordsOrigin(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	s, err := Create("rm x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(s.Dir, "host"))
+	if err != nil {
+		t.Fatalf("no host file: %v", err)
+	}
+	if got := strings.TrimSpace(string(b)); got != thisHost() {
+		t.Errorf("host file = %q, want %q", got, thisHost())
+	}
+	got, err := Get(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Origin != thisHost() {
+		t.Errorf("loaded Origin = %q, want %q", got.Origin, thisHost())
+	}
+}
+
+// A session written by an older hook has no host file. It must load cleanly
+// with an empty Origin, which Live treats as "use the pid probe, as before".
+func TestLoadWithoutOriginIsEmpty(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	s, err := Create("rm x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(s.Dir, "host")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Get(s.ID)
+	if err != nil {
+		t.Fatalf("a session without a host file must still load: %v", err)
+	}
+	if got.Origin != "" {
+		t.Errorf("Origin = %q, want empty", got.Origin)
+	}
+}
+
+// thisHost must be stable within a process: Live compares against it on every
+// call, and a value that varied would make liveness flap.
+//
+// Deliberately does not assert non-empty. The contract permits an empty result
+// -- a host where neither the hostname nor the boot id can be read -- and Live
+// resolves that case explicitly. Asserting otherwise would make this test fail
+// on a restricted container even where the fallback is working correctly.
+func TestThisHostIsStableAndOneLine(t *testing.T) {
+	a, b := thisHost(), thisHost()
+	if a != b {
+		t.Errorf("thisHost not stable: %q then %q", a, b)
+	}
+	if strings.Contains(a, "\n") {
+		t.Errorf("thisHost must be one line, got %q", a)
+	}
+}
+
+// Half an identity is worse than none: it matches sessions it should not.
+func TestComposeHostRequiresBothHalves(t *testing.T) {
+	if got := composeHost("node1", ""); got != "" {
+		t.Errorf("hostname with no boot id = %q, want empty: a session from "+
+			"before a reboot would look local and its pid may be reissued", got)
+	}
+	if got := composeHost("", "boot-uuid"); got != "" {
+		t.Errorf("boot id with no hostname = %q, want empty: containers sharing "+
+			"a kernel have separate pid namespaces", got)
+	}
+	if got := composeHost("node1", "boot-uuid"); got != "node1\tboot-uuid" {
+		t.Errorf("composeHost = %q", got)
+	}
+}
+
+// The shell hooks and Create must agree on what identifies this host, or a
+// session created by the fish hook reads as foreign to the Go binary running
+// on the same machine -- pinned for the whole grace, and undo refusing to
+// revert it. `uname -n` is gethostname(2) by POSIX definition, which is what
+// bash's $HOSTNAME, zsh's $HOST and Go's os.Hostname all report. `hostname`
+// the command is not: it may print the FQDN where gethostname returns the
+// short name.
+func TestUnameMatchesGoHostname(t *testing.T) {
+	out, err := exec.Command("uname", "-n").Output()
+	if err != nil {
+		t.Skipf("uname unavailable: %v", err)
+	}
+	name, err := os.Hostname()
+	if err != nil {
+		t.Skipf("os.Hostname unavailable: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != name {
+		t.Errorf("uname -n = %q but os.Hostname = %q; the hooks and the binary "+
+			"would disagree about which sessions are local", got, name)
 	}
 }
