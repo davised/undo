@@ -332,7 +332,13 @@ func GC(keep int, maxBytes int64, maxAge time.Duration) (int, error) {
 	for _, s := range all {
 		roots = append(roots, storeRoots(s.Entries)...)
 	}
-	rememberRoots(roots)
+	// Before pruning, not after, and fatal if it fails: a pruned session takes
+	// its journal, which is the only record of where its backups live. Pruning
+	// without that recorded means any backup Remove cannot delete -- an
+	// unmounted volume, say -- is unreachable by the sweep forever.
+	if err := rememberRoots(roots); err != nil {
+		return 0, err
+	}
 
 	removed, kept := 0, 0
 	var total int64
@@ -512,7 +518,13 @@ func SweepOrphans() (int, error) {
 		live := 0
 		for _, e := range ents {
 			cand := filepath.Join(undoDir, e.Name())
-			if !sessionID(e.Name()) || !realDir(cand) || !ownedByCaller(cand) {
+			// safeStore, not realDir alone: it also requires the .undo
+			// parent to be a real directory. ReadDir follows a symlinked
+			// .undo, and the fences on the entries say nothing about where
+			// they actually live -- a caller-owned 16-digit directory outside
+			// the store would otherwise pass all of them. Session.Remove has
+			// used this check since the symlink fix; the sweep must agree.
+			if !sessionID(e.Name()) || !safeStore(cand) {
 				live++ // not ours; its presence keeps the root registered
 				continue
 			}

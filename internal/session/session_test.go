@@ -663,3 +663,74 @@ func TestSweepOrphansRefusesEverythingItShould(t *testing.T) {
 		}
 	}
 }
+
+// The sweep reads <root>/.undo and deletes what it finds inside. If that
+// component is itself a symlink, ReadDir follows it and the fences on the
+// entries say nothing about where they actually live.
+func TestSweepOrphansRefusesASymlinkedUndoDirectory(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+
+	// somewhere else entirely, holding something shaped exactly like a store
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "1700000000000009")
+	writeBackup(t, filepath.Join(victim, "1-1"), 16)
+
+	vol := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(vol, ".undo")); err != nil {
+		t.Fatal(err)
+	}
+	// register the root the way gc does, via a session naming a backup under it
+	s, err := Create("rm x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.MarkDone()
+	writeJournal(t, s, "unlink\t"+filepath.Join(vol, "x")+"\t"+
+		filepath.Join(vol, ".undo", s.ID, "1-1")+"\tlink\n")
+
+	if _, err := GC(30, 1<<30, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SweepOrphans(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(victim); err != nil {
+		t.Fatal("the sweep deleted a directory outside the store by following a symlinked .undo")
+	}
+}
+
+// gc prunes sessions, and a pruned session takes its journal -- the only
+// record of where its backups live. If the roots registry could not be
+// written, pruning anyway strands any backup Remove then fails to delete.
+func TestGCRefusesToPruneWhenTheRegistryCannotBeSaved(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	vol := t.TempDir()
+
+	old, err := Create("rm a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	old.MarkDone()
+	b := filepath.Join(vol, ".undo", old.ID, "1-1")
+	writeBackup(t, b, 16)
+	writeJournal(t, old, "unlink\t"+filepath.Join(vol, "a")+"\t"+b+"\tlink\n")
+
+	newer, err := Create("rm b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newer.MarkDone()
+	writeJournal(t, newer, "create\t"+filepath.Join(vol, "b")+"\n")
+
+	// a directory where the registry file belongs: WriteFile fails EISDIR
+	if err := os.MkdirAll(rootsFile(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := GC(1, 1, 0); err == nil {
+		t.Error("GC reported success although the roots registry could not be written")
+	}
+	if _, err := os.Stat(old.Dir); err != nil {
+		t.Error("GC pruned a session after failing to record where its backups live")
+	}
+}
