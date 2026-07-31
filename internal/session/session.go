@@ -247,9 +247,43 @@ func dirSize(dir string) int64 {
 	return total
 }
 
+// allocatedBytes is what this session actually costs in space: the session
+// directory, plus every backup the journal names whose save method allocated
+// something.
+//
+// A hardlink is a second name for blocks that already exist, so it allocates
+// nothing and is excluded. Counting one at full logical size -- which is what
+// walking the directory does -- means a hardlinked 50 GiB deletion is charged
+// 50 GiB against a 1 GiB budget and evicted on the next command, making the
+// free mechanism the first one pruned. Hardlinks are bounded by session count
+// and UNDO_MAX_AGE instead, since their cost is deferred reclamation.
+//
+// Only non-hardlinked backups are stat'd, which is also what keeps this cheap:
+// a command deleting 100k files produces 100k hardlink records and zero round
+// trips here, while copies are capped at UNDO_MAX_BYTES each and far rarer.
+func (s *Session) allocatedBytes() int64 {
+	total := dirSize(s.Dir)
+	prefix := s.Dir + string(os.PathSeparator)
+	for _, e := range s.Entries {
+		if m := e.Method(); m == "link" || m == "none" {
+			continue
+		}
+		b := e.Backup()
+		if b == "" || b == "-" || strings.HasPrefix(b, prefix) {
+			continue // no backup, discarded, or already counted by dirSize
+		}
+		if fi, err := os.Lstat(b); err == nil && fi.Mode().IsRegular() {
+			total += fi.Size()
+		}
+	}
+	return total
+}
+
 // GC removes empty sessions and prunes the oldest until at most keep
-// sessions remain within maxBytes total. Live sessions are never touched.
-func GC(keep int, maxBytes int64) (int, error) {
+// sessions remain within maxBytes of allocated space. Sessions older than
+// maxAge go regardless; maxAge of 0 disables that. Live sessions are never
+// touched.
+func GC(keep int, maxBytes int64, maxAge time.Duration) (int, error) {
 	TightenPerms()
 	all, err := List()
 	if err != nil {
@@ -257,6 +291,7 @@ func GC(keep int, maxBytes int64) (int, error) {
 	}
 	removed, kept := 0, 0
 	var total int64
+	now := time.Now()
 	for _, s := range all { // newest first
 		if s.Live() {
 			continue
@@ -268,7 +303,7 @@ func GC(keep int, maxBytes int64) (int, error) {
 			continue
 		}
 		kept++
-		total += dirSize(s.Dir)
+		total += s.allocatedBytes()
 
 		// The newest session is the one `undo` with no arguments targets,
 		// so it always survives. Dropping it because a single big delete
@@ -277,7 +312,8 @@ func GC(keep int, maxBytes int64) (int, error) {
 		if kept == 1 {
 			continue
 		}
-		if kept > keep || total > maxBytes {
+		tooOld := maxAge > 0 && now.Sub(s.Started()) > maxAge
+		if kept > keep || total > maxBytes || tooOld {
 			if s.Remove() == nil {
 				removed++
 			}
@@ -286,22 +322,29 @@ func GC(keep int, maxBytes int64) (int, error) {
 	return removed, nil
 }
 
+// Started is when the session's command ran, decoded from its id -- which is
+// unix seconds followed by six digits of microseconds.
+func (s *Session) Started() time.Time {
+	if len(s.ID) < 7 {
+		return time.Time{}
+	}
+	secs, err := strconv.ParseInt(s.ID[:len(s.ID)-6], 10, 64)
+	if err != nil {
+		return time.Time{}
+	}
+	usec, err := strconv.ParseInt(s.ID[len(s.ID)-6:], 10, 64)
+	if err != nil {
+		return time.Time{}
+	}
+	return time.Unix(secs, usec*1000)
+}
+
 // backupPaths returns the backup locations this session's journal names.
 // The shim records them as absolute paths, so they may be anywhere.
 func (s *Session) backupPaths() []string {
 	var out []string
 	for _, e := range s.Entries {
-		var p string
-		switch e.Op {
-		case journal.OpUnlink, journal.OpMod:
-			if len(e.Fields) > 1 {
-				p = e.Fields[1]
-			}
-		case journal.OpRename:
-			if len(e.Fields) > 2 {
-				p = e.Fields[2]
-			}
-		}
+		p := e.Backup()
 		if p == "" || p == "-" {
 			continue
 		}

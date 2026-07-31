@@ -56,7 +56,7 @@ func TestGCRemovesEmptyAndOversized(t *testing.T) {
 	writeJournal(t, fresh, "create\t/tmp/small\n")
 
 	// budget fits the fresh session but not fresh+old
-	if _, err := GC(10, 4096); err != nil {
+	if _, err := GC(10, 4096, 0); err != nil {
 		t.Fatal(err)
 	}
 	all, _ := List()
@@ -68,7 +68,7 @@ func TestGCRemovesEmptyAndOversized(t *testing.T) {
 func TestGCKeepsLiveSessions(t *testing.T) {
 	t.Setenv("UNDO_DATA_DIR", t.TempDir())
 	s, _ := Create("still running") // live: our own pid, no done marker
-	if _, err := GC(10, 1<<30); err != nil {
+	if _, err := GC(10, 1<<30, 0); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(s.Dir); err != nil {
@@ -93,7 +93,7 @@ func TestGCKeepsNewestEvenWhenOversized(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := GC(10, 4096); err != nil {
+	if _, err := GC(10, 4096, 0); err != nil {
 		t.Fatal(err)
 	}
 	all, _ := List()
@@ -391,5 +391,93 @@ func TestUnprotectedCountsAcrossAWholeSession(t *testing.T) {
 	}
 	if got := reloaded.Unprotected(); got != 2 {
 		t.Errorf("Unprotected() = %d, want 2", got)
+	}
+}
+
+// writeBackup puts a file of n bytes at path, creating parents.
+func writeBackup(t *testing.T, path string, n int) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, make([]byte, n), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHardlinkedBackupsAreNotCharged(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	vol := t.TempDir()
+
+	linked, _ := Create("rm huge.bin")
+	linked.MarkDone()
+	lb := filepath.Join(vol, ".undo", linked.ID, "1-1")
+	writeBackup(t, lb, 1<<20)
+	writeJournal(t, linked, "unlink\t"+filepath.Join(vol, "huge.bin")+"\t"+lb+"\tlink\n")
+
+	copied, _ := Create("truncate huge.bin")
+	copied.MarkDone()
+	cb := filepath.Join(vol, ".undo", copied.ID, "1-1")
+	writeBackup(t, cb, 1<<20)
+	writeJournal(t, copied, "mod\t"+filepath.Join(vol, "huge.bin")+"\t"+cb+"\tcopy\n")
+
+	all, err := List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotLink, gotCopy int64 = -1, -1
+	for _, s := range all {
+		switch s.ID {
+		case linked.ID:
+			gotLink = s.allocatedBytes()
+		case copied.ID:
+			gotCopy = s.allocatedBytes()
+		}
+	}
+	// allocatedBytes always includes the session directory itself -- cmd, pid
+	// and journal, a couple of hundred bytes -- so this asserts what the 1 MiB
+	// backup contributes, not an exact total. Pinning the total would make the
+	// test brittle against unrelated session metadata.
+	const backup = 1 << 20
+	if gotLink >= backup {
+		t.Errorf("hardlinked session charged %d bytes; the %d-byte backup must not count",
+			gotLink, backup)
+	}
+	if gotCopy < backup {
+		t.Errorf("copied session charged %d bytes, want at least %d", gotCopy, backup)
+	}
+}
+
+func TestGCKeepsBigHardlinkAndPrunesBigCopy(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	vol := t.TempDir()
+
+	// oldest: a large copy, must go
+	bigCopy, _ := Create("truncate a.bin")
+	bigCopy.MarkDone()
+	p := filepath.Join(vol, ".undo", bigCopy.ID, "1-1")
+	writeBackup(t, p, 1<<20)
+	writeJournal(t, bigCopy, "mod\t"+filepath.Join(vol, "a.bin")+"\t"+p+"\tcopy\n")
+
+	// middle: an equally large hardlink, must stay
+	bigLink, _ := Create("rm b.bin")
+	bigLink.MarkDone()
+	q := filepath.Join(vol, ".undo", bigLink.ID, "1-1")
+	writeBackup(t, q, 1<<20)
+	writeJournal(t, bigLink, "unlink\t"+filepath.Join(vol, "b.bin")+"\t"+q+"\tlink\n")
+
+	// newest: always survives, and keeps the two above from being "newest"
+	newest, _ := Create("rm c.bin")
+	newest.MarkDone()
+	writeJournal(t, newest, "create\t"+filepath.Join(vol, "c.bin")+"\n")
+
+	if _, err := GC(10, 4096, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(bigCopy.Dir); !os.IsNotExist(err) {
+		t.Error("a large copied backup should have been pruned by the byte budget")
+	}
+	if _, err := os.Stat(bigLink.Dir); err != nil {
+		t.Error("a large hardlinked backup should not be charged against the byte budget")
 	}
 }

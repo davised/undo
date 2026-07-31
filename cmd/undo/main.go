@@ -52,7 +52,8 @@ func envInt(name string, def int64) int64 {
 func cmdGC(auto bool) {
 	keep := int(envInt("UNDO_KEEP", 30))
 	maxBytes := envInt("UNDO_MAX_STORE", 1<<30)
-	removed, err := session.GC(keep, maxBytes)
+	maxAge := time.Duration(envInt("UNDO_MAX_AGE", 0)) * time.Second
+	removed, err := session.GC(keep, maxBytes, maxAge)
 	if auto {
 		return
 	}
