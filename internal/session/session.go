@@ -56,11 +56,11 @@ var (
 	hostID   string
 )
 
-// thisHost identifies the running kernel instance: hostname and boot id.
+// thisHost identifies the scope in which this session's pid means something:
+// hostname, boot id, and pid namespace.
 //
-// A pid is only meaningful within one of these. If neither can be read the
-// result is empty, which Live treats as "cannot compare" and resolves
-// explicitly.
+// If any part cannot be read the result is empty, which Live treats as
+// "cannot compare" and resolves explicitly.
 func thisHost() string {
 	hostOnce.Do(func() {
 		name, _ := os.Hostname()
@@ -68,25 +68,29 @@ func thisHost() string {
 		if b, err := os.ReadFile("/proc/sys/kernel/random/boot_id"); err == nil {
 			boot = strings.TrimSpace(string(b))
 		}
-		hostID = composeHost(name, boot)
+		// "pid:[4026532537]" -- the namespace's inode, distinct per namespace
+		pidns, _ := os.Readlink("/proc/self/ns/pid")
+		hostID = composeHost(name, boot, strings.TrimSpace(pidns))
 	})
 	return hostID
 }
 
-// composeHost joins the two halves of a host identity, or returns empty if
-// either is missing.
+// composeHost joins the three parts of a host identity, or returns empty if
+// any is missing.
 //
-// Both or neither. A hostname without a boot id would make a session from
-// before a reboot look local, and Live would then trust a pid that has since
-// been reissued to something else. A boot id without a hostname would make
-// containers sharing a kernel look like one another while their pid namespaces
-// are separate. Half of this is not a weaker version of it; it is a different
-// and wrong answer.
-func composeHost(name, boot string) string {
-	if name == "" || boot == "" {
+// All or nothing, because each rules out a different way for a pid to be
+// misread. Without the boot id, a session from before a reboot looks local and
+// its pid may since have been reissued. Without the pid namespace, containers
+// that share a kernel and a UTS namespace -- several in one pod, say -- look
+// identical while the same number names unrelated processes in each. The
+// hostname is what makes the other two legible to a human reading the file.
+//
+// A subset is not a weaker version of this; it is a different and wrong answer.
+func composeHost(name, boot, pidns string) string {
+	if name == "" || boot == "" || pidns == "" {
 		return ""
 	}
-	return name + "\t" + boot
+	return name + "\t" + boot + "\t" + pidns
 }
 
 // Root returns the sessions directory, honoring UNDO_DATA_DIR.

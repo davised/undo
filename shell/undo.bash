@@ -21,18 +21,21 @@ fi
 mkdir -p -- "$UNDO_DATA_DIR/sessions" 2>/dev/null
 chmod 700 -- "$UNDO_DATA_DIR" "$UNDO_DATA_DIR/sessions" 2>/dev/null
 
-# identifies this kernel instance; see Session.Live. Computed once: a reboot
-# ends this shell, and the hostname does not change under it.
-# Both halves or none, matching composeHost in the Go side: a partial identity
+# Identifies the scope in which this shell's pid means something: hostname,
+# boot id, pid namespace. See Session.Live. Computed once -- a reboot ends this
+# shell, and neither the hostname nor the namespace changes under it.
+#
+# Every part or none, matching composeHost on the Go side: a partial identity
 # would not equal what the binary computes, and the session would then read as
 # foreign on the very host that created it.
-_undo_boot=
+_undo_boot= _undo_pidns=
 [[ -r /proc/sys/kernel/random/boot_id ]] && read -r _undo_boot < /proc/sys/kernel/random/boot_id
+_undo_pidns=$(readlink /proc/self/ns/pid 2>/dev/null) || _undo_pidns=
 _undo_origin=
-if [[ -n ${HOSTNAME:-} && -n $_undo_boot ]]; then
-    _undo_origin=$HOSTNAME$'\t'$_undo_boot
+if [[ -n ${HOSTNAME:-} && -n $_undo_boot && -n $_undo_pidns ]]; then
+    _undo_origin=$HOSTNAME$'\t'$_undo_boot$'\t'$_undo_pidns
 fi
-unset _undo_boot
+unset _undo_boot _undo_pidns
 
 # extra ignore patterns from the config file, colon-joined for the shim.
 # The shim always ignores node_modules/.cache/__pycache__/.git on top.

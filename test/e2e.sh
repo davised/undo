@@ -25,7 +25,9 @@ run_armed() {
     echo "$*" >"$sess/cmd"
     # a hook records which kernel instance made the session; so must this,
     # or no e2e case ever exercises the same-host path with an origin present
-    printf '%s\t%s\n' "$(uname -n)" "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" >"$sess/host"
+    printf '%s\t%s\t%s\n' "$(uname -n)" \
+        "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" \
+        "$(readlink /proc/self/ns/pid 2>/dev/null)" >"$sess/host"
     env UNDO_SESSION="$sess" LD_PRELOAD="$LIB" bash -c "$*"
     sleep 0.01 # keep session ids strictly ordered
 }

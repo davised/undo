@@ -27,16 +27,17 @@ test -r "$UNDO_LIB"; or return
 command mkdir -p $UNDO_DATA_DIR/sessions 2>/dev/null
 command chmod 700 $UNDO_DATA_DIR $UNDO_DATA_DIR/sessions 2>/dev/null
 
-# identifies this kernel instance; see Session.Live. Computed once: a reboot
-# ends this shell, and the hostname does not change under it.
+# Identifies the scope in which this shell's pid means something: hostname,
+# boot id, pid namespace. See Session.Live. Computed once -- a reboot ends this
+# shell, and neither the hostname nor the namespace changes under it.
 #
 # uname -n, not hostname: uname -n is gethostname(2), which is what bash's
 # $HOSTNAME, zsh's $HOST and Go's os.Hostname all report. `hostname` may print
 # the FQDN instead, and a session that disagrees with the binary about its own
 # host reads as foreign on the machine that created it.
-# Both halves or none, matching composeHost in the Go side: a partial identity
-# would not equal what the binary computes, and the session would then read as
-# foreign on the very host that created it.
+#
+# Every part or none, matching composeHost on the Go side: a partial identity
+# would not equal what the binary computes, with the same consequence.
 set -l _undo_boot ""
 if test -r /proc/sys/kernel/random/boot_id
     # no -l: that would declare a fresh local inside this block and leave the
@@ -44,9 +45,10 @@ if test -r /proc/sys/kernel/random/boot_id
     read _undo_boot </proc/sys/kernel/random/boot_id
 end
 set -l _undo_name (uname -n)
+set -l _undo_pidns (readlink /proc/self/ns/pid 2>/dev/null)
 set -g _undo_origin ""
-if test -n "$_undo_name" -a -n "$_undo_boot"
-    set -g _undo_origin (string join \t $_undo_name $_undo_boot)
+if test -n "$_undo_name" -a -n "$_undo_boot" -a -n "$_undo_pidns"
+    set -g _undo_origin (string join \t $_undo_name $_undo_boot $_undo_pidns)
 end
 
 # extra ignore patterns from the config file, colon-joined for the shim.

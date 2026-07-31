@@ -796,18 +796,35 @@ func TestThisHostIsStableAndOneLine(t *testing.T) {
 	}
 }
 
-// Half an identity is worse than none: it matches sessions it should not.
-func TestComposeHostRequiresBothHalves(t *testing.T) {
-	if got := composeHost("node1", ""); got != "" {
-		t.Errorf("hostname with no boot id = %q, want empty: a session from "+
-			"before a reboot would look local and its pid may be reissued", got)
+// A partial identity is worse than none: it matches sessions it should not.
+func TestComposeHostRequiresEveryPart(t *testing.T) {
+	if got := composeHost("node1", "", "pid:[1]"); got != "" {
+		t.Errorf("no boot id = %q, want empty: a session from before a reboot "+
+			"would look local and its pid may since have been reissued", got)
 	}
-	if got := composeHost("", "boot-uuid"); got != "" {
-		t.Errorf("boot id with no hostname = %q, want empty: containers sharing "+
-			"a kernel have separate pid namespaces", got)
+	if got := composeHost("", "boot-uuid", "pid:[1]"); got != "" {
+		t.Errorf("no hostname = %q, want empty", got)
 	}
-	if got := composeHost("node1", "boot-uuid"); got != "node1\tboot-uuid" {
-		t.Errorf("composeHost = %q", got)
+	if got := composeHost("node1", "boot-uuid", ""); got != "" {
+		t.Errorf("no pid namespace = %q, want empty: containers sharing a "+
+			"kernel and a UTS namespace would look identical while the same "+
+			"pid names unrelated processes in each", got)
+	}
+	want := "node1\tboot-uuid\tpid:[1]"
+	if got := composeHost("node1", "boot-uuid", "pid:[1]"); got != want {
+		t.Errorf("composeHost = %q, want %q", got, want)
+	}
+}
+
+// The pid namespace is what makes this identity mean "where this pid is
+// meaningful" rather than merely "which machine".
+func TestThisHostCarriesThePidNamespace(t *testing.T) {
+	ns, err := os.Readlink("/proc/self/ns/pid")
+	if err != nil {
+		t.Skipf("pid namespace unreadable: %v", err)
+	}
+	if !strings.Contains(thisHost(), strings.TrimSpace(ns)) {
+		t.Errorf("thisHost %q does not carry the pid namespace %q", thisHost(), ns)
 	}
 }
 
