@@ -84,7 +84,7 @@ static unsigned long parse_ulong(const char *s)
  * reference, so the variable is honoured exactly as before. That is what keeps
  * sessions from an older hook working through a rollout instead of silently
  * disarming them. */
-static const char *session_dir(void)
+static const char *explicit_session(void)
 {
     const char *s = getenv("UNDO_SESSION");
     if (!s || !*s || *s != '/')
@@ -96,6 +96,16 @@ static const char *session_dir(void)
             return NULL;
     }
     return s;
+}
+
+static const char *lazy_session(void);
+
+static const char *session_dir(void)
+{
+    const char *s = explicit_session();
+    if (s)
+        return s;
+    return lazy_session();
 }
 
 /* Opens a session's journal, declaring the integrity contract if and only if
@@ -155,10 +165,7 @@ static int journal_fd(void)
     return fd;
 }
 
-static int armed(void)
-{
-    return !in_shim && session_dir() != NULL;
-}
+/* armed() moved below armer_is_us, which it now consults; see there. */
 
 /* ---------- journal writing ---------- */
 
@@ -340,6 +347,19 @@ static int has_dotdot(const char *p)
             s++;
     }
     return 0;
+}
+
+/* Up here with the path predicates rather than with the store helpers: session
+ * resolution needs it, and that runs earlier in this file. */
+/* True when `path` is a directory in its own right -- not a symlink to one --
+ * belonging to the effective uid. lstat does not follow the final component,
+ * so a symlink reports S_IFLNK and fails S_ISDIR. */
+static int own_real_dir(const char *path)
+{
+    struct stat st;
+    if (lstat(path, &st) != 0)
+        return 0;
+    return S_ISDIR(st.st_mode) && st.st_uid == geteuid();
 }
 
 /* ---------- process-group identity ---------- */
@@ -576,6 +596,313 @@ static int armer_is_us(void)
     return (unsigned long)pgid == apgid && proc_starttime(pgid) == ast;
 }
 
+/* Whether this process is armed -- deliberately WITHOUT resolving or creating
+ * a session.
+ *
+ * armed() runs on every interposed call, including read-only opens. Creating a
+ * session here would make `cat file` and `ls` each mint a session directory,
+ * six metadata files and a group symlink while recording nothing -- which is
+ * exactly the per-tool-call metadata traffic that lazy creation exists to
+ * avoid on a shared home. The session is created by session_dir(), which runs
+ * only from the paths that are about to write something. Caught by e2e case
+ * 42; the plan had asserted this function needed no change.
+ *
+ * armer_is_us() reads /proc, which is too expensive on every interposed call,
+ * so its answer is cached against the process group it describes. The group is
+ * the only thing the answer depends on, and it changes only through
+ * setpgid/setsid -- rare, and the comparison below notices. */
+static int armed(void)
+{
+    if (in_shim)
+        return 0;
+    if (explicit_session() != NULL)
+        return 1;
+    const char *arm = getenv("UNDO_ARM");
+    if (!arm || !*arm)
+        return 0;
+    static __thread pid_t cached_pgid;
+    static __thread int cached_excluded;
+    pid_t pg = getpgrp();
+    if (pg != cached_pgid) {
+        cached_pgid = pg;
+        cached_excluded = armer_is_us();
+    }
+    return !cached_excluded;
+}
+
+/* ---------- lazy session creation ---------- */
+
+/* The store root, from the environment. The shim never computes the XDG
+ * default: whoever armed us knows it, and guessing would put backups somewhere
+ * the CLI does not look. */
+static const char *data_dir(void)
+{
+    const char *d = getenv("UNDO_DATA_DIR");
+    if (!d || !*d || *d != '/')
+        return NULL;
+    return d;
+}
+
+/* Writes body to path, creating it. Best effort, like everything here. */
+static void write_meta(const char *dir, const char *name, const char *body)
+{
+    char path[PATH_MAX];
+    if ((size_t)snprintf(path, sizeof path, "%s/%s", dir, name) >= sizeof path)
+        return;
+    REAL(open, int, const char *, int, ...);
+    int fd = real_open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return;
+    ssize_t n = write(fd, body, strlen(body));
+    (void)n;
+    close(fd);
+}
+
+/* The command line of the group leader, which for an agent tool call is
+ * `<shell> -c '<the whole command>'` -- so the pipeline survives intact,
+ * because the entire command is one argv element.
+ *
+ * Falls back to our own cmdline when the leader has already exited. */
+static void group_cmdline(pid_t pgid, char *out, size_t cap)
+{
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/cmdline", (int)pgid);
+    REAL(open, int, const char *, int, ...);
+    int fd = real_open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        fd = real_open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        snprintf(out, cap, "(unknown)\n");
+        return;
+    }
+    ssize_t n = read(fd, out, cap - 2);
+    close(fd);
+    if (n <= 0) {
+        snprintf(out, cap, "(unknown)\n");
+        return;
+    }
+    for (ssize_t i = 0; i < n; i++)
+        if (out[i] == 0)
+            out[i] = ' ';
+    while (n > 0 && out[n - 1] == ' ')
+        n--;
+    out[n] = '\n';
+    out[n + 1] = 0;
+}
+
+/* Fills the metadata of a session directory. Every value describes the group
+ * rather than the writer, so two members racing here write byte-identical
+ * content and the race is invisible. */
+static void fill_session(const char *dir, pid_t pgid)
+{
+    char buf[PATH_MAX];
+
+    group_cmdline(pgid, buf, sizeof buf);
+    write_meta(dir, "cmd", buf);
+
+    /* pid and pgid are the SAME number here, and must stay that way.
+     * Both name the group leader, and Session.probe depends on it: when
+     * pgid is 1 it cannot use kill(-1, 0) and falls back to the pid,
+     * which is safe only because pgid 1 implies pid 1 -- init, which
+     * cannot exit while its children are still running. Recording the
+     * creating process's pid instead would put a dead leader pid beside
+     * an unprobeable group and make a running command collectible. A
+     * review gate raised that scenario; this is what keeps it
+     * hypothetical. */
+    snprintf(buf, sizeof buf, "%d\n", (int)pgid);
+    write_meta(dir, "pid", buf); /* an older undo probes this */
+    write_meta(dir, "pgid", buf);
+
+    snprintf(buf, sizeof buf, "%lld\n", (long long)bucket_ttl());
+    write_meta(dir, "ttl", buf);
+
+    char name[HOST_FIELD], boot[HOST_FIELD], pidns[HOST_FIELD];
+    if (host_parts(name, boot, pidns) == 0) {
+        snprintf(buf, sizeof buf, "%s\t%s\t%s\n", name, boot, pidns);
+        write_meta(dir, "host", buf);
+    }
+}
+
+/* Removes a session directory this thread built and then did not use, because
+ * another member of the group published its own first.
+ *
+ * By name, never by walking the directory. This runs inside an interposer, and
+ * a recursive delete driven by directory contents is precisely the thing that
+ * must never appear here by accident. Anything left behind is an empty session
+ * with no journal: it costs no retention slot and gc collects it. */
+static void discard_session(const char *dir)
+{
+    static const char *const names[] = {"cmd",  "pid",      "pgid",
+                                        "ttl",  "host",     "journalv", NULL};
+    char path[PATH_MAX];
+    REAL(unlink, int, const char *);
+    REAL(rmdir, int, const char *);
+    for (int i = 0; names[i]; i++)
+        if ((size_t)snprintf(path, sizeof path, "%s/%s", dir, names[i]) <
+            sizeof path)
+            real_unlink(path);
+    if ((size_t)snprintf(path, sizeof path, "%s/data", dir) < sizeof path)
+        real_rmdir(path);
+    real_rmdir(dir);
+}
+
+/* Resolves this process group's session directory into `out`, creating it if
+ * this is the group's first destructive call.
+ *
+ * The ordering is not the obvious one. mkdir of the session directory comes
+ * first and is the arbiter for id collisions between *unrelated* groups: two
+ * groups creating in the same microsecond would otherwise agree on one id and
+ * interleave their journals. The symlink then decides which member of *this*
+ * group won. */
+static int resolve_session(char *out)
+{
+    const char *data = data_dir();
+    if (!data)
+        return -1;
+    char key[KEY_MAX];
+    if (group_key(key) != 0)
+        return -1;
+
+    char groups[PATH_MAX], link[PATH_MAX];
+    if ((size_t)snprintf(groups, sizeof groups, "%s/groups", data) >= sizeof groups)
+        return -1;
+    if ((size_t)snprintf(link, sizeof link, "%s/%s", groups, key) >= sizeof link)
+        return -1;
+
+    REAL(mkdir, int, const char *, mode_t);
+    char sessions[PATH_MAX];
+    if ((size_t)snprintf(sessions, sizeof sessions, "%s/sessions", data) >=
+        sizeof sessions)
+        return -1;
+    real_mkdir(data, 0700);
+    real_mkdir(sessions, 0700);
+    real_mkdir(groups, 0700);
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+        char target[PATH_MAX];
+        ssize_t n = readlink(link, target, sizeof target - 1);
+        if (n > 0) {
+            target[n] = 0;
+            const char *slash = strrchr(target, '/');
+            const char *id = slash ? slash + 1 : target;
+            if ((size_t)snprintf(out, PATH_MAX, "%s/%s", sessions, id) >= PATH_MAX)
+                return -1;
+            if (own_real_dir(out))
+                return 0;
+            /* The session it names is gone -- reachable through
+             * `undo purge --force` on a live session. Without this the journal
+             * open lands in a directory that does not exist and every later
+             * record is lost with nothing printed. */
+            REAL(unlink, int, const char *);
+            real_unlink(link);
+            continue;
+        }
+
+        /* pick an id the same way session.Create does, so sessionID() accepts
+         * it and the orphan sweep can reclaim its store */
+        struct timespec ts;
+        char id[32], dir[PATH_MAX];
+        int made = 0;
+        for (int tries = 0; tries < 1000 && !made; tries++) {
+            if (clock_gettime(CLOCK_REALTIME, &ts) != 0)
+                return -1;
+            snprintf(id, sizeof id, "%lld%06ld", (long long)ts.tv_sec,
+                     (long)(ts.tv_nsec / 1000));
+            if ((size_t)snprintf(dir, sizeof dir, "%s/%s", sessions, id) >= sizeof dir)
+                return -1;
+            if (real_mkdir(dir, 0700) == 0)
+                made = 1;
+            else if (errno != EEXIST)
+                return -1;
+        }
+        if (!made)
+            return -1;
+
+        /* Everything the session needs, BEFORE the link that publishes it.
+         *
+         * A peer follows the link the instant it appears and starts saving
+         * into the directory it names. If data/ does not exist yet its backup
+         * fails while the real deletion still succeeds, so the file goes
+         * unprotected -- and the metadata a reader needs to judge liveness is
+         * missing too. Publishing a half-built session is the race; building
+         * it first is the fix. */
+        char data_sub[PATH_MAX];
+        if ((size_t)snprintf(data_sub, sizeof data_sub, "%s/data", dir) >=
+            sizeof data_sub) {
+            discard_session(dir);
+            return -1;
+        }
+        real_mkdir(data_sub, 0700);
+        /* The mkdir's own return says nothing useful -- EEXIST is the ordinary
+         * case when a peer got here first -- so what is checked is that a
+         * directory we own is there now. Publishing without it would hand
+         * every later call in this process group a session whose backups
+         * cannot be written, while their deletions succeed exactly as asked.
+         * One broken session would quietly unprotect the rest of the command. */
+        if (!own_real_dir(data_sub)) {
+            discard_session(dir);
+            return -1;
+        }
+        fill_session(dir, getpgrp());
+
+        /* ../sessions/<id>, not the bare id: a symlink target resolves
+         * relative to the link's own parent, so a bare id would resolve to
+         * groups/<id> -- a path that never exists. Every group link would be
+         * dangling, and the gc prune would delete the mapping of every live
+         * session on its first run. */
+        char rel[PATH_MAX];
+        if ((size_t)snprintf(rel, sizeof rel, "../sessions/%s", id) >= sizeof rel) {
+            discard_session(dir);
+            return -1;
+        }
+        if (symlink(rel, link) == 0) {
+            snprintf(out, PATH_MAX, "%s", dir);
+            return 0;
+        }
+        /* another member of our group published first; take theirs */
+        discard_session(dir);
+    }
+    return -1;
+}
+
+/* This process's session directory, cached.
+ *
+ * Thread-local like the journal descriptor and the store cache above: a
+ * process-wide table would need a lock, and taking a lock inside an interposer
+ * invites deadlock and leaves undefined state across fork().
+ *
+ * The key is re-derived on every call rather than cached, because it carries
+ * the age bucket: when the bucket rolls the key changes, and re-resolving is
+ * exactly what moves this process to the new session. The previous one is
+ * already retired by its own ttl and needs nothing done to it. */
+static __thread char lazy_dir[PATH_MAX];
+static __thread char lazy_key[KEY_MAX];
+
+static const char *lazy_session(void)
+{
+    /* An empty UNDO_ARM is unset, not armed. `env UNDO_ARM= ...` yields a
+     * non-NULL empty string, so a bare NULL test would arm on it -- and it
+     * would arm with no identity at all, which is the one state where neither
+     * the exclusion nor the detach test can run. Every other reader of this
+     * variable already treats empty as absent; this one must agree. */
+    const char *arm = getenv("UNDO_ARM");
+    if (!arm || !*arm)
+        return NULL;
+    if (armer_is_us())
+        return NULL;
+    char key[KEY_MAX];
+    if (group_key(key) != 0)
+        return NULL;
+    if (lazy_dir[0] && strcmp(lazy_key, key) == 0)
+        return lazy_dir;
+    char dir[PATH_MAX];
+    if (resolve_session(dir) != 0)
+        return NULL;
+    snprintf(lazy_dir, sizeof lazy_dir, "%s", dir);
+    snprintf(lazy_key, sizeof lazy_key, "%s", key);
+    return lazy_dir;
+}
+
 /* ---------- filesystem-local store placement ---------- */
 
 #define STORE_CACHE_SLOTS 8
@@ -681,16 +1008,7 @@ static const char *session_id(void)
     return (slash && slash[1]) ? slash + 1 : NULL;
 }
 
-/* True when `path` is a directory in its own right -- not a symlink to one --
- * belonging to the effective uid. lstat does not follow the final component,
- * so a symlink reports S_IFLNK and fails S_ISDIR. */
-static int own_real_dir(const char *path)
-{
-    struct stat st;
-    if (lstat(path, &st) != 0)
-        return 0;
-    return S_ISDIR(st.st_mode) && st.st_uid == geteuid();
-}
+/* own_real_dir moved up to the path helpers; see there. */
 
 /* Create <root>/.undo/<session-id>/ and return it in `out`.
  *

@@ -2322,7 +2322,48 @@ declaration above `session_dir`:
 static const char *lazy_session(void);
 ```
 
-`armed()` needs no change: it already tests `session_dir() != NULL`.
+**`armed()` DOES need changing, and the opposite of what this plan first said.**
+It used to read `!in_shim && session_dir() != NULL`, and `session_dir()` now
+creates. Since `armed()` runs on every interposed call including read-only
+opens, `cat` and `ls` would each mint a session directory, six metadata files
+and a group symlink while recording nothing -- destroying the "read-only tool
+calls cost nothing" property the design rests its metadata-traffic answer on.
+Caught by e2e case 42.
+
+Creation belongs where something is about to be written. `session_dir()` is
+already called only from those paths, so the fix is to take the test out of
+`armed()`:
+
+```c
+static int armed(void)
+{
+    if (in_shim)
+        return 0;
+    if (explicit_session() != NULL)
+        return 1;
+    const char *arm = getenv("UNDO_ARM");
+    if (!arm || !*arm)
+        return 0;
+    /* armer_is_us() reads /proc, too expensive on every interposed call, so
+     * its answer is cached against the process group it describes -- the only
+     * thing it depends on, and it changes only through setpgid/setsid. */
+    static __thread pid_t cached_pgid;
+    static __thread int cached_excluded;
+    pid_t pg = getpgrp();
+    if (pg != cached_pgid) {
+        cached_pgid = pg;
+        cached_excluded = armer_is_us();
+    }
+    return !cached_excluded;
+}
+```
+
+`armed()` must then move below `armer_is_us`, and `own_real_dir` must move up
+to the path helpers -- `resolve_session` calls it and it lived in the
+store-placement section below. Both are the same cross-task ordering class as
+`parse_ulong` in Task 4: four instances now, every one found by the compiler
+rather than by review, because the plan is reviewed per task and the file
+compiles as a whole.
 
 **Order matters in the file.** `explicit_session` and `session_dir` sit near
 the top, above `journal_fd`; `lazy_session` depends on `group_key`, which

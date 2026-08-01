@@ -643,3 +643,83 @@ UNDO_SID; a rollout would silently stop recording"
 
 echo
 echo "all cases passed"
+
+# arms a command the way `undo arm` will: environment only, no session
+run_agent() {
+    env UNDO_DATA_DIR="$UNDO_DATA_DIR" \
+        UNDO_ARM="$(arm_id)" \
+        LD_PRELOAD="$LIB" setsid bash -c "$*"
+    sleep 0.01
+}
+
+echo "== case 41: an agent tool call is captured with no shell hook at all"
+make_tree
+before=$(ls "$UNDO_DATA_DIR/sessions" | wc -l)
+run_agent "rm -rf $PLAY/docs"
+[[ ! -e $PLAY/docs ]] || fail "case 41: the rm did not run"
+after=$(ls "$UNDO_DATA_DIR/sessions" | wc -l)
+[[ $after -gt $before ]] || fail "case 41: no session was created"
+last=$(ls "$UNDO_DATA_DIR/sessions" | sort | tail -1)
+sess=$UNDO_DATA_DIR/sessions/$last
+[[ -s $sess/journal ]] || fail "case 41: nothing was journaled"
+[[ -s $sess/pgid ]] || fail "case 41: no pgid recorded"
+[[ -s $sess/ttl ]] || fail "case 41: no ttl recorded"
+grep -q 'rm -rf' "$sess/cmd" || fail "case 41: cmd did not capture the command line"
+"$UNDO" apply "$last" -y >/dev/null
+[[ -f $PLAY/docs/report.txt ]] || fail "case 41: the tree did not come back"
+
+echo "== case 42: a read-only tool call creates no session at all"
+before=$(ls "$UNDO_DATA_DIR/sessions" | wc -l)
+run_agent "cat $PLAY/top.txt >/dev/null && ls $PLAY >/dev/null"
+after=$(ls "$UNDO_DATA_DIR/sessions" | wc -l)
+[[ $after -eq $before ]] ||
+    fail "case 42: creation is lazy; a command that destroyed nothing made a session"
+
+echo "== case 43: the arming process group gets no session of its own"
+make_tree
+before=$(ls "$UNDO_DATA_DIR/sessions" | wc -l)
+# UNDO_ARM naming *this* process group, and the command runs in it
+env UNDO_DATA_DIR="$UNDO_DATA_DIR" \
+    UNDO_ARM="$(arm_id)" \
+    LD_PRELOAD="$LIB" bash -c "rm $PLAY/top.txt"
+[[ ! -e $PLAY/top.txt ]] || fail "case 43: the rm did not run"
+after=$(ls "$UNDO_DATA_DIR/sessions" | wc -l)
+[[ $after -eq $before ]] ||
+    fail "case 43: the armer's own group was journaled; an agent harness would \
+record its own housekeeping"
+
+echo "== case 44: concurrent members of one group agree on one complete session"
+# Repeated, because both failures this covers are races: a peer following the
+# rendezvous link into a session whose data/ does not exist yet, and two first
+# writers each concluding the other declared the integrity contract. One
+# iteration would pass by luck.
+for round in 1 2 3 4 5; do
+    make_tree
+    before=$(ls "$UNDO_DATA_DIR/sessions" | wc -l)
+    run_agent "rm $PLAY/docs/report.txt & rm $PLAY/docs/sub/note.txt & \
+               rm $PLAY/top.txt & wait"
+    after=$(ls "$UNDO_DATA_DIR/sessions" | wc -l)
+    [[ $((after - before)) -eq 1 ]] ||
+        fail "case 44 round $round: $((after - before)) sessions for one process group, want 1"
+    last=$(ls "$UNDO_DATA_DIR/sessions" | sort | tail -1)
+    sess=$UNDO_DATA_DIR/sessions/$last
+    [[ -d $sess/data ]] || fail "case 44 round $round: the session has no data/"
+    [[ -f $sess/journalv ]] ||
+        fail "case 44 round $round: no journalv; both first writers decided the \
+other had declared the integrity contract, and this session is unchecked forever"
+    [[ $(grep -c '^unlink' "$sess/journal") -eq 3 ]] ||
+        fail "case 44 round $round: all three deletions should be in the one session"
+    # nothing may have been lost to a half-built session
+    ! grep -q '^lost' "$sess/journal" ||
+        fail "case 44 round $round: a peer saved into a session that was not \
+finished being built, and the file it deleted is unprotected"
+    "$UNDO" apply "$last" -y >/dev/null
+done
+
+echo "== case 45: the shim never breaks the command, even with no writable store"
+make_tree
+env UNDO_DATA_DIR=/proc/nonexistent/store \
+    UNDO_ARM="1" LD_PRELOAD="$LIB" setsid bash -c "rm $PLAY/top.txt"
+rc=$?
+[[ $rc -eq 0 ]] || fail "case 45: an unwritable store changed the command's exit status"
+[[ ! -e $PLAY/top.txt ]] || fail "case 45: the rm did not run"
