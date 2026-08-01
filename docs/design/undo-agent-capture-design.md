@@ -203,10 +203,18 @@ Members of a group discover each other through an atomic symlink under
    does. **The mkdir is the arbiter for id collisions across unrelated groups**;
    without it two groups creating in the same microsecond would share one
    session and interleave their journals.
-3. `symlink(<id>, groups/<key>)`.
+3. `symlink("../sessions/<id>", groups/<key>)`.
 4. On success, finish setup. On `EEXIST`, another member of our own group won:
-   `rmdir` our unused session directory, `readlink` the key, and use the id it
-   names.
+   `rmdir` our unused session directory, `readlink` the key, take the basename
+   of what it returns, and use that id.
+
+**The target is `../sessions/<id>` and not the bare id, which is not a
+cosmetic choice.** A symlink target resolves relative to the link's *parent*,
+so a bare `<id>` at `groups/<key>` would resolve to `groups/<id>` — a path
+that never exists. Every group link would then be dangling, and the `undo gc`
+prune below would delete the mapping of every *live* session on its first run.
+Raised by the gate; the failure is total and silent, and the obvious
+implementation is the broken one.
 
 Symlink creation is atomic and is the classic primitive for exactly this on
 network filesystems. There is no polling and no leader election beyond picking
@@ -374,12 +382,52 @@ Short writes to a regular file arise from `ENOSPC` and `EDQUOT`, which is to
 say from ordinary quota exhaustion on shared storage — reachable, not
 theoretical.
 
-**Fix:** check the return, and on a short write emit a lone newline so the
-damaged record is self-contained and the next one starts clean. Deliberately
-*not* a retry of the remainder: a second write could interleave with another
-process in the same group, turning one damaged record into two.
+**The writer-side fix alone is not sufficient, and this is the important
+part.** Checking the return and emitting a lone terminating newline closes the
+single-writer case. Under *concurrent* writers in one process group it does
+not: the newline is a second `write()`, so another member can append a complete
+record between the short write and the newline. That record then merges with
+the damaged prefix and the corruption is exactly as before. Raised by the gate,
+and correct — concurrent writers in one group is not an exotic case, it is
+`make -j`, `xargs -P`, or any parallel test suite inside one tool call.
 
-**Concurrency answers itself structurally.** Parallel agent tool calls each get
+The deeper problem is that **every writer-side remedy asks a failing writer to
+perform more successful I/O at the moment I/O is failing.** The newline write
+can itself fail on the same quota that truncated the record.
+
+**So the guarantee is reader-side: every record carries a trailing integrity
+field.** The shim appends `~<16 hex digits>`, an FNV-1a hash of the encoded
+record, computed during the pass it already makes to percent-encode. The reader
+recomputes it over everything preceding the final tab and rejects any record
+that does not match.
+
+This is decisive against the merge because a merged line carries the *second*
+record's hash over the *first* record's prefix, so it can never validate. It
+also catches damage the writer never noticed — a truncated read, a partially
+replicated file — rather than only the case the writer detected.
+
+Three properties that make it safe to add:
+
+- **Additive, as the format requires.** It is a trailing field, and
+  `journal.Read` already tolerates trailing fields. Every field access in
+  `journal.go`, `restore.go` and `session.go` is bounds-guarded; none assumes
+  an exact field count. Verified, not assumed.
+- **Legacy records stay readable.** A record with no integrity field is
+  accepted as-is. The two cannot be confused: the marker requires a final field
+  that is exactly `~` followed by 16 hex digits, and no legacy final field can
+  take that form — path fields are absolute and contain `/`, mode fields are
+  three or four octal digits, method fields are `link`, `copy` or `none`, and
+  `lost` reasons are `unlink` or `write`.
+- **Rejection is not filtering.** A rejected record is corrupt, not merely
+  unrecognised. Journal indices are load-bearing — `restore.slot()` and the
+  interactive picker are keyed by position — so a rejected record must still
+  occupy its slot, marked unrestorable, rather than being dropped and shifting
+  every index after it.
+
+The newline-on-short-write stays as cheap containment for the single-writer
+case; it is no longer what the correctness rests on.
+
+**Concurrency otherwise answers itself structurally.** Parallel agent tool calls each get
 their own pgid, hence their own session, hence their own journal; they never
 share one. The only concurrent writers to a single journal are members of one
 process group, which by definition live on one node and so behind one network
@@ -452,6 +500,8 @@ is reported.
 | Stale group symlink, session gone | symlink unlinked, one retry | — |
 | `rmdir` of an unused session directory fails | empty session leaks, costs no retention slot | — |
 | Short journal write | record terminated, next record clean | — |
+| Record fails its integrity check | slot kept but marked unrestorable, never acted on | **yes, loudly** |
+| Record predates the integrity field | accepted as-is | — |
 | Long-lived group | one session per `UNDO_SESSION_MAX_AGE` | `undo list` |
 | Bun-based harness, in-process write | not captured at all | **documented limit** |
 
@@ -484,6 +534,16 @@ Beyond that:
   unwritable, every interposed call still returns the real syscall's result and
   the real `errno`.
 - **Journal short write:** a truncated record does not merge with the next one.
+- **Integrity field:** a hand-built journal in which a truncated record is
+  followed by a complete one — the concurrent-writer merge, constructed
+  directly rather than raced — is rejected rather than restored. This is the
+  case the writer-side newline cannot cover, so it is the one that must be
+  asserted.
+- **Legacy journals:** a journal with no integrity field on any record restores
+  exactly as it does today, and a mixed journal restores both kinds.
+- **Indices survive rejection:** a journal with one corrupt record in the middle
+  leaves every later record at the same slot number the interactive picker and
+  `restore.slot()` would have given it before.
 - **glibc floor** re-asserted by `objdump` after the shim change.
 
 ## Phasing
