@@ -718,11 +718,20 @@ statfield() { # statfield <pid|self> <n>
 # container with no job control, those are two different processes and pairing
 # them describes nothing at all. armer_is_us would never match and the
 # exclusion would silently stop working.
+#
+# Falls back to the static "1" exactly as cmdArm does, rather than failing.
+# A group whose leader has already exited has no /proc/<pgid>/stat, and
+# returning nothing would expand to UNDO_ARM= -- an empty value, which is a
+# third state neither the shim nor this harness should have to reason about.
 arm_id() {
     local pgid st
     pgid=$(statfield self 5)
-    st=$(statfield "$pgid" 22)
-    [[ -n $pgid && -n $st ]] || return 1
+    st=""
+    [[ -n $pgid ]] && st=$(statfield "$pgid" 22)
+    if [[ -z $pgid || -z $st ]]; then
+        printf '1\n'
+        return 0
+    fi
     printf '%s:%s\n' "$pgid" "$st"
 }
 ```
@@ -2075,7 +2084,13 @@ static __thread char lazy_key[KEY_MAX];
 
 static const char *lazy_session(void)
 {
-    if (!getenv("UNDO_ARM"))
+    /* An empty UNDO_ARM is unset, not armed. `env UNDO_ARM= ...` yields a
+     * non-NULL empty string, so a bare NULL test would arm on it -- and it
+     * would arm with no identity at all, which is the one state where neither
+     * the exclusion nor the detach test can run. Every other reader of this
+     * variable already treats empty as absent; this one must agree. */
+    const char *arm = getenv("UNDO_ARM");
+    if (!arm || !*arm)
         return NULL;
     if (armer_is_us())
         return NULL;
