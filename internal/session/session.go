@@ -556,6 +556,20 @@ func groupsDir() string {
 // session mid-creation. Removing a live one would be worse than leaving a
 // stale one: the group would create a second session while its first is still
 // being written.
+//
+// This is space reclamation, not a correctness mechanism, and the distinction
+// is what makes the race below acceptable. resolve_session already unlinks a
+// stale link and retries when it finds one naming a session that is gone, so
+// the shim heals this state without help.
+//
+// The race, raised by a review gate: between proving a link dangling and
+// removing it, the live group can unlink it and publish a new valid one under
+// the same name, and this removes that instead. It cannot be closed -- POSIX
+// has no compare-and-unlink, so any re-check has the same window -- and it is
+// reachable only after `purge --force` on a live session, with gc running at
+// that instant. The cost is one command's changes split across two sessions,
+// both listed and both restorable, against no way to prevent it. Accepted
+// deliberately; do not "fix" it with a second stat, which changes nothing.
 func pruneGroups() {
 	ents, err := os.ReadDir(groupsDir())
 	if err != nil {

@@ -2941,8 +2941,18 @@ git commit -m "gc: take the group links of sessions that are gone"
 
 - [ ] `test/in-container.sh make test` — C unit harness, all Go tests, every
       e2e case through 49
-- [ ] `test/in-container.sh --privileged test/multifs.sh` — the two-filesystem
-      harnesses
+- [ ] The multifs harnesses. **`test/multifs.sh` on its own runs only its four
+      setup checks** — it mounts the two tmpfs, exports FS_A/FS_B, and then runs
+      whatever sub-harness it is GIVEN as `$1`. Bare, it silently skips store
+      placement, the orphan sweep and cross-device restore, and still prints
+      "multifs harness ok". Run all three:
+      ```bash
+      test/in-container.sh --privileged bash -c '
+        make >/dev/null
+        for h in store gc restore; do test/multifs.sh test/multifs-$h.sh; done'
+      ```
+      These are the only coverage for store placement across filesystems, so
+      they matter most after any change to where sessions live.
 - [ ] `test/in-container.sh bash -c 'apt-get install -y -qq zsh >/dev/null && make all >/dev/null && bash test/hook-zsh.sh'` — the zsh hook still loads. zsh is not in the test
       image; without installing it this exits 127 rather than skipping.
 - [ ] Floor check from Global Constraints — still `GLIBC_2.34`
@@ -2953,6 +2963,19 @@ git commit -m "gc: take the group links of sessions that are gone"
       armed, with `UNDO_DATA_DIR` pointing at an unwritable path, and confirm
       the command's exit status and `errno` are untouched. This is the one
       property whose failure is unrecoverable.
+
+## A note on verification steps that cannot fail
+
+Two steps in this block were written so they could not do their job, and both
+looked like passes:
+
+- `test/hook-zsh.sh` in a container with no zsh exits 127, not "skipped".
+- `test/multifs.sh` with no argument runs its setup and prints "ok" while
+  testing none of the three things it exists for.
+
+Both were found by running them and reading the output, not by review. Before
+trusting any step here, check that it *can* execute and that it exercises what
+its wording claims — a step that cannot fail still gets ticked.
 
 ## Out of scope, deliberately
 
