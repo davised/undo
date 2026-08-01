@@ -610,7 +610,11 @@ static int armer_is_us(void)
  * armer_is_us() reads /proc, which is too expensive on every interposed call,
  * so its answer is cached against the process group it describes. The group is
  * the only thing the answer depends on, and it changes only through
- * setpgid/setsid -- rare, and the comparison below notices. */
+ * setpgid/setsid -- rare, and the comparison below notices.
+ *
+ * Keyed on UNDO_ARM as well as the group: a process that changes the variable
+ * without changing group would otherwise keep a stale answer, and be either
+ * silently disarmed or recording the armer's own housekeeping. */
 static int armed(void)
 {
     if (in_shim)
@@ -621,10 +625,13 @@ static int armed(void)
     if (!arm || !*arm)
         return 0;
     static __thread pid_t cached_pgid;
+    static __thread char cached_arm[64];
     static __thread int cached_excluded;
     pid_t pg = getpgrp();
-    if (pg != cached_pgid) {
+    if (pg != cached_pgid ||
+        strncmp(cached_arm, arm, sizeof cached_arm - 1) != 0) {
         cached_pgid = pg;
+        snprintf(cached_arm, sizeof cached_arm, "%s", arm);
         cached_excluded = armer_is_us();
     }
     return !cached_excluded;
@@ -643,19 +650,20 @@ static const char *data_dir(void)
     return d;
 }
 
-/* Writes body to path, creating it. Best effort, like everything here. */
-static void write_meta(const char *dir, const char *name, const char *body)
+/* Writes body to path, creating it. Returns 0 on success, -1 on failure. */
+static int write_meta(const char *dir, const char *name, const char *body)
 {
     char path[PATH_MAX];
     if ((size_t)snprintf(path, sizeof path, "%s/%s", dir, name) >= sizeof path)
-        return;
+        return -1;
     REAL(open, int, const char *, int, ...);
     int fd = real_open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd < 0)
-        return;
-    ssize_t n = write(fd, body, strlen(body));
-    (void)n;
+        return -1;
+    size_t len = strlen(body);
+    ssize_t n = write(fd, body, len);
     close(fd);
+    return (n >= 0 && (size_t)n == len) ? 0 : -1;
 }
 
 /* The command line of the group leader, which for an agent tool call is
@@ -692,35 +700,38 @@ static void group_cmdline(pid_t pgid, char *out, size_t cap)
 
 /* Fills the metadata of a session directory. Every value describes the group
  * rather than the writer, so two members racing here write byte-identical
- * content and the race is invisible. */
-static void fill_session(const char *dir, pid_t pgid)
+ * content and the race is invisible. Returns 0 on success, -1 if liveness
+ * metadata could not be fully written. */
+static int fill_session(const char *dir, pid_t pgid)
 {
     char buf[PATH_MAX];
 
+    /* cosmetic: a missing cmd costs a label in undo list, nothing more */
     group_cmdline(pgid, buf, sizeof buf);
     write_meta(dir, "cmd", buf);
 
-    /* pid and pgid are the SAME number here, and must stay that way.
-     * Both name the group leader, and Session.probe depends on it: when
-     * pgid is 1 it cannot use kill(-1, 0) and falls back to the pid,
-     * which is safe only because pgid 1 implies pid 1 -- init, which
-     * cannot exit while its children are still running. Recording the
-     * creating process's pid instead would put a dead leader pid beside
-     * an unprobeable group and make a running command collectible. A
-     * review gate raised that scenario; this is what keeps it
-     * hypothetical. */
+    /* pid, pgid and ttl decide liveness. Published without them, the session
+     * loads with Pgid 0 and Pid 0, probe() answers false, and gc removes the
+     * backups of a command that is still running. If they cannot be written
+     * this candidate must not be published at all -- leaving the operation
+     * uncaptured is recoverable, deleting a live command's backups is not. */
     snprintf(buf, sizeof buf, "%d\n", (int)pgid);
-    write_meta(dir, "pid", buf); /* an older undo probes this */
-    write_meta(dir, "pgid", buf);
+    if (write_meta(dir, "pid", buf) != 0 || write_meta(dir, "pgid", buf) != 0)
+        return -1;
 
     snprintf(buf, sizeof buf, "%lld\n", (long long)bucket_ttl());
-    write_meta(dir, "ttl", buf);
+    if (write_meta(dir, "ttl", buf) != 0)
+        return -1;
 
+    /* host may legitimately be absent: host_parts fails when the boot id or
+     * the namespace link cannot be read, and Live resolves an empty origin by
+     * probing, which is the right answer. Best effort. */
     char name[HOST_FIELD], boot[HOST_FIELD], pidns[HOST_FIELD];
     if (host_parts(name, boot, pidns) == 0) {
         snprintf(buf, sizeof buf, "%s\t%s\t%s\n", name, boot, pidns);
         write_meta(dir, "host", buf);
     }
+    return 0;
 }
 
 /* Removes a session directory this thread built and then did not use, because
@@ -777,6 +788,15 @@ static int resolve_session(char *out)
     real_mkdir(data, 0700);
     real_mkdir(sessions, 0700);
     real_mkdir(groups, 0700);
+
+    /* EEXIST is the ordinary case, so the mkdir returns say nothing; what
+     * matters is what is actually there. These names are predictable, and on
+     * shared storage another user can pre-create them as symlinks -- after
+     * which sessions, metadata and rendezvous links all land wherever the link
+     * points, and discard_session removes files there. ensure_store guards the
+     * per-filesystem store for the same reason. */
+    if (!own_real_dir(data) || !own_real_dir(sessions) || !own_real_dir(groups))
+        return -1;
 
     for (int attempt = 0; attempt < 2; attempt++) {
         char target[PATH_MAX];
@@ -843,7 +863,10 @@ static int resolve_session(char *out)
             discard_session(dir);
             return -1;
         }
-        fill_session(dir, getpgrp());
+        if (fill_session(dir, getpgrp()) != 0) {
+            discard_session(dir);
+            return -1;
+        }
 
         /* ../sessions/<id>, not the bare id: a symlink target resolves
          * relative to the link's own parent, so a bare id would resolve to

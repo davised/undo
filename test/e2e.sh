@@ -723,3 +723,20 @@ env UNDO_DATA_DIR=/proc/nonexistent/store \
 rc=$?
 [[ $rc -eq 0 ]] || fail "case 45: an unwritable store changed the command's exit status"
 [[ ! -e $PLAY/top.txt ]] || fail "case 45: the rm did not run"
+
+echo "== case 46: a symlinked sessions directory is refused, not written through"
+# The names under UNDO_DATA_DIR are predictable, so on shared storage another
+# user can pre-create one as a symlink. Writing through it would put sessions,
+# metadata and rendezvous links outside the store -- and discard_session would
+# then remove files there. resolve_session requires a real directory it owns.
+make_tree
+symstore=$WORK/symstore
+elsewhere=$WORK/elsewhere
+rm -rf "$symstore" "$elsewhere"
+mkdir -p "$symstore" "$elsewhere"
+ln -s "$elsewhere" "$symstore/sessions"
+env UNDO_DATA_DIR="$symstore" UNDO_ARM="$(arm_id)" LD_PRELOAD="$LIB" \
+    setsid bash -c "rm $PLAY/top.txt"
+[[ ! -e $PLAY/top.txt ]] || fail "case 46: the rm did not run"
+[[ -z $(ls -A "$elsewhere") ]] ||
+    fail "case 46: the shim wrote through a symlinked sessions directory: $(ls -A "$elsewhere")"

@@ -2032,19 +2032,22 @@ static const char *data_dir(void)
     return d;
 }
 
-/* Writes body to path, creating it. Best effort, like everything here. */
-static void write_meta(const char *dir, const char *name, const char *body)
+/* Writes body to path, creating it. Reports whether it landed: some of what
+ * fill_session writes decides liveness, and best-effort is the wrong policy
+ * for those. */
+static int write_meta(const char *dir, const char *name, const char *body)
 {
     char path[PATH_MAX];
     if ((size_t)snprintf(path, sizeof path, "%s/%s", dir, name) >= sizeof path)
-        return;
+        return -1;
     REAL(open, int, const char *, int, ...);
     int fd = real_open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd < 0)
-        return;
-    ssize_t n = write(fd, body, strlen(body));
-    (void)n;
+        return -1;
+    size_t len = strlen(body);
+    ssize_t n = write(fd, body, len);
     close(fd);
+    return (n >= 0 && (size_t)n == len) ? 0 : -1;
 }
 
 /* The command line of the group leader, which for an agent tool call is
@@ -2166,6 +2169,15 @@ static int resolve_session(char *out)
     real_mkdir(data, 0700);
     real_mkdir(sessions, 0700);
     real_mkdir(groups, 0700);
+    /* EEXIST is the ordinary case, so those returns say nothing; what matters
+     * is what is actually there. These names are predictable, and on shared
+     * storage another user can pre-create one as a symlink -- after which
+     * sessions, metadata and rendezvous links all land wherever it points, and
+     * discard_session removes files there. ensure_store guards the
+     * per-filesystem store for exactly this reason; the same reasoning applies
+     * here and was missed. Raised by the gate, pinned by e2e case 46. */
+    if (!own_real_dir(data) || !own_real_dir(sessions) || !own_real_dir(groups))
+        return -1;
 
     for (int attempt = 0; attempt < 2; attempt++) {
         char target[PATH_MAX];
@@ -2232,7 +2244,14 @@ static int resolve_session(char *out)
             discard_session(dir);
             return -1;
         }
-        fill_session(dir, getpgrp());
+        /* A session published without pid, pgid and ttl loads with Pgid 0 and
+         * Pid 0, probe() answers false, and gc removes the backups of a
+         * command that is still running. Leaving the operation uncaptured is
+         * recoverable; that is not. */
+        if (fill_session(dir, getpgrp()) != 0) {
+            discard_session(dir);
+            return -1;
+        }
 
         /* ../sessions/<id>, not the bare id: a symlink target resolves
          * relative to the link's own parent, so a bare id would resolve to
