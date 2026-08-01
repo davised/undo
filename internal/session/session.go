@@ -13,6 +13,11 @@
 //	           boot id and pid namespace, tab separated. Homes are shared
 //	           across nodes, so a pid alone does not say whether the command
 //	           is still running; see Live.
+//	pgid     - the process group the command ran in, when the shim created the
+//	           session. The group is what is alive; the leader may exit while a
+//	           child keeps writing. See Live.
+//	ttl      - unix seconds at which this session stops being presumed to be
+//	           running. Unlike a pid it is meaningful from any node.
 package session
 
 import (
@@ -39,48 +44,64 @@ type Session struct {
 	Done     bool      // the command finished (done marker present)
 	Pid      int       // shell or runner pid, 0 for pre-lock sessions
 	Origin   string    // where its pid is meaningful, empty for older sessions
+	Pgid     int       // process group, 0 when none was recorded
+	TTL      time.Time // when this session stops being presumed live, zero for none
 	Entries  []journal.Entry
 }
 
 // Live reports whether the session's command may still be running.
 //
-// A pid is only meaningful within the kernel instance and namespace that
-// issued it, and homes are shared across nodes, so the local probe is trusted
-// only when the origin matches. A session from elsewhere cannot be probed at
-// all: it is treated as running until it outlives foreignGrace, because
-// deleting a running command's backups destroys data while keeping a finished
-// session merely wastes space.
+// The order matters and is not arbitrary:
 //
-// Sessions written before origins were recorded have none, and keep the old
-// pid-probe behaviour so a rollout does not strand what is already on disk.
+//  1. A done marker is conclusive.
+//  2. A recorded ttl is authoritative from any node. Unlike a pid it names an
+//     absolute instant, so it means the same thing read from anywhere -- which
+//     is what retires a rolled bucket even when gc only ever runs elsewhere,
+//     and what stops a long-lived process group from holding one session that
+//     nothing can ever collect.
+//  3. A session from another origin cannot be probed at all. Inside its ttl it
+//     is presumed running; with no ttl it falls back to the foreign grace,
+//     exactly as before.
+//  4. Otherwise probe, the group when one was recorded.
 func (s *Session) Live() bool {
 	if s.Done {
 		return false
 	}
-	// The pid is not consulted for a session from elsewhere -- not even to
-	// notice it is missing. load turns an absent, truncated or unparsable pid
-	// file into zero, and on a store shared between nodes that is an ordinary
-	// sight rather than an error: a session whose creator is still writing it.
-	// Checking Pid <= 0 first would call those finished and collect them.
-	//
+	if !s.TTL.IsZero() && time.Now().After(s.TTL.Add(ttlSkew)) {
+		return false
+	}
 	// An empty local identity means we could not establish which kernel
-	// instance we are, so nothing can be classified. Neither signal is sound
-	// alone there -- the grace alone would let a local running command be
-	// purged once it aged out, and the probe alone would collect a foreign one
-	// -- so a session is finished only when both agree it is.
+	// instance we are, so nothing can be classified and neither signal is
+	// sound alone.
 	local := thisHost()
 	if local == "" {
 		return s.probe() || s.withinGrace()
 	}
 	if s.Origin != "" && s.Origin != local {
+		if !s.TTL.IsZero() {
+			return true // inside its ttl, and step 2 already ruled out past it
+		}
 		return s.withinGrace()
 	}
 	return s.probe()
 }
 
-// probe asks the kernel whether this session's pid is still around. Only
+// probe asks the kernel whether this session's creator is still around. Only
 // meaningful for a session issued by this kernel instance.
+//
+// A process group when one was recorded: the group is what the session belongs
+// to. Probing the leader alone is wrong the moment the leader exits while a
+// child keeps writing, and being wrong there means gc deletes the backups of a
+// command that is still running.
+//
+// The Pgid > 1 guard is load-bearing, not defensive. kill(-1, 0) is the "every
+// process you may signal" form; it succeeds always, so a session recording
+// pgid 1 would read live forever and nothing could ever collect it.
 func (s *Session) probe() bool {
+	if s.Pgid > 1 {
+		err := syscall.Kill(-s.Pgid, 0)
+		return err == nil || err == syscall.EPERM
+	}
 	if s.Pid <= 0 {
 		return false
 	}
@@ -107,6 +128,11 @@ func (s *Session) withinGrace() bool {
 // the floor is what stops a mistuned grace from turning ordinary skew into
 // data loss.
 const minForeignGrace = 15 * time.Minute
+
+// ttlSkew allows for the ttl having been written by one node's clock and read
+// by another's. Retiring a session early does not lose the command's data, but
+// it does lose the ability to undo it, so the allowance errs long.
+const ttlSkew = 5 * time.Minute
 
 // maxGraceSeconds is the largest grace that fits in a time.Duration, which
 // counts nanoseconds in an int64 -- about 292 years.
@@ -225,6 +251,17 @@ func load(dir string) (*Session, error) {
 	}
 	if b, err := os.ReadFile(filepath.Join(dir, "host")); err == nil {
 		s.Origin = strings.TrimSpace(string(b))
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "pgid")); err == nil {
+		s.Pgid, _ = strconv.Atoi(strings.TrimSpace(string(b)))
+	}
+	// Unix seconds rather than a formatted timestamp: the shim writes this,
+	// and formatting a time in C costs code and a symbol it needs for nothing
+	// else.
+	if b, err := os.ReadFile(filepath.Join(dir, "ttl")); err == nil {
+		if n, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64); err == nil && n > 0 {
+			s.TTL = time.Unix(n, 0)
+		}
 	}
 	entries, err := journal.Read(filepath.Join(dir, "journal"))
 	if err != nil {

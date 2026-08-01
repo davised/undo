@@ -882,13 +882,37 @@ func shimSession(t *testing.T, pgid int, ttl time.Time) *Session {
 	return got
 }
 
+// liveGroup starts a helper process in a process group of its own and returns
+// that group's id.
+//
+// A test cannot use its own process group for this. Under `make test` in a
+// container there is no job control and everything shares pgid 1 -- measured,
+// not assumed -- which is precisely the value probe() must refuse to hand to
+// kill(-pgid, 0). A test written with syscall.Getpgrp() therefore exercises
+// the pid path it was meant to avoid, and fails.
+//
+// Setpgid makes the child a group leader, so its pid is also its pgid.
+func liveGroup(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command("sleep", "60")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start a helper process: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+	return cmd.Process.Pid
+}
+
 // The defect a leader-pid probe reintroduces: the group leader exits while a
 // child keeps writing, the probe says finished, and gc deletes the backups of
 // a command that is still running.
 func TestLiveProbesTheGroupNotTheLeader(t *testing.T) {
 	t.Setenv("UNDO_DATA_DIR", t.TempDir())
 	// our own process group: certainly alive, and its leader may not be us
-	s := shimSession(t, syscall.Getpgrp(), time.Now().Add(time.Hour))
+	s := shimSession(t, liveGroup(t), time.Now().Add(time.Hour))
 	// a leader pid that is not running, as if the leader had already exited
 	if err := os.WriteFile(filepath.Join(s.Dir, "pid"), []byte("2147483647\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -927,7 +951,7 @@ func TestLiveDoesNotProbeGroupOneAsAWildcard(t *testing.T) {
 // gc can never collect it.
 func TestLiveRetiresASessionPastItsTTL(t *testing.T) {
 	t.Setenv("UNDO_DATA_DIR", t.TempDir())
-	s := shimSession(t, syscall.Getpgrp(), time.Now().Add(-time.Hour))
+	s := shimSession(t, liveGroup(t), time.Now().Add(-time.Hour))
 	if s.Live() {
 		t.Error("a session past its ttl read as live even though its group is " +
 			"still running; a long-lived process would pin it forever")
@@ -938,7 +962,7 @@ func TestLiveRetiresASessionPastItsTTL(t *testing.T) {
 // another's. Just past the instant is not past it.
 func TestLiveHonoursTheSkewAllowance(t *testing.T) {
 	t.Setenv("UNDO_DATA_DIR", t.TempDir())
-	s := shimSession(t, syscall.Getpgrp(), time.Now().Add(-time.Minute))
+	s := shimSession(t, liveGroup(t), time.Now().Add(-time.Minute))
 	if !s.Live() {
 		t.Error("a session one minute past its ttl was retired; clock skew " +
 			"between nodes would collect commands that just started")
@@ -1004,7 +1028,16 @@ func TestLiveWithoutPgidOrTTLIsUnchanged(t *testing.T) {
 }
 ```
 
-Add `"syscall"` to the test file's imports if not already present.
+Add `"os/exec"` and `"syscall"` to the test file's imports if not already
+present.
+
+**Do not reach for `syscall.Getpgrp()` as "a group that is certainly alive".**
+Found during execution: under `make test` in a container there is no job
+control and every process shares pgid 1, which is exactly the value `probe()`
+refuses to pass to `kill(-1, 0)`. A test written that way silently exercises
+the pid path instead of the group path. Note that Step 5's mutation check
+would NOT have caught this: it confirms a test can fail, not that its setup
+means what you think it does.
 
 - [ ] **Step 2: Run it to make sure it fails**
 

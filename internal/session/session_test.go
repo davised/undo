@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -1196,5 +1197,172 @@ func TestGCSparesAYoungSessionThatHasRecordedNothingYet(t *testing.T) {
 	}
 	if _, err := os.Stat(starting.Dir); err != nil {
 		t.Error("gc deleted a session that was still being set up")
+	}
+}
+
+// shimSession builds a session as the shim will write one: a recorded process
+// group and a ttl, with our own origin so the local path is exercised.
+func shimSession(t *testing.T, pgid int, ttl time.Time) *Session {
+	t.Helper()
+	s, err := Create("rm -rf x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.Dir, "pgid"),
+		[]byte(strconv.Itoa(pgid)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.Dir, "ttl"),
+		[]byte(strconv.FormatInt(ttl.Unix(), 10)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := load(s.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+// liveGroup starts a helper process in a process group of its own and returns
+// that group's id.
+//
+// A test cannot use its own process group for this. Under `make test` in a
+// container there is no job control and everything shares pgid 1 -- which is
+// precisely the value probe() must refuse to hand to kill(-pgid, 0), so a test
+// written that way exercises the pid path it was meant to avoid.
+//
+// Setpgid makes the child a group leader, so its pid is also its pgid.
+func liveGroup(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command("sleep", "60")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start a helper process: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+	return cmd.Process.Pid
+}
+
+// The defect a leader-pid probe reintroduces: the group leader exits while a
+// child keeps writing, the probe says finished, and gc deletes the backups of
+// a command that is still running.
+func TestLiveProbesTheGroupNotTheLeader(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	// our own process group: certainly alive, and its leader may not be us
+	s := shimSession(t, liveGroup(t), time.Now().Add(time.Hour))
+	// a leader pid that is not running, as if the leader had already exited
+	if err := os.WriteFile(filepath.Join(s.Dir, "pid"), []byte("2147483647\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := load(s.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.Live() {
+		t.Error("a session whose group is alive read as finished because its " +
+			"recorded leader had exited; gc would delete a running command's backups")
+	}
+}
+
+// kill(-1, 0) is the "every process you may signal" form: it succeeds always.
+// A session recording pgid 1 -- a container with no job control -- must not be
+// probed that way, or it is pinned live forever and nothing can collect it.
+func TestLiveDoesNotProbeGroupOneAsAWildcard(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	s := shimSession(t, 1, time.Now().Add(time.Hour))
+	if err := os.WriteFile(filepath.Join(s.Dir, "pid"), []byte("2147483647\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := load(s.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Live() {
+		t.Error("pgid 1 was probed as kill(-1, 0), which always succeeds; the " +
+			"session is now uncollectable")
+	}
+}
+
+// A rolled bucket is retired by its own ttl, with nobody having written a done
+// marker. Without this a daemon holds one session whose group never dies, and
+// gc can never collect it.
+func TestLiveRetiresASessionPastItsTTL(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	s := shimSession(t, liveGroup(t), time.Now().Add(-time.Hour))
+	if s.Live() {
+		t.Error("a session past its ttl read as live even though its group is " +
+			"still running; a long-lived process would pin it forever")
+	}
+}
+
+// The skew allowance exists because the ttl is one node's clock read from
+// another's. Just past the instant is not past it.
+func TestLiveHonoursTheSkewAllowance(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	s := shimSession(t, liveGroup(t), time.Now().Add(-time.Minute))
+	if !s.Live() {
+		t.Error("a session one minute past its ttl was retired; clock skew " +
+			"between nodes would collect commands that just started")
+	}
+}
+
+// ttl is authoritative from any node, unlike a pid. Otherwise a foreign
+// session is held for the whole foreign grace and the bound does not work
+// wherever gc happens to run.
+func TestLiveRetiresAForeignSessionPastItsTTL(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	s := shimSession(t, 2147483647, time.Now().Add(-time.Hour))
+	if err := os.WriteFile(filepath.Join(s.Dir, "host"),
+		[]byte("othernode\tnot-our-boot-id\tpid:[1]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := load(s.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Live() {
+		t.Error("a foreign session past its ttl was held by the foreign grace; " +
+			"the long-lived-group bound then depends on which node runs gc")
+	}
+}
+
+// A foreign session inside its ttl is presumed running, and the ttl is a
+// tighter bound than the week-long grace.
+func TestLiveHoldsAForeignSessionInsideItsTTL(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	s := shimSession(t, 2147483647, time.Now().Add(time.Hour))
+	if err := os.WriteFile(filepath.Join(s.Dir, "host"),
+		[]byte("othernode\tnot-our-boot-id\tpid:[1]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := load(s.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.Live() {
+		t.Error("a foreign session inside its ttl was called finished")
+	}
+}
+
+// Sessions written before this change have neither file and must keep the old
+// behaviour exactly, or a rollout strands what is already on disk.
+func TestLiveWithoutPgidOrTTLIsUnchanged(t *testing.T) {
+	t.Setenv("UNDO_DATA_DIR", t.TempDir())
+	s, err := Create("rm x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Pgid != 0 || !s.TTL.IsZero() {
+		t.Fatalf("setup: want no pgid and no ttl, got %d %v", s.Pgid, s.TTL)
+	}
+	got, err := load(s.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Live() {
+		t.Error("our own running pid stopped reading as live")
 	}
 }
