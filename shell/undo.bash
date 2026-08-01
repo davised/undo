@@ -41,8 +41,11 @@ fi
 # A session inherited across setsid is not ours. We are about to overwrite
 # UNDO_SID with our own sid, which would re-authorise it for the rest of
 # startup, so it goes first. Only on disagreement: unset UNDO_SID means no
-# reference, and the shim honours UNDO_SESSION in that case by design.
-if [[ -n ${UNDO_SESSION-} && -n ${UNDO_SID-} && ${UNDO_SID-} != "$_undo_sid" ]]; then
+# reference, and the shim honours UNDO_SESSION in that case by design. The
+# same applies when we could not read our own sid: unknown means do not
+# act, or a nested shell sharing its parent's session is disarmed for the
+# whole of startup.
+if [[ -n $_undo_sid && -n ${UNDO_SESSION-} && -n ${UNDO_SID-} && ${UNDO_SID-} != "$_undo_sid" ]]; then
     unset UNDO_SESSION
 fi
 [[ -n $_undo_sid ]] && export UNDO_SID=$_undo_sid

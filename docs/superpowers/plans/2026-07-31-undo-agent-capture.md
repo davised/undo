@@ -1402,11 +1402,24 @@ In `shell/undo.bash` and `shell/undo.zsh`, immediately before the
 # A session inherited across setsid is not ours. We are about to overwrite
 # UNDO_SID with our own sid, which would re-authorise it for the rest of
 # startup, so it goes first. Only on disagreement: unset UNDO_SID means no
-# reference, and the shim honours UNDO_SESSION in that case by design.
-if [[ -n ${UNDO_SESSION-} && -n ${UNDO_SID-} && ${UNDO_SID-} != "$_undo_sid" ]]; then
+# reference, and the shim honours UNDO_SESSION in that case by design. The
+# same applies when we could not read our own sid: unknown means do not
+# act, or a nested shell sharing its parent's session is disarmed for the
+# whole of startup.
+if [[ -n $_undo_sid && -n ${UNDO_SESSION-} && -n ${UNDO_SID-} && ${UNDO_SID-} != "$_undo_sid" ]]; then
     unset UNDO_SESSION
 fi
 ```
+
+
+**An unreadable input is not a mismatch.** The `-n $_undo_sid` term is the
+whole point of that first condition: without it, a shell that cannot read
+`/proc/self/stat` compares any inherited `UNDO_SID` against the empty string,
+finds them unequal, and disarms a session it had no evidence was stale. The
+shim resolves the same doubt the other way -- unset `UNDO_SID` means honour
+`UNDO_SESSION` -- and the two must agree or they disagree about the same
+uncertainty. `shell/undo.fish` needs no equivalent because its guard already
+sits inside the block that runs only when the stat file parsed.
 
 In `shell/undo.fish`, immediately before `set -gx UNDO_SID $_undo_stat[6]`:
 
