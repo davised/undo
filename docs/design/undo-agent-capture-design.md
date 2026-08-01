@@ -455,10 +455,31 @@ Three properties that make it safe to add:
   "`journalv` could not be written at all", which is a creation-time failure
   and degrades to today's behaviour rather than below it.
 
-  Consequence worth stating: a journal that somehow mixes records from an old
-  and a new shim — two members of one group with different shim builds — has
-  `journalv`, so the old shim's records fail validation and are rejected.
-  Over-strict, and closed in the safe direction.
+  Consequence worth stating, and it is sharper than "somehow": a journal that
+  mixes records from an old and a new shim has `journalv` whenever the *new*
+  one created it, so the old one's unstamped records fail validation and are
+  rejected.
+
+  That ordering is reachable. With `UNDO_CAPTURE_SHELL=1` a shell keeps its
+  `libundo.so` mapped for its whole life, so replacing the library in place and
+  then running `rm a; echo b > c` has the external command load the new shim
+  and create the journal, while the builtin redirection is handled by the old
+  shim still mapped in that shell. The same shape reaches a long-lived armed
+  process that shares a group with freshly exec'd children.
+
+  **It is accepted rather than fixed, because it cannot be fixed from the
+  writer and the reader-side fix is worse.** A writer cannot detect that a
+  differently-versioned writer shares its session — there is nothing to test.
+  And accepting unstamped records inside a versioned journal is precisely the
+  downgrade hole this file rejects two paragraphs above: a record truncated
+  before its integrity field is unstamped too, so the leniency that admits an
+  old shim's records also admits a damaged one.
+
+  The two errors are not symmetric. This one fails closed — a restorable change
+  is reported as unrestorable, which is visible and recoverable by rerunning
+  the command's effects. The alternative fails open: the wrong backup written
+  to the wrong path with nothing said. Raised by the gate; adjudicated, not
+  applied.
 - **Old readers are unaffected.** The field is trailing and `journal.Read`
   already tolerates trailing fields, so an older `undo` binary reading a newer
   journal ignores both the field and `journalv` and behaves exactly as it does

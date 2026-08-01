@@ -765,11 +765,17 @@ func SweepOrphans() (int, error) {
 
 // Unprotected counts the entries this session cannot restore.
 //
-// Three journal states land here, all of them already recorded by the shim: a
-// `lost` record, meaning no backup could be taken at all; a backup that
-// existed and was discarded when its store was destroyed; and a rename whose
-// overwritten target could not be saved. They reduce to one rule -- a "-"
-// backup whose method is anything other than "none".
+// Three of them are recorded by the shim and reduce to one rule -- a "-"
+// backup whose method is anything other than "none": a `lost` record, meaning
+// no backup could be taken at all; a backup that existed and was discarded
+// when its store was destroyed; and a rename whose overwritten target could
+// not be saved.
+//
+// A fourth is different in kind and is checked separately: a record that
+// failed its integrity check. That is damage to the journal rather than to a
+// backup, it is found by the reader rather than recorded by the shim, and the
+// backup it names may be perfectly intact. Corrupted counts that subset,
+// because the two cannot honestly be reported to the user as one thing.
 //
 // The method has to be consulted rather than just testing for "-", because
 // `rename old new - none` is a rename that overwrote nothing, needed no
@@ -788,6 +794,19 @@ func (s *Session) Unprotected() int {
 			continue
 		}
 		if e.Backup() == "-" && e.Method() != "none" {
+			n++
+		}
+	}
+	return n
+}
+
+// Corrupted counts the entries whose journal record failed its integrity
+// check. A subset of Unprotected: the change cannot be restored either way,
+// but the reason is different and the two must not be reported as one.
+func (s *Session) Corrupted() int {
+	n := 0
+	for _, e := range s.Entries {
+		if e.Corrupt {
 			n++
 		}
 	}

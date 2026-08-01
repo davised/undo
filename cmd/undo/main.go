@@ -200,10 +200,15 @@ func previewSession(s *session.Session, full bool) {
 	}
 	// Last, so it sits directly above the "revert this?" prompt in cmdApply:
 	// the point is that the user reads it while deciding, not afterwards.
-	if n := s.Unprotected(); n > 0 {
+	if n := s.Unprotected() - s.Corrupted(); n > 0 {
 		fmt.Printf("\n  warning: %d change(s) cannot be restored - "+
 			"the backup was too large to save, or was discarded when its "+
 			"store was removed\n", n)
+	}
+	if n := s.Corrupted(); n > 0 {
+		fmt.Printf("\n  warning: %d journal record(s) failed an integrity "+
+			"check and will not be applied - the journal was damaged, most "+
+			"likely by a write that ran out of space or quota\n", n)
 	}
 }
 
