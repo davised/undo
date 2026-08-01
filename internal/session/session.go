@@ -779,6 +779,10 @@ func SweepOrphans() (int, error) {
 func (s *Session) Unprotected() int {
 	n := 0
 	for _, e := range s.Entries {
+		if e.Corrupt {
+			n++
+			continue
+		}
 		if e.Op == journal.OpLost {
 			n++
 			continue

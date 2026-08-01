@@ -250,6 +250,14 @@ func Run(s *session.Session, dir Direction, opts Options) (*Result, error) {
 		skip := func(why string) {
 			res.Skipped = append(res.Skipped, e.Describe()+": "+why)
 		}
+		// A corrupt record's fields are whatever survived the damage. Acting on
+		// them means restoring the wrong backup over the wrong path, silently,
+		// which is the failure the integrity field exists to prevent. The slot
+		// is still consumed: slot() is keyed by position.
+		if e.Corrupt {
+			skip("record failed its integrity check")
+			continue
+		}
 		act := func() bool {
 			if opts.DryRun {
 				res.Actions = append(res.Actions, "would "+verb+": "+e.Describe())

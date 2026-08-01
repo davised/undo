@@ -8,6 +8,8 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -27,8 +29,9 @@ const (
 )
 
 type Entry struct {
-	Op     string
-	Fields []string
+	Op      string
+	Fields  []string
+	Corrupt bool // failed its integrity check; keeps its slot, never acted on
 }
 
 // backupField returns the index of e's backup path field, or -1 if the op
@@ -154,6 +157,96 @@ func decode(s string) string {
 	return b.String()
 }
 
+// integrityLen is the width of the trailing integrity field: '~' and sixteen
+// hex digits.
+const integrityLen = 17
+
+// versionFile sits beside a journal and declares that every record in it
+// carries an integrity field.
+//
+// Per journal rather than per record, and that is the whole point. Inferring
+// it -- "no trailing marker means this record predates the field" -- accepts a
+// record that a short write truncated before its field, which is precisely the
+// corruption the field exists to catch. A truncated record cannot erase this
+// file: it is written once at session setup, not per record.
+const versionFile = "journalv"
+
+// fnv1a is the 64-bit FNV-1a the shim writes over each encoded record.
+//
+// Non-cryptographic on purpose: this detects a truncated record and the
+// concatenation of two records, not tampering. An attacker who can write the
+// journal can write anything in it.
+//
+// The offset basis is 14695981039346656037, the real FNV-1a 64 constant. Do
+// not copy it from the shim's path_hash, which uses 1469598103934665603 -- one
+// digit short, harmless for a hash table's slot index and wrong here, and a
+// mismatch means every record the shim writes is rejected as corrupt.
+func fnv1a(s string) uint64 {
+	h := uint64(14695981039346656037)
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= 1099511628211
+	}
+	return h
+}
+
+// validIntegrity reports whether field is the integrity field for body.
+func validIntegrity(field, body string) bool {
+	if len(field) != integrityLen || field[0] != '~' {
+		return false
+	}
+	want, err := strconv.ParseUint(field[1:], 16, 64)
+	if err != nil {
+		return false
+	}
+	return want == fnv1a(body)
+}
+
+// parseLine turns one journal line into an entry.
+//
+// The bool is false only for a line that is not a record at all, and what
+// qualifies differs by journal:
+//
+// In a versioned journal that means an empty line and nothing else. Every
+// other non-empty line was written by a shim that promised an integrity field,
+// so a line too short even to hold a tab is a record a short write cut off
+// mid-first-field -- damaged, not absent. Dropping it would shift every index
+// after it, and slot() is keyed by position, so later valid entries would
+// resolve to the wrong parked files.
+//
+// A legacy journal keeps the historical skip of any line with fewer than two
+// fields. There the shim promised nothing, and changing the rule would
+// renumber journals already on disk.
+func parseLine(line string, verify bool) (Entry, bool) {
+	parts := strings.Split(line, "\t")
+	if verify {
+		if line == "" {
+			return Entry{}, false
+		}
+		// Op is kept so the entry describes itself in a listing; the fields
+		// are deliberately not, because they are the untrustworthy part and
+		// nothing should be tempted to read them.
+		corrupt := Entry{Op: decode(parts[0]), Corrupt: true}
+		if len(parts) < 2 {
+			return corrupt, true
+		}
+		last := parts[len(parts)-1]
+		// everything before the final tab, which is what the shim hashed
+		body := line[:len(line)-len(last)-1]
+		if !validIntegrity(last, body) {
+			return corrupt, true
+		}
+		parts = parts[:len(parts)-1]
+	} else if len(parts) < 2 {
+		return Entry{}, false
+	}
+	e := Entry{Op: decode(parts[0])}
+	for _, p := range parts[1:] {
+		e.Fields = append(e.Fields, decode(p))
+	}
+	return e, true
+}
+
 // Read parses a journal file. Unknown ops are kept as-is so newer shims
 // degrade gracefully.
 func Read(path string) ([]Entry, error) {
@@ -163,17 +256,18 @@ func Read(path string) ([]Entry, error) {
 	}
 	defer f.Close()
 
+	// Whether records must validate is declared by the session, not guessed
+	// per record. See versionFile.
+	_, verr := os.Stat(filepath.Join(filepath.Dir(path), versionFile))
+	verify := verr == nil
+
 	var entries []Entry
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	for sc.Scan() {
-		parts := strings.Split(sc.Text(), "\t")
-		if len(parts) < 2 {
+		e, ok := parseLine(sc.Text(), verify)
+		if !ok {
 			continue
-		}
-		e := Entry{Op: decode(parts[0])}
-		for _, p := range parts[1:] {
-			e.Fields = append(e.Fields, decode(p))
 		}
 		entries = append(entries, e)
 	}
@@ -187,6 +281,9 @@ func (e Entry) Describe() string {
 			return e.Fields[i]
 		}
 		return "?"
+	}
+	if e.Corrupt {
+		return "CORRUPT   " + e.Op + " record (integrity check failed)"
 	}
 	switch e.Op {
 	case OpCreate:
