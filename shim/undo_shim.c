@@ -23,6 +23,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef RENAME_EXCHANGE
@@ -339,6 +340,240 @@ static int has_dotdot(const char *p)
             s++;
     }
     return 0;
+}
+
+/* ---------- process-group identity ---------- */
+
+#define HOST_FIELD 128
+#define KEY_MAX 256
+
+/* Reads the first line of a file into out. Used for /proc entries, which are
+ * small and never short-read in practice. */
+static int read_first_line(const char *path, char *out, size_t cap)
+{
+    REAL(open, int, const char *, int, ...);
+    int fd = real_open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    ssize_t n = read(fd, out, cap - 1);
+    close(fd);
+    if (n <= 0)
+        return -1;
+    out[n] = 0;
+    char *nl = strchr(out, '\n');
+    if (nl)
+        *nl = 0;
+    return 0;
+}
+
+/* Field 22 of /proc/<pid>/stat: the process's start time in clock ticks since
+ * boot. It is what makes a pgid unique -- pids are reissued, and a recycled
+ * pgid would otherwise merge two unrelated commands into one session, or match
+ * a long-dead armer and silently disable capture.
+ *
+ * Parsed forward from the last ')' rather than by splitting the whole line:
+ * field 2 is the executable name in parentheses and may itself contain spaces
+ * and parentheses, which is the classic way to misparse this file. */
+static unsigned long proc_starttime(pid_t pid)
+{
+    char path[64], buf[1024];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+    REAL(open, int, const char *, int, ...);
+    int fd = real_open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0)
+        return 0;
+    buf[n] = 0;
+    char *p = strrchr(buf, ')');
+    if (!p)
+        return 0;
+    p++;
+    /* the token after the name is field 3, so field 22 is 19 tokens later */
+    for (int i = 0; i < 20; i++) {
+        while (*p == ' ')
+            p++;
+        if (!*p)
+            return 0;
+        if (i == 19)
+            break;
+        while (*p && *p != ' ')
+            p++;
+    }
+    return parse_ulong(p);
+}
+
+/* The three parts of a host identity, matching internal/session.composeHost
+ * byte for byte: hostname, boot id, and the raw /proc/self/ns/pid link target.
+ *
+ * All three or failure. A session whose host file disagrees with what the Go
+ * binary computes reads as foreign on the very machine that created it, is
+ * pinned for the whole grace, and undo refuses to revert it. */
+static int host_parts(char *name, char *boot, char *pidns)
+{
+    if (gethostname(name, HOST_FIELD) != 0)
+        return -1;
+    name[HOST_FIELD - 1] = 0;
+    if (!*name)
+        return -1;
+    if (read_first_line("/proc/sys/kernel/random/boot_id", boot, HOST_FIELD) != 0)
+        return -1;
+    if (!*boot)
+        return -1;
+    ssize_t n = readlink("/proc/self/ns/pid", pidns, HOST_FIELD - 1);
+    if (n <= 0)
+        return -1;
+    pidns[n] = 0;
+    return 0;
+}
+
+/* UNDO_SESSION_MAX_AGE in seconds: how long one process group's session lasts
+ * before it rolls to a new one.
+ *
+ * Only long-lived groups reach it; an ordinary command lasting seconds never
+ * splits, because the bucket is measured from the group's own start rather
+ * than from wall-clock boundaries. Floored so a mistuned value cannot make
+ * every call its own session. */
+static unsigned long session_max_age(void)
+{
+    static unsigned long v;
+    if (!v) {
+        v = parse_ulong(getenv("UNDO_SESSION_MAX_AGE"));
+        if (!v)
+            v = 21600; /* six hours */
+        else if (v < 60)
+            v = 60;
+    }
+    return v;
+}
+
+/* Seconds this process group has been alive, from /proc/uptime and the
+ * leader's start time.
+ *
+ * Uptime rather than wall clock deliberately: starttime is in ticks since
+ * boot, and converting it to wall clock needs boot-time arithmetic that
+ * misbehaves across container boundaries and NTP steps. Both values here share
+ * the same origin, so the subtraction is exact without knowing when boot was. */
+static unsigned long group_age(unsigned long starttime_ticks)
+{
+    char buf[64];
+    if (read_first_line("/proc/uptime", buf, sizeof buf) != 0)
+        return 0;
+    unsigned long up = parse_ulong(buf); /* integer seconds is plenty */
+    long hz = sysconf(_SC_CLK_TCK);
+    if (hz <= 0)
+        hz = 100;
+    unsigned long started = starttime_ticks / (unsigned long)hz;
+    return up > started ? up - started : 0;
+}
+
+/* Which session slice a group of this age belongs to.
+ *
+ * Its own function because a test cannot make a process group old, so this is
+ * the only part of the roll that can be asserted directly. Guards max == 0
+ * because session_max_age never returns it but a future caller might. */
+static unsigned long age_bucket(unsigned long age, unsigned long max)
+{
+    if (max == 0)
+        return 0;
+    return age / max;
+}
+
+/* Appends s to a key being built, replacing anything that is not
+ * filename-safe. The key is a directory entry name and a hostname is not
+ * guaranteed to be one. */
+static void key_append(char *dst, size_t cap, size_t *len, const char *s,
+                       size_t max)
+{
+    for (size_t i = 0; s[i] && i < max; i++) {
+        char c = s[i];
+        int ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                 (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+        if (*len + 1 >= cap)
+            return;
+        dst[(*len)++] = ok ? c : '_';
+    }
+}
+
+/* The key identifying this process group's current session.
+ *
+ *   <hostname>-<boot-id>-<pidns>-<pgid>-<leader-starttime>-<age-bucket>
+ *
+ * Origin is in the key because homes are shared across nodes and two machines
+ * will both have pgid 5000; the boot id because a reboot reissues pgids; the
+ * pid namespace because containers sharing a kernel and a UTS namespace have
+ * separate ones, where the same number names unrelated processes. The leader's
+ * starttime defeats pgid reuse within one boot. The bucket bounds a long-lived
+ * group; see session_max_age.
+ *
+ * An unreadable starttime records 0 rather than failing: two commands that
+ * reuse a pgid can then merge into one session, which is visible in undo show
+ * and never a wrong restore, whereas failing would mean no capture at all. */
+static int group_key(char *out)
+{
+    char name[HOST_FIELD], boot[HOST_FIELD], pidns[HOST_FIELD];
+    if (host_parts(name, boot, pidns) != 0)
+        return -1;
+    pid_t pgid = getpgrp();
+    unsigned long st = proc_starttime(pgid);
+    unsigned long age = group_age(st);
+    unsigned long bucket = age_bucket(age, session_max_age());
+
+    size_t len = 0;
+    key_append(out, KEY_MAX, &len, name, 64);
+    key_append(out, KEY_MAX, &len, "-", 1);
+    key_append(out, KEY_MAX, &len, boot, 40);
+    key_append(out, KEY_MAX, &len, "-", 1);
+    key_append(out, KEY_MAX, &len, pidns, 32);
+    char tail[64];
+    snprintf(tail, sizeof tail, "-%d-%lu-%lu", (int)pgid, st, bucket);
+    key_append(out, KEY_MAX, &len, tail, sizeof tail);
+    if (len >= KEY_MAX)
+        return -1;
+    out[len] = 0;
+    return 0;
+}
+
+/* When this process group's current bucket ends, in wall clock, for a reader
+ * on any node to compare against. */
+static time_t bucket_ttl(void)
+{
+    unsigned long max = session_max_age();
+    unsigned long age = group_age(proc_starttime(getpgrp()));
+    return time(NULL) + (time_t)(max - (age % max));
+}
+
+/* True when this process is in the process group that armed us, which
+ * therefore gets no session of its own: an agent harness or a login shell
+ * should not journal its own housekeeping.
+ *
+ * Compares the starttime as well as the pgid. A bare pgid comparison would let
+ * a recycled number match a long-dead armer -- inherited through a terminal
+ * multiplexer, say -- and the symptom of that is silence.
+ *
+ * A zero start time is rejected rather than compared. proc_starttime answers 0
+ * when it cannot read, so comparing against a recorded 0 would let "could not
+ * read" masquerade as "matches", and matching means this process creates no
+ * session at all. Erring toward not-the-armer costs at most an extra session;
+ * erring the other way loses capture silently. A real start time is ticks
+ * since boot and is never 0 in practice -- measured at 27915037 for pid 1 on a
+ * host up three days. */
+static int armer_is_us(void)
+{
+    const char *arm = getenv("UNDO_ARM");
+    if (!arm || !*arm)
+        return 0;
+    const char *colon = strchr(arm, ':');
+    if (!colon)
+        return 0; /* the static UNDO_ARM=1 form: no identity, no exclusion */
+    unsigned long apgid = parse_ulong(arm);
+    unsigned long ast = parse_ulong(colon + 1);
+    if (apgid == 0 || ast == 0)
+        return 0;
+    pid_t pgid = getpgrp();
+    return (unsigned long)pgid == apgid && proc_starttime(pgid) == ast;
 }
 
 /* ---------- filesystem-local store placement ---------- */

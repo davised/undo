@@ -1589,6 +1589,31 @@ Append to `main()` in `test/pathpred.c`:
     expect(age_bucket(86400, 21600) == 4, 1, "a day-old group is bucket 4");
     expect(age_bucket(100, 0) == 0, 1, "a zero max age does not divide by zero");
 
+    /* armer_is_us decides whether this process gets a session at all, and its
+     * failure mode is silence, so all its answers are pinned. */
+    {
+        char arm[64];
+        snprintf(arm, sizeof arm, "%d:%lu", (int)getpgrp(),
+                 proc_starttime(getpgrp()));
+        setenv("UNDO_ARM", arm, 1);
+        expect(armer_is_us(), 1, "UNDO_ARM naming our own group matches");
+
+        snprintf(arm, sizeof arm, "%d:0", (int)getpgrp());
+        setenv("UNDO_ARM", arm, 1);
+        expect(armer_is_us(), 0, "UNDO_ARM with a zero start time does not match");
+
+        setenv("UNDO_ARM", "1", 1);
+        expect(armer_is_us(), 0, "static UNDO_ARM=1 excludes nothing");
+
+        snprintf(arm, sizeof arm, "%d:%lu", (int)getpgrp() + 12345,
+                 proc_starttime(getpgrp()));
+        setenv("UNDO_ARM", arm, 1);
+        expect(armer_is_us(), 0, "a different pgid does not match");
+
+        unsetenv("UNDO_ARM");
+        expect(armer_is_us(), 0, "unset UNDO_ARM excludes nothing");
+    }
+
     /* the three parts must all be present or none: half an identity matches
      * sessions it should not */
     {
@@ -1832,7 +1857,15 @@ static time_t bucket_ttl(void)
  *
  * Compares the starttime as well as the pgid. A bare pgid comparison would let
  * a recycled number match a long-dead armer -- inherited through a terminal
- * multiplexer, say -- and the symptom of that is silence. */
+ * multiplexer, say -- and the symptom of that is silence.
+ *
+ * A zero start time is rejected rather than compared. proc_starttime answers 0
+ * when it cannot read, so comparing against a recorded 0 would let "could not
+ * read" masquerade as "matches", and matching means this process creates no
+ * session at all. Erring toward not-the-armer costs at most an extra session;
+ * erring the other way loses capture silently. A real start time is ticks
+ * since boot and is never 0 in practice -- measured at 27915037 for pid 1 on a
+ * host up three days. */
 static int armer_is_us(void)
 {
     const char *arm = getenv("UNDO_ARM");
@@ -1843,7 +1876,7 @@ static int armer_is_us(void)
         return 0; /* the static UNDO_ARM=1 form: no identity, no exclusion */
     unsigned long apgid = parse_ulong(arm);
     unsigned long ast = parse_ulong(colon + 1);
-    if (apgid == 0)
+    if (apgid == 0 || ast == 0)
         return 0;
     pid_t pgid = getpgrp();
     return (unsigned long)pgid == apgid && proc_starttime(pgid) == ast;
