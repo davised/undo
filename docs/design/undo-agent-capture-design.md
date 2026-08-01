@@ -124,16 +124,37 @@ only when its own pgid *and* that group leader's starttime both equal the pair
 in `UNDO_ARM`. Comparing the pgid alone would let a recycled number match a
 long-dead armer, and the symptom of that is silence.
 
-The entry point is a new subcommand:
+The entry point is one new subcommand:
 
 ```
-undo arm -- <program> [args...]
+undo arm -- <harness> [args...]
 ```
 
 which resolves the shim, sets the four variables, and `exec`s. `exec` preserves
-pid, pgid and sid, so the recorded identity is exactly the armed program's. It
-also sets `UNDO_HOOK=arm`, so `undo doctor` can distinguish an inactive arming
-from a missing install, as the shell hooks already do.
+pid, pgid and sid, so the recorded identity is exactly the harness's. It also
+sets `UNDO_HOOK=arm`, so `undo doctor` can distinguish an inactive arming from
+a missing install, as the shell hooks already do.
+
+**It is not a way to run one command, and that distinction is silent if
+ignored.** Because `exec` preserves the process group, the armed program lands
+in the very group `UNDO_ARM` names. That is right for a harness — it should not
+journal its own housekeeping, while each tool call it spawns gets a fresh group
+and is captured — and exactly wrong for a single command, which would run in
+the excluded group and record nothing at all, with no error and no output.
+Raised by the gate, which also caught that the end-to-end case had hidden the
+problem by invoking `setsid`.
+
+For a single command **`undo run -- <cmd>` already exists** (`cmd/undo/run.go`,
+dispatched at `cmd/undo/main.go:273` ahead of flag parsing so the command's own
+flags are not eaten). It creates the session eagerly, runs the command as a
+child with `UNDO_SESSION` set, preserves its exit status including death by
+signal, and reports what it captured. Nothing in this design replaces it; it
+needs only the `UNDO_SID` line the detach test requires, so that a daemon the
+command starts does not inherit a session that is about to finish.
+
+The two are complements, not alternatives: `undo run` arms one command
+eagerly and knows when it ends; `undo arm` arms an open-ended tree of them and
+cannot.
 
 **Two documented arming sites, one mechanism.** Nothing in the shim branches on
 which is used.
