@@ -2046,8 +2046,14 @@ static int write_meta(const char *dir, const char *name, const char *body)
         return -1;
     size_t len = strlen(body);
     ssize_t n = write(fd, body, len);
-    close(fd);
-    return (n >= 0 && (size_t)n == len) ? 0 : -1;
+    /* close() is where a network filesystem reports a deferred write error:
+     * write() can return the full length into the page cache and the ENOSPC,
+     * EDQUOT or EIO only appears here. The store sits on a quota'd network
+     * home, so this is the expected failure on the deployment target, and
+     * ignoring it would publish a session whose liveness metadata never
+     * reached the server. */
+    int crc = close(fd);
+    return (n >= 0 && (size_t)n == len && crc == 0) ? 0 : -1;
 }
 
 /* The command line of the group leader, which for an agent tool call is
