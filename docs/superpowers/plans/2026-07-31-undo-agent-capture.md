@@ -2406,6 +2406,18 @@ dependency introduced before the plan satisfies it is invisible per task. If a
 later task introduces another such ordering dependency, expect the compiler to
 be what finds it.
 
+**Case numbering.** Task 6 gained case 46 (the symlinked sessions directory)
+during execution, so this task's cases are 47-51, not 46-49 as first written.
+
+**Case 49 must not identify a session by `ls | tail -1`.** When nothing is
+captured `undo run` removes its own empty session, so the newest session is some
+earlier case's -- and asserting against it can fail on working code and pass on
+broken code. It counts sessions instead. Worth knowing: that bug was invisible
+when the case ran in isolation, because then there was no earlier session for
+`tail -1` to find. A case whose correctness depends on suite ordering is one
+someone will "fix" by running it alone, seeing it pass, and calling the suite
+flaky.
+
 - [ ] **Step 5: Run everything**
 
 Run: `test/in-container.sh make test`
@@ -2439,7 +2451,9 @@ git commit -m "shim: create a session for the process group on its first destruc
 ### Task 7: `undo arm` and the doctor arming section
 
 **Files:**
-- Modify: `cmd/undo/main.go` (usage, dispatch, `cmdArm`, `cmdDoctor`)
+- Modify: `cmd/undo/main.go` (usage, pre-parse dispatch, `cmdArm`)
+- Modify: `cmd/undo/doctor.go` (the arming section — `cmdDoctor` lives here,
+  not in `main.go`)
 - Modify: `test/e2e.sh` (cases 46–49)
 
 **Interfaces:**
@@ -2514,12 +2528,27 @@ In `cmd/undo/main.go`, add to the usage text after the `doctor` line:
   undo arm -- <harness>   arm an agent so everything it runs is captured
 ```
 
-Add to the command switch, beside `case "doctor":`:
+**`undo arm` is dispatched BEFORE flag parsing, not from the command switch.**
+undo's parser consumes `-n`, `-y`, `--force`, `--purge`, `-i`, `-V`, `-h` and
+`help` anywhere in argv, so from the switch `undo arm -- claude -y` swallows
+`-y` as undo's own flag and `undo arm -- foo --help` prints undo's usage instead
+of running anything. `undo run` already avoids this the same way; the design
+notes that and this plan then put `arm` in the switch regardless. Case 51 pins
+it.
+
+In `main()`, directly below the existing `undo run` special case:
 
 ```go
-	case "arm":
-		cmdArm(args)
+	// `undo arm` likewise takes the rest of argv verbatim: the armed
+	// program's own flags must not be read as undo's.
+	if len(os.Args) > 1 && os.Args[1] == "arm" {
+		cmdArm(os.Args[2:])
+		return
+	}
 ```
+
+Note it passes `os.Args[2:]`, not the parsed `args`: from the switch, `args[0]`
+is the literal string "arm" and cmdArm would try to exec it.
 
 Add the implementation:
 

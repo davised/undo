@@ -94,6 +94,40 @@ func cmdDoctor() {
 		fmt.Println("not working yet. fix the FAIL lines above.")
 		os.Exit(1)
 	}
+
+	fmt.Println()
+	fmt.Println("arming:")
+	arm := os.Getenv("UNDO_ARM")
+	switch {
+	case arm == "":
+		fmt.Println("  UNDO_ARM       not set (env arming off; hooks may still be active)")
+	case !strings.Contains(arm, ":"):
+		fmt.Println("  UNDO_ARM       set, but with no identity (UNDO_ARM=1)")
+		fmt.Println("                 the armer-exclusion and detach tests are DISABLED")
+	default:
+		fmt.Println("  UNDO_ARM      ", arm)
+	}
+	if p := os.Getenv("LD_PRELOAD"); strings.Contains(p, "libundo.so") {
+		fmt.Println("  LD_PRELOAD     shim loaded")
+	} else {
+		fmt.Println("  LD_PRELOAD     shim NOT loaded; nothing in this process is captured")
+	}
+	if sid := os.Getenv("UNDO_SID"); sid != "" {
+		fmt.Println("  UNDO_SID      ", sid, "(detach test active)")
+	} else {
+		fmt.Println("  UNDO_SID       not set; an inherited UNDO_SESSION is trusted unconditionally")
+	}
+	if pgid := selfStatField(5); pgid != "" && strings.HasPrefix(arm, pgid+":") {
+		fmt.Println("  process group  same as the armer's: capture is DISABLED here.")
+		fmt.Println("                 expected for the agent process itself; if every")
+		fmt.Println("                 command reports this, nothing creates process groups")
+		fmt.Println("                 (a container with no job control) and nothing is captured.")
+	}
+	ign := os.Getenv("UNDO_IGNORE")
+	if ign == "" {
+		ign = "(none beyond the built-in defaults)"
+	}
+	fmt.Println("  UNDO_IGNORE   ", ign)
 }
 
 func detectLibc() (musl bool, note string) {

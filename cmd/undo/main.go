@@ -5,8 +5,11 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/edaywalid/undo/internal/restore"
@@ -30,6 +33,7 @@ usage:
   undo gc                 prune old, empty, and oversized sessions
   undo purge              delete all stored sessions and backups
   undo doctor             check the install and run a live self-test
+  undo arm -- <harness>   arm an agent so everything it runs is captured
   undo upgrade [--check]  update to the latest release
   undo uninstall [--purge] remove undo (--purge also deletes backups)
 
@@ -273,10 +277,105 @@ func cmdApply(s *session.Session, dir restore.Direction, opts restore.Options, y
 	report(res, opts, dir)
 }
 
+// cmdArm execs a harness with the shim preloaded, so that everything the
+// harness spawns is captured.
+//
+// The harness itself is the armer and is therefore excluded: it should not
+// journal its own housekeeping, while each tool call it starts gets a fresh
+// process group and a session of its own.
+//
+// This is deliberately NOT a way to run one command. exec preserves the
+// process group, so a single command run this way would land in the very group
+// UNDO_ARM names and record nothing at all, with no error and no output. Use
+// the existing `undo run -- <cmd>` for that; it creates the session eagerly and
+// knows when the command ended, which this cannot.
+//
+// exec rather than fork: it preserves pid, pgid and sid, so the identity
+// recorded in UNDO_ARM and UNDO_SID is exactly the harness's. Forking would
+// record this process's, which dies immediately, and the exclusion test would
+// then match nothing.
+func cmdArm(args []string) {
+	if len(args) > 0 && args[0] == "--" {
+		args = args[1:]
+	}
+	if len(args) == 0 {
+		fatal(fmt.Errorf("arm needs a program: undo arm -- <harness> [args...]\n" +
+			"to capture a single command, use: undo run -- <cmd> [args...]"))
+	}
+	lib := findShim() // cmd/undo/run.go
+	if lib == "" {
+		fatal(fmt.Errorf("libundo.so not found; set UNDO_LIB or make install"))
+	}
+	prog, err := exec.LookPath(args[0])
+	if err != nil {
+		fatal(err)
+	}
+
+	env := os.Environ()
+	set := func(k, v string) {
+		pfx := k + "="
+		for i, e := range env {
+			if strings.HasPrefix(e, pfx) {
+				env[i] = pfx + v
+				return
+			}
+		}
+		env = append(env, pfx+v)
+	}
+	// Drop any other libundo.so first: two loaded copies both interpose,
+	// duplicating journal entries and recording each other's backups.
+	var keep []string
+	for _, p := range strings.Split(os.Getenv("LD_PRELOAD"), ":") {
+		if p != "" && !isUndoShim(p) { // isUndoShim: cmd/undo/run.go
+			keep = append(keep, p)
+		}
+	}
+	set("LD_PRELOAD", strings.Join(append([]string{lib}, keep...), ":"))
+	set("UNDO_DATA_DIR", filepath.Dir(session.Root()))
+	set("UNDO_HOOK", "arm")
+	// pgid is field 5 of our own stat, but the start time must come from the
+	// LEADER's stat, not ours.
+	//
+	// When undo arm is launched without job control it is not the group leader,
+	// and pairing the leader's pgid with our own start time describes no
+	// process at all. The shim's armer_is_us compares that pair against
+	// proc_starttime(pgid), so it would never match, and the armed harness's
+	// own housekeeping would be captured instead of excluded -- silently, since
+	// the only symptom is extra sessions nobody asked for.
+	pgid := selfStatField(5)
+	st := ""
+	if pgid != "" {
+		st = procStatField("/proc/"+pgid+"/stat", 22)
+	}
+	if pgid != "" && st != "" {
+		set("UNDO_ARM", pgid+":"+st)
+	} else {
+		// No identity: lazy creation still works, but the exclusion and detach
+		// tests cannot run. doctor says so rather than letting it pass.
+		set("UNDO_ARM", "1")
+	}
+	if sid := selfStatField(6); sid != "" {
+		set("UNDO_SID", sid)
+	}
+
+	if err := syscall.Exec(prog, args, env); err != nil {
+		fatal(err)
+	}
+}
+
 func main() {
 	// `undo run` takes the rest of argv verbatim, before any flag parsing
 	if len(os.Args) > 1 && os.Args[1] == "run" {
 		cmdRun(os.Args[2:])
+		return
+	}
+
+	// `undo arm` likewise takes the rest of argv verbatim: the armed
+	// program's own flags must not be read as undo's. Without this,
+	// `undo arm -- claude -y` swallows -y and `undo arm -- foo --help`
+	// prints undo's usage instead of running anything.
+	if len(os.Args) > 1 && os.Args[1] == "arm" {
+		cmdArm(os.Args[2:])
 		return
 	}
 

@@ -740,3 +740,63 @@ env UNDO_DATA_DIR="$symstore" UNDO_ARM="$(arm_id)" LD_PRELOAD="$LIB" \
 [[ ! -e $PLAY/top.txt ]] || fail "case 46: the rm did not run"
 [[ -z $(ls -A "$elsewhere") ]] ||
     fail "case 46: the shim wrote through a symlinked sessions directory: $(ls -A "$elsewhere")"
+
+echo "== case 47: undo arm captures what the armed program spawns"
+# The harness shape: undo arm execs a long-lived program, and the tool calls it
+# starts each get their own process group. setsid stands in for that here --
+# it is what the program spawns, not the program itself, that is captured.
+make_tree
+before=$(ls "$UNDO_DATA_DIR/sessions" | wc -l)
+UNDO_LIB=$LIB "$UNDO" arm -- bash -c "setsid rm $PLAY/top.txt; sleep 0.2"
+[[ ! -e $PLAY/top.txt ]] || fail "case 47: the rm did not run"
+after=$(ls "$UNDO_DATA_DIR/sessions" | wc -l)
+[[ $after -gt $before ]] || fail "case 47: undo arm captured nothing"
+"$UNDO" -y >/dev/null
+[[ -f $PLAY/top.txt ]] || fail "case 47: the file did not come back"
+
+echo "== case 48: undo arm does NOT capture the armed program itself"
+# The armed program is the armer and is excluded by design. Asserting it keeps
+# anyone from "fixing" undo arm into a single-command runner, which would make
+# an agent journal its own housekeeping. undo run is the single-command path.
+make_tree
+before=$(ls "$UNDO_DATA_DIR/sessions" | wc -l)
+UNDO_LIB=$LIB "$UNDO" arm -- rm "$PLAY/top.txt"
+[[ ! -e $PLAY/top.txt ]] || fail "case 48: the rm did not run"
+after=$(ls "$UNDO_DATA_DIR/sessions" | wc -l)
+[[ $after -eq $before ]] ||
+    fail "case 48: undo arm captured the armed program itself; it is the armer \
+and must be excluded, or an agent journals its own housekeeping"
+
+echo "== case 49: undo run still captures a single command, and sets UNDO_SID"
+make_tree
+UNDO_LIB=$LIB "$UNDO" run -- rm "$PLAY/top.txt"
+[[ ! -e $PLAY/top.txt ]] || fail "case 49: the rm did not run"
+"$UNDO" -y >/dev/null
+[[ -f $PLAY/top.txt ]] || fail "case 49: undo run stopped capturing"
+# A daemon the command starts must not inherit the session, which undo run
+# marks done the moment the command exits.
+#
+# Counted rather than named: when nothing is captured undo run removes its own
+# empty session, so \"the newest session\" is some earlier case's and asserting
+# against it tests nothing. If the detached child HAD written, the session
+# would be non-empty and undo run would keep it.
+make_tree
+before=$(ls "$UNDO_DATA_DIR/sessions" | wc -l)
+UNDO_LIB=$LIB "$UNDO" run -- bash -c "setsid rm $PLAY/top.txt; sleep 0.3"
+after=$(ls "$UNDO_DATA_DIR/sessions" | wc -l)
+[[ ! -e $PLAY/top.txt ]] || fail "case 49: the detached rm did not run"
+[[ $after -eq $before ]] ||
+    fail "case 49: a detached child wrote into undo run's session, which is \
+marked done the moment the command exits"
+
+echo "== case 50: doctor reports that capture is disabled in the armer's own group"
+out=$(UNDO_LIB=$LIB "$UNDO" arm -- "$UNDO" doctor 2>&1 || true)
+grep -qi 'arm' <<<"$out" || fail "case 50: doctor says nothing about arming"
+
+echo "== case 51: undo arm passes the armed program's own flags through"
+# undo's flag parser eats -y, -n, --force, -i and --help anywhere in argv, so
+# `undo arm` must be dispatched before parsing -- as `undo run` already is.
+# Without that, these flags never reach the armed program.
+out=$(UNDO_LIB=$LIB "$UNDO" arm -- sh -c 'echo "$@"' _ -y --force -n 2>&1)
+[[ $out == "-y --force -n" ]] ||
+    fail "case 51: armed program received [$out], want [-y --force -n]"
