@@ -225,6 +225,11 @@ the id.
 All five describe the *group*, not the writer, so racing processes write
 byte-identical content and the race is not merely tolerable but invisible.
 
+A sixth file, `journalv`, is written by the shim before its first journal
+record rather than here, because sessions created by a shell hook need it too
+and the hook may be an older one. It is idempotent for the same reason. See
+section 7.
+
 Two residual cases, both bounded:
 
 - If the `rmdir` in step 4 fails, an empty session directory leaks. It costs no
@@ -412,12 +417,34 @@ Three properties that make it safe to add:
   `journal.Read` already tolerates trailing fields. Every field access in
   `journal.go`, `restore.go` and `session.go` is bounds-guarded; none assumes
   an exact field count. Verified, not assumed.
-- **Legacy records stay readable.** A record with no integrity field is
-  accepted as-is. The two cannot be confused: the marker requires a final field
-  that is exactly `~` followed by 16 hex digits, and no legacy final field can
-  take that form — path fields are absolute and contain `/`, mode fields are
-  three or four octal digits, method fields are `link`, `copy` or `none`, and
-  `lost` reasons are `unlink` or `write`.
+- **Whether validation is required is declared per journal, not inferred per
+  record.** The shim writes a `journalv` file into the session directory,
+  idempotently, before its first journal record. Its presence means *every*
+  record in that journal must validate; its absence means legacy rules.
+
+  Inferring it per record — "no trailing marker means legacy" — is the obvious
+  rule and it is wrong, which the gate caught. A short write that truncates a
+  new record *before* its integrity field leaves a line with no marker, which
+  that rule accepts as legacy; if enough fields survived to satisfy the parser,
+  restore acts on a partial path. That is precisely the single-writer failure
+  the field exists to close, reintroduced by the compatibility rule.
+
+  A truncated record cannot erase `journalv`: it is a different file, written
+  once at session setup rather than per record. The residual hole is only
+  "`journalv` could not be written at all", which is a creation-time failure
+  and degrades to today's behaviour rather than below it.
+
+  Consequence worth stating: a journal that somehow mixes records from an old
+  and a new shim — two members of one group with different shim builds — has
+  `journalv`, so the old shim's records fail validation and are rejected.
+  Over-strict, and closed in the safe direction.
+- **Old readers are unaffected.** The field is trailing and `journal.Read`
+  already tolerates trailing fields, so an older `undo` binary reading a newer
+  journal ignores both the field and `journalv` and behaves exactly as it does
+  today. This is why the marker is appended rather than prepended: a leading
+  sentinel would be airtight against truncation, but it would shift every field
+  index, and an old binary would then parse every op as unknown — listing a
+  session as having N changes and restoring none of them.
 - **Rejection is not filtering.** A rejected record is corrupt, not merely
   unrecognised. Journal indices are load-bearing — `restore.slot()` and the
   interactive picker are keyed by position — so a rejected record must still
@@ -501,7 +528,8 @@ is reported.
 | `rmdir` of an unused session directory fails | empty session leaks, costs no retention slot | — |
 | Short journal write | record terminated, next record clean | — |
 | Record fails its integrity check | slot kept but marked unrestorable, never acted on | **yes, loudly** |
-| Record predates the integrity field | accepted as-is | — |
+| Session has no `journalv` | legacy rules, no validation | — |
+| `journalv` unwritable at session setup | legacy rules; degrades to today, not below | doctor |
 | Long-lived group | one session per `UNDO_SESSION_MAX_AGE` | `undo list` |
 | Bun-based harness, in-process write | not captured at all | **documented limit** |
 
@@ -539,8 +567,11 @@ Beyond that:
   directly rather than raced — is rejected rather than restored. This is the
   case the writer-side newline cannot cover, so it is the one that must be
   asserted.
-- **Legacy journals:** a journal with no integrity field on any record restores
-  exactly as it does today, and a mixed journal restores both kinds.
+- **Legacy journals:** a session with no `journalv` restores exactly as it does
+  today, integrity fields absent throughout.
+- **The downgrade hole stays closed:** a session *with* `journalv` whose last
+  record was truncated before its integrity field is rejected, not accepted as
+  legacy. This is the case a per-record inference rule would have passed.
 - **Indices survive rejection:** a journal with one corrupt record in the middle
   leaves every later record at the same slot number the interactive picker and
   `restore.slot()` would have given it before.
@@ -584,7 +615,7 @@ designs around an invented one.
    only. Agent-scoped arming needs no node-image change and no sign-off, which
    is why phase 1 ships that way.
 4. **Metadata traffic from per-tool-call session creation.** Each destructive
-   tool call creates a session directory, five small files and one symlink on
+   tool call creates a session directory, six small files and one symlink on
    the shared home filesystem. Lazy creation means read-only tool calls cost
    nothing, which removes most of the volume, but an agent doing hundreds of
    destructive calls is a metadata pattern worth sizing before wide
