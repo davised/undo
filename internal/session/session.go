@@ -542,6 +542,51 @@ func (s *Session) distributedCharges() []backupCharge {
 	return out
 }
 
+// groupsDir holds one symlink per process group, naming the session that group
+// writes to. It sits beside the sessions directory so it outlives any one of
+// them.
+func groupsDir() string {
+	return filepath.Join(filepath.Dir(Root()), "groups")
+}
+
+// pruneGroups removes group links whose session is gone.
+//
+// A link is created before nothing and after the session directory it names,
+// so a link that resolves to nothing is unambiguously stale rather than a
+// session mid-creation. Removing a live one would be worse than leaving a
+// stale one: the group would create a second session while its first is still
+// being written.
+func pruneGroups() {
+	ents, err := os.ReadDir(groupsDir())
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		link := filepath.Join(groupsDir(), e.Name())
+		fi, err := os.Lstat(link)
+		if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+			continue // only ever remove our own symlinks
+		}
+		// Only absence is proof. A transient error, a permission failure, or a
+		// path that stopped resolving for any other reason is not evidence the
+		// session is gone -- and removing a live mapping splits the group: its
+		// next destructive call creates a second session while the first is
+		// still being written.
+		//
+		// os.IsNotExist is exactly right here, not a near-miss for
+		// errors.Is(err, syscall.ENOENT). Measured on this repo's Go
+		// (1.24.13): stat through a non-directory component gives ENOTDIR, and
+		// both os.IsNotExist and errors.Is(err, fs.ErrNotExist) are false for
+		// it -- Errno.Is maps only ENOENT to fs.ErrNotExist. A review gate
+		// flagged this as a bug; it was measured and rejected, and
+		// TestGCKeepsAGroupLinkItCannotResolve is what keeps it honest.
+		if _, err := os.Stat(link); !os.IsNotExist(err) {
+			continue
+		}
+		os.Remove(link)
+	}
+}
+
 // GC removes empty sessions and prunes the oldest until at most keep
 // sessions remain within maxBytes of allocated space. Sessions older than
 // maxAge go regardless; maxAge of 0 disables that. Live sessions are never
@@ -630,6 +675,7 @@ func GC(keep int, maxBytes int64, maxAge time.Duration) (int, error) {
 			}
 		}
 	}
+	pruneGroups()
 	return removed, nil
 }
 

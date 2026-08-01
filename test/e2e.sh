@@ -800,3 +800,23 @@ echo "== case 51: undo arm passes the armed program's own flags through"
 out=$(UNDO_LIB=$LIB "$UNDO" arm -- sh -c 'echo "$@"' _ -y --force -n 2>&1)
 [[ $out == "-y --force -n" ]] ||
     fail "case 51: armed program received [$out], want [-y --force -n]"
+
+echo "== case 52: undo arm drops a session it inherited rather than writing into it"
+# A hooked shell sets UNDO_SESSION for the command it is running, so
+# `undo arm -- <agent>` typed at a prompt inherits one. If it survived, the
+# harness and every tool call would write into that single session -- which the
+# hook marks done at the next prompt and gc then collects while the agent is
+# still running.
+make_tree
+inherited=$UNDO_DATA_DIR/sessions/$(date +%s%N | cut -c1-16)
+mkdir -p "$inherited/data"
+echo "the shell command that started the agent" >"$inherited/cmd"
+before=$(ls "$UNDO_DATA_DIR/sessions" | wc -l)
+env UNDO_SESSION="$inherited" UNDO_SID="$(statfield self 6)" UNDO_LIB=$LIB \
+    "$UNDO" arm -- bash -c "setsid rm $PLAY/top.txt; sleep 0.3"
+[[ ! -e $PLAY/top.txt ]] || fail "case 52: the rm did not run"
+[[ ! -s $inherited/journal ]] ||
+    fail "case 52: the armed program wrote into the session it inherited"
+after=$(ls "$UNDO_DATA_DIR/sessions" | wc -l)
+[[ $after -gt $before ]] ||
+    fail "case 52: no new session was created for the spawned process group"

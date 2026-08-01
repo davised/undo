@@ -306,12 +306,32 @@ func cmdArm(args []string) {
 	if lib == "" {
 		fatal(fmt.Errorf("libundo.so not found; set UNDO_LIB or make install"))
 	}
+	// LD_PRELOAD is resolved per process against the current directory, and
+	// a harness changes directory constantly, so a relative UNDO_LIB loads
+	// here and silently stops loading in the first tool call after a chdir.
+	if abs, err := filepath.Abs(lib); err == nil {
+		lib = abs
+	}
 	prog, err := exec.LookPath(args[0])
 	if err != nil {
 		fatal(err)
 	}
 
-	env := os.Environ()
+	// Drop any inherited session before arming. A hooked shell sets
+	// UNDO_SESSION for the command it is running, so `undo arm -- <agent>`
+	// typed at a prompt inherits one -- and explicit_session() takes
+	// precedence over lazy arming, so the harness and every tool call would
+	// write into that single session, which the hook marks done at the next
+	// prompt and gc then collects while the agent is still running.
+	// UNDO_SID goes with it; we set our own below.
+	var env []string
+	for _, e := range os.Environ() {
+		if strings.HasPrefix(e, "UNDO_SESSION=") ||
+			strings.HasPrefix(e, "UNDO_SID=") {
+			continue
+		}
+		env = append(env, e)
+	}
 	set := func(k, v string) {
 		pfx := k + "="
 		for i, e := range env {

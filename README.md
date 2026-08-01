@@ -155,6 +155,51 @@ echo "source $(brew --prefix)/share/undo/undo.bash" >> ~/.bashrc && exec bash
 Use double quotes there. Left unexpanded, that runs `brew` on every
 shell startup, and it is a Ruby program.
 
+### Capturing an agent's commands
+
+A coding agent's tool call is `<shell> -c '...'`, which runs no `preexec` and
+no `PROMPT_COMMAND`, so the shell hooks never fire and nothing is recorded.
+Arm the agent instead:
+
+    undo arm -- <your-agent>
+
+Everything the agent runs through its shell is then captured, one session per
+tool call, and `undo list` shows them like any other session. No shell hook is
+involved and it works whatever shell the agent invokes, including `sh` and
+`tcsh`.
+
+`undo arm` arms an open-ended tree of commands; the agent itself is the armer
+and is deliberately not captured, so it does not journal its own housekeeping.
+**To capture one command, use `undo run -- <cmd>` instead** — running a single
+command under `undo arm` puts it in the excluded group and records nothing.
+
+Two limits worth knowing:
+
+- **Programs that do not call libc are invisible.** Go binaries and static
+  binaries issue raw syscalls, and so do parts of some JavaScript runtimes.
+  An agent's own in-process file editing may therefore not be captured even
+  when its shell commands are.
+- **A long-lived process gets one session per `UNDO_SESSION_MAX_AGE`.** A
+  terminal multiplexer pane or a daemon started by the agent is one process
+  group for its whole life, so its session covers many unrelated commands.
+  `undo -i` picks individual entries out of it.
+
+#### Choosing what not to record
+
+An armed agent journals its builds, test suites and package installs too. The
+size budgets bound that, but two things are worth excluding deliberately:
+
+    export UNDO_IGNORE=.venv:target:build:dist:.tox:.mypy_cache:.pytest_cache:vendor:site-packages
+
+`undo` does not set this for you, and will not. Ignoring a path silently is how
+you come to believe you are protected when you are not, so the list is yours to
+choose; `undo doctor` prints the one in effect.
+
+The second reason is not noise but secrecy. An agent that rewrites its own
+credential or transcript files copies them into the store. The store is mode
+700, but it is still a second copy in a second place — add the agent's own
+state directory to `UNDO_IGNORE` unless you want it backed up.
+
 ### 3. Check it works
 
 ```console
@@ -290,6 +335,9 @@ Environment variables, set before sourcing the hook:
 | `UNDO_DEFAULT_IGNORE` | on | set to `0` to stop skipping `node_modules`, `.cache`, `__pycache__`, `.git` |
 | `UNDO_CAPTURE_SHELL` | off | zsh only: set to `1` to re-exec once at startup with the shim preloaded, so the shell's own redirections (`echo x > file`) are captured too |
 | `UNDO_LIB` | auto-detected | explicit path to `libundo.so` |
+| `UNDO_ARM` | unset | `<pgid>:<starttime>` of the arming process, set by `undo arm`. Its presence lets the shim create sessions itself, with no shell hook. `UNDO_ARM=1` also works where only static environment can be set, but disables the armer-exclusion and detach tests |
+| `UNDO_SID` | unset | terminal session id recorded by whoever set `UNDO_SESSION`. Lets the shim reject a session inherited across `setsid()` — a terminal multiplexer server, a daemon — which would otherwise be written to long after it finished |
+| `UNDO_SESSION_MAX_AGE` | 21600 | seconds before a long-lived process group rolls to a new session (minimum 60). Only reached by daemons and multiplexer panes; an ordinary command never splits, because the age is measured from the group's own start |
 
 Installer-only variables, for `install.sh`:
 

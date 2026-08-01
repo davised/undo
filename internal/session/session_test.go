@@ -1366,3 +1366,68 @@ func TestLiveWithoutPgidOrTTLIsUnchanged(t *testing.T) {
 		t.Error("our own running pid stopped reading as live")
 	}
 }
+
+// A group link outlives the session it names -- the session is collected by
+// retention, the link is not -- so gc has to take them or the directory grows
+// one entry per process group forever.
+func TestGCPrunesDanglingGroupLinks(t *testing.T) {
+	data := t.TempDir()
+	t.Setenv("UNDO_DATA_DIR", data)
+
+	live := mustSession(t, "rm live")
+	writeJournal(t, live, "unlink\t/a\t-\tnone\n")
+
+	groups := filepath.Join(data, "groups")
+	if err := os.MkdirAll(groups, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// one link to a session that exists, one to a session that does not
+	if err := os.Symlink("../sessions/"+live.ID, filepath.Join(groups, "keyA")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../sessions/1111111111111111", filepath.Join(groups, "keyB")); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := GC(30, 1<<30, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(groups, "keyA")); err != nil {
+		t.Error("gc removed the group link of a session that still exists; the " +
+			"group would start a second session while its first is still live")
+	}
+	if _, err := os.Lstat(filepath.Join(groups, "keyB")); err == nil {
+		t.Error("gc kept a group link whose session is gone")
+	}
+}
+
+// A stat that fails for a reason other than absence is not proof. Constructed
+// with a regular file where a directory component would be, so stat through it
+// returns ENOTDIR -- deterministic, and unlike a permissions trick it behaves
+// the same when the tests run as root.
+func TestGCKeepsAGroupLinkItCannotResolve(t *testing.T) {
+	data := t.TempDir()
+	t.Setenv("UNDO_DATA_DIR", data)
+	sessions := filepath.Join(data, "sessions")
+	if err := os.MkdirAll(sessions, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessions, "notadir"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	groups := filepath.Join(data, "groups")
+	if err := os.MkdirAll(groups, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../sessions/notadir/child", filepath.Join(groups, "keyC")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := GC(30, 1<<30, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(groups, "keyC")); err != nil {
+		t.Error("gc removed a group link whose target it could not resolve; a " +
+			"transient error is not proof the session is gone, and removing a " +
+			"live mapping splits the group across two sessions")
+	}
+}
