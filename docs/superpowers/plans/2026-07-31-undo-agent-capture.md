@@ -736,6 +736,30 @@ arm_id() {
 }
 ```
 
+**Then fix case 25, which this task breaks.** It is the only assertion in the
+suite anchored to the END of a journal record:
+
+```bash
+grep -q $'\tlink$' "$sess/journal" ||
+    fail "the unlink record does not end with the save method"
+```
+
+Appending an integrity field makes the method no longer last, so it fails.
+Replace it with a positional check, matching what every other assertion in the
+file already does (line 340 immediately below, and `test/multifs-store.sh:44`)
+and which no future trailing field can break:
+
+```bash
+awk -F'\t' '$1=="unlink" && $4=="link"' "$sess/journal" | grep -q . ||
+    fail "the unlink record does not name link as its save method"
+```
+
+Found during execution, not by review. The design's claim that the format is
+"additive, and `journal.Read` already tolerates trailing fields" was verified
+against `journal.go`, `restore.go` and `session.go` — and not against the shell
+tests, which is half the surface. Nothing else in `test/*.sh` is end-anchored;
+that was checked afterwards rather than assumed.
+
 Then append the cases:
 
 ```bash

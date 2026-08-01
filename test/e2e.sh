@@ -17,6 +17,39 @@ PLAY=$WORK/play
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+# Field <n> of /proc/<pid>/stat, one-indexed.
+#
+# Everything up to the LAST ')' is stripped first: field 2 is the executable
+# name in parentheses and may contain spaces and parentheses of its own, so
+# `cut -d' ' -fN` silently reads the wrong field for such a process.
+statfield() { # statfield <pid|self> <n>
+    sed 's/.*) //' "/proc/$1/stat" | awk -v n="$(( $2 - 2 ))" '{print $n}'
+}
+
+# UNDO_ARM exactly as `undo arm` builds it: the process group's id, paired with
+# the START TIME OF THE GROUP LEADER -- not our own.
+#
+# When this shell is not its group leader, which is the ordinary case in a
+# container with no job control, those are two different processes and pairing
+# them describes nothing at all. armer_is_us would never match and the
+# exclusion would silently stop working.
+#
+# Falls back to the static "1" exactly as cmdArm does, rather than failing.
+# A group whose leader has already exited has no /proc/<pgid>/stat, and
+# returning nothing would expand to UNDO_ARM= -- an empty value, which is a
+# third state neither the shim nor this harness should have to reason about.
+arm_id() {
+    local pgid st
+    pgid=$(statfield self 5)
+    st=""
+    [[ -n $pgid ]] && st=$(statfield "$pgid" 22)
+    if [[ -z $pgid || -z $st ]]; then
+        printf '1\n'
+        return 0
+    fi
+    printf '%s:%s\n' "$pgid" "$st"
+}
+
 run_armed() {
     local id
     id=$(date +%s%N | cut -c1-16)
@@ -302,8 +335,8 @@ mkdir -p "$PLAY/store-local"
 echo "large enough to matter" >"$PLAY/store-local/big.bin"
 run_armed "rm $PLAY/store-local/big.bin"
 sess=$(ls -1d "$UNDO_DATA_DIR"/sessions/* | tail -1)
-grep -q $'\tlink$' "$sess/journal" ||
-    fail "the unlink record does not end with the save method"
+awk -F'\t' '$1=="unlink" && $4=="link"' "$sess/journal" | grep -q . ||
+    fail "the unlink record does not name link as its save method"
 bak=$(awk -F'\t' '$1=="unlink"{print $3}' "$sess/journal" | tail -1)
 case $bak in
     */.undo/*) ;;
@@ -522,6 +555,58 @@ printf 'unlink\t%s\t%s\tlink\n' "$PLAY/oldfile.txt" "$oldstore/1-1" >"$oldsess/j
 UNDO_KEEP=2 UNDO_FOREIGN_GRACE=1800 "$UNDO" gc >/dev/null
 [[ ! -d $oldsess ]] || fail "a foreign session past its grace must be collectible"
 [[ ! -e $oldstore/1-1 ]] || fail "its backup should have been reclaimed too"
+
+echo
+echo "== case 36: every record carries an integrity field the reader accepts"
+make_tree
+run_armed "rm $PLAY/top.txt"
+last=$(ls "$UNDO_DATA_DIR/sessions" | sort | tail -1)
+sess=$UNDO_DATA_DIR/sessions/$last
+[[ -f $sess/journalv ]] || fail "case 36: no journalv beside the journal"
+while IFS= read -r line; do
+    [[ $line == *$'\t'~* ]] || fail "case 36: record has no integrity field: $line"
+done <"$sess/journal"
+# the whole point: a stamped journal still restores
+"$UNDO" -y
+[[ -f $PLAY/top.txt ]] || fail "case 36: a stamped journal did not restore"
+
+echo "== case 37: a merged record is refused, not restored onto the wrong path"
+make_tree
+run_armed "rm $PLAY/top.txt"
+last=$(ls "$UNDO_DATA_DIR/sessions" | sort | tail -1)
+sess=$UNDO_DATA_DIR/sessions/$last
+# what a short write leaves behind: a record with no newline, then the next one
+{ printf 'unlink\t%s/docs/report.txt' "$PLAY"; cat "$sess/journal"; } >"$sess/j2"
+mv "$sess/j2" "$sess/journal"
+rm -f "$PLAY/top.txt"
+"$UNDO" -y >/dev/null 2>&1 || true
+[[ $(cat "$PLAY/docs/report.txt") == "report v1" ]] ||
+    fail "case 37: a merged record restored a backup over the wrong path"
+
+echo "== case 38: upgrading the shim under a session in flight keeps it restorable"
+# A session an older shim already wrote unstamped records into. Declaring the
+# integrity contract over those would mark every one of them corrupt, and the
+# session would stop being restorable the moment the shim was upgraded.
+make_tree
+id=$(date +%s%N | cut -c1-16)
+sess=$UNDO_DATA_DIR/sessions/$id
+mkdir -p "$sess/data"
+echo "a session started before the shim was upgraded" >"$sess/cmd"
+printf '%s\t%s\t%s\n' "$(uname -n)" \
+    "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" \
+    "$(readlink /proc/self/ns/pid 2>/dev/null)" >"$sess/host"
+cp "$PLAY/top.txt" "$sess/data/legacy-1"
+rm -f "$PLAY/top.txt"
+printf 'unlink\t%s\t%s\tlink\n' "$PLAY/top.txt" "$sess/data/legacy-1" >"$sess/journal"
+# now the new shim appends to that same journal
+env UNDO_SESSION="$sess" UNDO_SID="$(statfield self 6)" \
+    LD_PRELOAD="$LIB" bash -c "rm $PLAY/docs/report.txt"
+[[ ! -f $sess/journalv ]] ||
+    fail "case 38: the integrity contract was declared over records written \
+before it existed; every one of them now reads as corrupt"
+"$UNDO" apply "$id" -y >/dev/null
+[[ -f $PLAY/top.txt ]] ||
+    fail "case 38: a record written by the older shim was not restored"
 
 echo
 echo "all cases passed"

@@ -31,6 +31,11 @@
 
 #define DEFAULT_MAX_BYTES (256UL * 1024 * 1024)
 
+/* What the integrity field costs at the end of a record: '\t', '~', sixteen
+ * hex digits and the NUL snprintf writes is 19; the twentieth byte is slack so
+ * the reservation in jwritev is provably sufficient rather than exactly so. */
+#define integrity_width 20
+
 static __thread int in_shim;
 
 #define REAL(name, ret, ...)                                                 \
@@ -48,6 +53,43 @@ static const char *session_dir(void)
     return s;
 }
 
+/* Opens a session's journal, declaring the integrity contract if and only if
+ * this call is what brought the journal into existence.
+ *
+ * O_EXCL is the whole mechanism. Exactly one process can create the file, and
+ * only that process writes journalv, so the decision needs no other
+ * coordination.
+ *
+ * Deciding from the journal's size instead would race, which is how this was
+ * first written: a peer can append between another process's open and its
+ * stat, and both then conclude someone else must have declared it. The session
+ * is read as legacy forever and integrity checking is silently off for it.
+ *
+ * A journal that already exists is never versioned here. It was either created
+ * by a peer, which declared the contract, or written by an older shim, in
+ * which case declaring it now would mark every record that shim wrote corrupt
+ * and make a session unrestorable the moment the shim is upgraded under it. */
+static int open_journal(const char *dir, const char *path)
+{
+    REAL(open, int, const char *, int, ...);
+    int fd = real_open(path, O_WRONLY | O_APPEND | O_CREAT | O_EXCL | O_CLOEXEC,
+                       0600);
+    if (fd < 0)
+        return real_open(path, O_WRONLY | O_APPEND | O_CLOEXEC, 0600);
+    char vpath[PATH_MAX];
+    if ((size_t)snprintf(vpath, sizeof vpath, "%s/journalv", dir) <
+        sizeof vpath) {
+        int vfd = real_open(vpath, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                            0600);
+        if (vfd >= 0) {
+            ssize_t vr = write(vfd, "1\n", 2);
+            (void)vr;
+            close(vfd);
+        }
+    }
+    return fd;
+}
+
 static int journal_fd(void)
 {
     static __thread char cached_dir[PATH_MAX];
@@ -62,8 +104,7 @@ static int journal_fd(void)
     char path[PATH_MAX];
     if ((size_t)snprintf(path, sizeof path, "%s/journal", dir) >= sizeof path)
         return fd = -1;
-    REAL(open, int, const char *, int, ...);
-    fd = real_open(path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
+    fd = open_journal(dir, path);
     if (fd >= 0)
         snprintf(cached_dir, sizeof cached_dir, "%s", dir);
     return fd;
@@ -94,6 +135,23 @@ static void enc_append(char *dst, size_t cap, size_t *len, const char *s)
     }
 }
 
+/* FNV-1a over an encoded record. Mirrored exactly by fnv1a in
+ * internal/journal: if the two ever disagree the reader rejects every record
+ * the shim writes, and undo silently restores nothing.
+ *
+ * Deliberately not path_hash(): that one maps 0 to 1 so zero can mark an empty
+ * table slot, and replicating that quirk on the Go side for no reason is how
+ * two implementations of one hash drift apart. */
+static uint64_t rec_hash(const char *s, size_t len)
+{
+    uint64_t h = 14695981039346656037ULL;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (unsigned char)s[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
 /* Formats and appends one record to an already-open journal descriptor.
  *
  * Shared so a record destined for another session's journal is encoded by
@@ -105,18 +163,52 @@ static void jwritev(int fd, const char *op, va_list ap)
     if (fd < 0)
         return;
     char line[4 * PATH_MAX];
+    /* Reserve the tail for the integrity field and the newline so encoding can
+     * never consume the room they need.
+     *
+     * Stamping only "if it fits" is what this replaces, and it was wrong in the
+     * worst direction: a record written without its stamp into a journal whose
+     * journalv promises every record has one is read as corrupt, and the change
+     * it records becomes unrestorable. A full buffer would have silently
+     * disarmed the guarantee this field exists to provide.
+     *
+     * enc_append still truncates a field that does not fit in what remains.
+     * That is pre-existing and bounded -- the buffer is 4 * PATH_MAX and the
+     * widest record the shim writes is an op and three paths -- so it is left
+     * alone here rather than fixed halfway. */
+    const size_t cap = sizeof line - integrity_width - 1;
     size_t len = 0;
-    enc_append(line, sizeof line, &len, op);
+    enc_append(line, cap, &len, op);
     const char *f;
     while ((f = va_arg(ap, const char *)) != NULL) {
-        if (len + 1 < sizeof line)
+        if (len + 1 < cap)
             line[len++] = '\t';
-        enc_append(line, sizeof line, &len, f);
+        enc_append(line, cap, &len, f);
     }
-    if (len + 1 < sizeof line)
-        line[len++] = '\n';
+    /* Hashed over everything preceding it, which is exactly what the reader
+     * recomputes from the text before the final tab. Both writes below fit by
+     * construction: cap left integrity_width + 1 bytes free. */
+    uint64_t h = rec_hash(line, len);
+    int n = snprintf(line + len, sizeof line - len, "\t~%016llx",
+                     (unsigned long long)h);
+    if (n > 0)
+        len += (size_t)n;
+    line[len++] = '\n';
     ssize_t r = write(fd, line, len);
-    (void)r;
+    /* A short write leaves a record with no newline, so the next record
+     * concatenates onto it and is read as one entry with the wrong path and
+     * the wrong backup. Terminate it.
+     *
+     * This only covers a single writer. A concurrent member of the same
+     * process group can land a complete record in the gap between these two
+     * writes, and the merge happens anyway -- which is why the integrity field
+     * above is what correctness actually rests on, and this is only
+     * containment. Every writer-side remedy asks a failing writer to perform
+     * more successful I/O at the moment I/O is failing. */
+    if (r >= 0 && (size_t)r < len) {
+        ssize_t nl = write(fd, "\n", 1);
+        (void)nl;
+    }
 }
 
 /* jwrite("op", field1, field2, NULL) -- to this session's journal */
@@ -594,8 +686,7 @@ static int other_journal_fd(const char *sid)
         return -1;
     if ((size_t)snprintf(path, sizeof path, "%s/journal", sdir) >= sizeof path)
         return -1;
-    REAL(open, int, const char *, int, ...);
-    return real_open(path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
+    return open_journal(sdir, path);
 }
 
 /* Roots already evacuated by this thread, so a recursive delete does not

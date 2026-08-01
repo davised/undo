@@ -40,7 +40,7 @@ int main(void)
             printf("FAIL: mkdtemp\n");
             failures++;
         } else {
-            char deep[PATH_MAX], got[PATH_MAX], file[PATH_MAX];
+            char deep[PATH_MAX], got[PATH_MAX], file[PATH_MAX + 16];
             snprintf(deep, sizeof deep, "%s/a/b/c", base);
             char mk[PATH_MAX + 32];
             snprintf(mk, sizeof mk, "mkdir -p %s", deep);
@@ -68,6 +68,9 @@ int main(void)
             }
         }
     }
+    expect(rec_hash("", 0) == 14695981039346656037ULL, 1, "fnv1a empty");
+    expect(rec_hash("a", 1) == 12638187200555641996ULL, 1, "fnv1a a");
+    expect(rec_hash("foobar", 6) == 9625390261332436968ULL, 1, "fnv1a foobar");
 
     if (failures == 0)
         printf("path predicates ok\n");

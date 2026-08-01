@@ -30,7 +30,14 @@ bin/undo: $(GO_SRC) go.mod
 	@mkdir -p bin
 	go build -ldflags "-X main.version=$(VERSION)" -o $@ ./cmd/undo
 
-test: all
+# The C harness includes the shim translation unit directly, which is how its
+# static functions get tested without exporting them.
+build/shimunit: test/pathpred.c shim/undo_shim.c
+	@mkdir -p build
+	$(CC) -O2 -Wall -Wextra -o $@ test/pathpred.c -ldl
+
+test: all build/shimunit
+	./build/shimunit
 	go test ./...
 	./test/e2e.sh
 
