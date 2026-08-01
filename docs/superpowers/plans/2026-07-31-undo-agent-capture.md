@@ -1405,8 +1405,15 @@ Run: `test/in-container.sh make test`
 Expected: PASS, including cases 39 and 40. Every earlier case now runs with
 `UNDO_SID` set and a matching sid, which is the path a hooked shell takes.
 
-Run: `test/in-container.sh bash test/hook-zsh.sh`
-Expected: PASS.
+Run: `test/in-container.sh bash -c 'apt-get install -y -qq zsh >/dev/null && make all >/dev/null && bash test/hook-zsh.sh'`
+Expected: `zsh hook smoke test passed`.
+
+**zsh is not in the test image**, so the bare
+`test/in-container.sh bash test/hook-zsh.sh` this plan originally gave
+exits 127 with `zsh: command not found` — an unrunnable check that reads
+as a failure rather than as a skip. Found during execution. Installing it
+first is what makes this step verify anything, and it matters here
+because this task changes `shell/undo.zsh`.
 
 Run the floor check.
 Expected: `GLIBC_2.34`. `getsid` is `GLIBC_2.2.5`.
@@ -1972,6 +1979,15 @@ static void fill_session(const char *dir, pid_t pgid)
     group_cmdline(pgid, buf, sizeof buf);
     write_meta(dir, "cmd", buf);
 
+    /* pid and pgid are the SAME number here, and must stay that way.
+     * Both name the group leader, and Session.probe depends on it: when
+     * pgid is 1 it cannot use kill(-1, 0) and falls back to the pid,
+     * which is safe only because pgid 1 implies pid 1 -- init, which
+     * cannot exit while its children are still running. Recording the
+     * creating process's pid instead would put a dead leader pid beside
+     * an unprobeable group and make a running command collectible. A
+     * review gate raised that scenario; this is what keeps it
+     * hypothetical. */
     snprintf(buf, sizeof buf, "%d\n", (int)pgid);
     write_meta(dir, "pid", buf); /* an older undo probes this */
     write_meta(dir, "pgid", buf);
@@ -2198,16 +2214,21 @@ static const char *lazy_session(void);
 
 `armed()` needs no change: it already tests `session_dir() != NULL`.
 
-**Order matters in the file.** `explicit_session` and `session_dir` currently
-sit near the top, above `journal_fd`; `lazy_session` depends on `group_key`,
-which depends on `parse_ulong`, which is defined much lower. Move
-`parse_ulong` up to just below the `REAL` macro so the group-identity section
-can be placed above `session_dir`, and leave a comment where it was:
+**Order matters in the file.** `explicit_session` and `session_dir` sit near
+the top, above `journal_fd`; `lazy_session` depends on `group_key`, which
+depends on `parse_ulong`.
 
-```c
-/* parse_ulong moved above the session helpers: group identity needs it, and
- * those run before anything else in this file. */
-```
+**`parse_ulong` has already been moved** — Task 4 needed it for `session_dir`'s
+`UNDO_SID` comparison, so it now sits just below the `REAL` macro with a marker
+left where it used to be. Nothing to do here; place the group-identity section
+above `session_dir` and it will resolve.
+
+That move was originally scheduled for this task, and Task 4 hit an
+implicit-declaration error because of it. Worth noting why no review caught it:
+the plan is reviewed one task at a time, but the file compiles as a whole, so a
+dependency introduced before the plan satisfies it is invisible per task. If a
+later task introduces another such ordering dependency, expect the compiler to
+be what finds it.
 
 - [ ] **Step 5: Run everything**
 
@@ -2717,7 +2738,8 @@ git commit -m "gc: take the group links of sessions that are gone"
       e2e case through 49
 - [ ] `test/in-container.sh --privileged test/multifs.sh` — the two-filesystem
       harnesses
-- [ ] `test/in-container.sh bash test/hook-zsh.sh` — the zsh hook still loads
+- [ ] `test/in-container.sh bash -c 'apt-get install -y -qq zsh >/dev/null && make all >/dev/null && bash test/hook-zsh.sh'` — the zsh hook still loads. zsh is not in the test
+      image; without installing it this exits 127 rather than skipping.
 - [ ] Floor check from Global Constraints — still `GLIBC_2.34`
 - [ ] `tools/check-no-site-data.sh && tools/check-ere.sh`
 - [ ] `git fetch upstream && git log --oneline HEAD..upstream/main` — still

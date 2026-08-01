@@ -61,7 +61,8 @@ run_armed() {
     printf '%s\t%s\t%s\n' "$(uname -n)" \
         "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" \
         "$(readlink /proc/self/ns/pid 2>/dev/null)" >"$sess/host"
-    env UNDO_SESSION="$sess" LD_PRELOAD="$LIB" bash -c "$*"
+    env UNDO_SESSION="$sess" UNDO_SID="$(statfield self 6)" \
+        LD_PRELOAD="$LIB" bash -c "$*"
     sleep 0.01 # keep session ids strictly ordered
 }
 
@@ -607,6 +608,38 @@ before it existed; every one of them now reads as corrupt"
 "$UNDO" apply "$id" -y >/dev/null
 [[ -f $PLAY/top.txt ]] ||
     fail "case 38: a record written by the older shim was not restored"
+
+echo "== case 39: a process that detached ignores the session it inherited"
+make_tree
+id=$(date +%s%N | cut -c1-16)
+sess=$UNDO_DATA_DIR/sessions/$id
+mkdir -p "$sess/data"
+echo "the command that started the daemon" >"$sess/cmd"
+printf '%s\t%s\t%s\n' "$(uname -n)" \
+    "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" \
+    "$(readlink /proc/self/ns/pid 2>/dev/null)" >"$sess/host"
+# setsid puts the command in a new terminal session, which is what a
+# multiplexer server or any daemonizing program does
+env UNDO_SESSION="$sess" UNDO_SID="$(statfield self 6)" \
+    LD_PRELOAD="$LIB" setsid bash -c "rm $PLAY/top.txt" || true
+[[ ! -e $PLAY/top.txt ]] || fail "case 39: the rm did not run"
+[[ ! -s $sess/journal ]] ||
+    fail "case 39: a detached process wrote into the session it inherited; \
+after gc collects that session those writes go to an unlinked inode"
+
+echo "== case 40: without UNDO_SID the inherited session is still honoured"
+make_tree
+id=$(date +%s%N | cut -c1-16)
+sess=$UNDO_DATA_DIR/sessions/$id
+mkdir -p "$sess/data"
+echo "an older hook that does not set UNDO_SID" >"$sess/cmd"
+printf '%s\t%s\t%s\n' "$(uname -n)" \
+    "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" \
+    "$(readlink /proc/self/ns/pid 2>/dev/null)" >"$sess/host"
+env UNDO_SESSION="$sess" LD_PRELOAD="$LIB" setsid bash -c "rm $PLAY/top.txt" || true
+[[ -s $sess/journal ]] ||
+    fail "case 40: the detach test disarmed a shell whose hook predates \
+UNDO_SID; a rollout would silently stop recording"
 
 echo
 echo "all cases passed"

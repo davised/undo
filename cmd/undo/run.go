@@ -63,12 +63,21 @@ func armedEnv(base []string, shim, dir string) []string {
 			}
 			continue
 		}
-		if strings.HasPrefix(kv, "UNDO_SESSION=") {
+		if strings.HasPrefix(kv, "UNDO_SESSION=") ||
+			strings.HasPrefix(kv, "UNDO_SID=") {
 			continue
 		}
 		env = append(env, kv)
 	}
-	return append(env, "UNDO_SESSION="+dir, "LD_PRELOAD="+preload)
+	env = append(env, "UNDO_SESSION="+dir, "LD_PRELOAD="+preload)
+	// Whoever sets UNDO_SESSION sets UNDO_SID. Without it a daemon this
+	// command starts inherits the session for its entire life and keeps
+	// appending to it long after it finished -- and once gc collects it, to an
+	// unlinked inode, with nothing printed. See session_dir in the shim.
+	if sid := selfStatField(6); sid != "" {
+		env = append(env, "UNDO_SID="+sid)
+	}
+	return env
 }
 
 // isUndoShim reports whether an LD_PRELOAD entry is one of our shims,
@@ -131,3 +140,28 @@ func cmdRun(argv []string) {
 	}
 	os.Exit(code)
 }
+
+// procStatField reads a one-indexed space-separated field of a /proc stat file.
+//
+// Counted forward from the last ')': field 2 is the executable name in
+// parentheses and may itself contain spaces and parentheses, which is the
+// classic way to misparse this file.
+func procStatField(path string, n int) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	s := string(b)
+	i := strings.LastIndex(s, ")")
+	if i < 0 {
+		return ""
+	}
+	f := strings.Fields(s[i+1:])
+	// f[0] is field 3, so field n is at index n-3
+	if n < 3 || n-3 >= len(f) {
+		return ""
+	}
+	return f[n-3]
+}
+
+func selfStatField(n int) string { return procStatField("/proc/self/stat", n) }

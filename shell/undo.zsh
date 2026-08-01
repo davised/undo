@@ -35,7 +35,14 @@ typeset -g _undo_origin=
 if [[ -n ${HOST:-} && -n $_undo_boot && -n $_undo_pidns ]]; then
     typeset -g _undo_origin=$HOST$'\t'$_undo_boot$'\t'$_undo_pidns
 fi
-unset _undo_boot _undo_pidns
+# The terminal session id, so the shim can tell an inherited UNDO_SESSION from
+# one meant for this process. See session_dir in the shim.
+_undo_sid=
+if [[ -r /proc/self/stat ]]; then
+    read -r _ _ _ _ _ _undo_sid _ < /proc/self/stat
+fi
+[[ -n $_undo_sid ]] && export UNDO_SID=$_undo_sid
+unset _undo_boot _undo_pidns _undo_sid
 
 # extra ignore patterns from the config file, colon-joined for the shim.
 # The shim always ignores node_modules/.cache/__pycache__/.git on top.

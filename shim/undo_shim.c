@@ -43,13 +43,57 @@ static __thread int in_shim;
     if (!real_##name)                                                        \
         real_##name = (ret (*)(__VA_ARGS__))dlsym(RTLD_NEXT, #name);
 
+/* Up here rather than with the backup helpers: session_dir needs it, and that
+ * runs before everything else in this file. */
+/* Hand-rolled so the shim never references strtoul. Under _GNU_SOURCE a
+ * modern glibc redirects strtoul to __isoc23_strtoul, which only exists
+ * in glibc >= 2.38 and makes the .so refuse to load on older distros
+ * (Debian 12, Ubuntu 22.04, RHEL 9). */
+static unsigned long parse_ulong(const char *s)
+{
+    unsigned long v = 0;
+    if (!s)
+        return 0;
+    while (*s == ' ' || *s == '\t')
+        s++;
+    for (; *s >= '0' && *s <= '9'; s++) {
+        if (v > (ULONG_MAX - (unsigned long)(*s - '0')) / 10)
+            return ULONG_MAX; /* saturate rather than wrap */
+        v = v * 10 + (unsigned long)(*s - '0');
+    }
+    return v;
+}
+
 /* ---------- session state ---------- */
 
+/* The session this process should write to, or NULL.
+ *
+ * An inherited UNDO_SESSION is rejected when this process has left the
+ * terminal session that set it. A process that calls setsid() -- a terminal
+ * multiplexer server, any daemonizing program -- carries the variable for its
+ * entire life and hands it to every child it later spawns; those children then
+ * append to a session that finished long ago, and once gc collects it, to an
+ * unlinked inode, with nothing printed.
+ *
+ * Job control changes a child's pgid but not its sid, so an ordinary command
+ * from a hooked shell still matches and nothing about the existing hook path
+ * changes.
+ *
+ * Deliberately conservative: with UNDO_SID unset there is no trustworthy
+ * reference, so the variable is honoured exactly as before. That is what keeps
+ * sessions from an older hook working through a rollout instead of silently
+ * disarming them. */
 static const char *session_dir(void)
 {
     const char *s = getenv("UNDO_SESSION");
     if (!s || !*s || *s != '/')
         return NULL;
+    const char *sid = getenv("UNDO_SID");
+    if (sid && *sid) {
+        unsigned long armed_sid = parse_ulong(sid);
+        if (armed_sid != 0 && (unsigned long)getsid(0) != armed_sid)
+            return NULL;
+    }
     return s;
 }
 
@@ -453,24 +497,7 @@ static int ensure_store(const char *root, char *out)
 
 /* ---------- backups ---------- */
 
-/* Hand-rolled so the shim never references strtoul. Under _GNU_SOURCE a
- * modern glibc redirects strtoul to __isoc23_strtoul, which only exists
- * in glibc >= 2.38 and makes the .so refuse to load on older distros
- * (Debian 12, Ubuntu 22.04, RHEL 9). */
-static unsigned long parse_ulong(const char *s)
-{
-    unsigned long v = 0;
-    if (!s)
-        return 0;
-    while (*s == ' ' || *s == '\t')
-        s++;
-    for (; *s >= '0' && *s <= '9'; s++) {
-        if (v > (ULONG_MAX - (unsigned long)(*s - '0')) / 10)
-            return ULONG_MAX; /* saturate rather than wrap */
-        v = v * 10 + (unsigned long)(*s - '0');
-    }
-    return v;
-}
+/* parse_ulong moved above the session helpers; see there. */
 
 static unsigned long max_bytes(void)
 {

@@ -50,6 +50,14 @@ if test -n "$_undo_name" -a -n "$_undo_boot" -a -n "$_undo_pidns"
     set -g _undo_origin (string join \t $_undo_name $_undo_boot $_undo_pidns)
 end
 
+# see session_dir in the shim
+if test -r /proc/self/stat
+    set -l _undo_stat (string split ' ' < /proc/self/stat)
+    if test (count $_undo_stat) -ge 6
+        set -gx UNDO_SID $_undo_stat[6]
+    end
+end
+
 # extra ignore patterns from the config file, colon-joined for the shim.
 # The shim always ignores node_modules/.cache/__pycache__/.git on top.
 set -q UNDO_IGNORE_FILE; or set -g UNDO_IGNORE_FILE (set -q XDG_CONFIG_HOME; and echo $XDG_CONFIG_HOME; or echo $HOME/.config)/undo/ignore

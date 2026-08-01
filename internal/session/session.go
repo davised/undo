@@ -97,6 +97,21 @@ func (s *Session) Live() bool {
 // The Pgid > 1 guard is load-bearing, not defensive. kill(-1, 0) is the "every
 // process you may signal" form; it succeeds always, so a session recording
 // pgid 1 would read live forever and nothing could ever collect it.
+//
+// Falling back to the pid when pgid is 1 is safe only because of an invariant
+// the shim maintains and this function silently depends on: a session that
+// records a pgid records the SAME number as its pid, since both name the group
+// leader. So pgid 1 implies pid 1, which is init inside a pid namespace --
+// kill(1, 0) answers nil or EPERM and both read as live, and init cannot exit
+// while its children are still running. Sessions created by a shell hook have
+// no pgid file at all and take the pid path unchanged.
+//
+// If the shim is ever changed to record the creating process's pid instead of
+// the group leader's, that stops holding: a dead leader pid beside an
+// unprobeable group would make a still-running command collectible, which is
+// the data loss this function exists to prevent. A review gate raised exactly
+// that scenario against this code; it is safe today for this reason and no
+// other, so the reason is written down rather than rediscovered.
 func (s *Session) probe() bool {
 	if s.Pgid > 1 {
 		err := syscall.Kill(-s.Pgid, 0)
