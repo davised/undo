@@ -54,6 +54,13 @@ end
 if test -r /proc/self/stat
     set -l _undo_stat (string split ' ' < /proc/self/stat)
     if test (count $_undo_stat) -ge 6
+        # see the bash hook: drop a session inherited across setsid before
+        # publishing our own sid, or we re-authorise the one the shim rejected
+        if set -q UNDO_SESSION; and set -q UNDO_SID
+            if test "$UNDO_SID" != "$_undo_stat[6]"
+                set -e UNDO_SESSION
+            end
+        end
         set -gx UNDO_SID $_undo_stat[6]
     end
 end

@@ -1387,6 +1387,70 @@ if test -r /proc/self/stat
 end
 ```
 
+**Each hook must drop a mismatched inherited session BEFORE publishing its own
+sid.** Found by the gate after this task first shipped, and it defeats the
+whole change if omitted: a multiplexer pane inherits UNDO_SESSION, UNDO_SID and
+LD_PRELOAD, the shim correctly rejects the stale session while UNDO_SID still
+names the terminal session that set it -- and then the hook exports UNDO_SID
+with its own sid, the comparison matches again, and the stale session is live
+for the rest of shell startup.
+
+In `shell/undo.bash` and `shell/undo.zsh`, immediately before the
+`export UNDO_SID` line:
+
+```bash
+# A session inherited across setsid is not ours. We are about to overwrite
+# UNDO_SID with our own sid, which would re-authorise it for the rest of
+# startup, so it goes first. Only on disagreement: unset UNDO_SID means no
+# reference, and the shim honours UNDO_SESSION in that case by design.
+if [[ -n ${UNDO_SESSION-} && -n ${UNDO_SID-} && ${UNDO_SID-} != "$_undo_sid" ]]; then
+    unset UNDO_SESSION
+fi
+```
+
+In `shell/undo.fish`, immediately before `set -gx UNDO_SID $_undo_stat[6]`:
+
+```fish
+        if set -q UNDO_SESSION; and set -q UNDO_SID
+            if test "$UNDO_SID" != "$_undo_stat[6]"
+                set -e UNDO_SESSION
+            end
+        end
+```
+
+**And pin it in `test/hook-zsh.sh`**, which is the only harness that exercises
+hook *sourcing*. Add `"$WORK/zdot2"` to the existing `mkdir -p`, then before
+the final success message:
+
+```bash
+# A session inherited across setsid must not survive sourcing the hook.
+#
+# Recorded from inside .zshrc rather than asked for afterwards: _undo_preexec
+# creates a fresh session before the first command runs, so an interactive
+# `echo $UNDO_SESSION` always reports that new session and can never see the
+# window this guards. The first version of this test did exactly that and
+# reported a real session id, which reads as the guard failing.
+cat >"$WORK/zdot2/.zshrc" <<EOF
+export UNDO_DATA_DIR=$WORK/store
+export UNDO_LIB=$ROOT/build/libundo.so
+export UNDO_SESSION=$WORK/stale-session
+export UNDO_SID=999999
+path=($ROOT/bin \$path)
+source $ROOT/shell/undo.zsh
+print -r -- "AFTER_SOURCE=[\${UNDO_SESSION-unset}]" >"$WORK/observed"
+EOF
+printf 'exit\n' | ZDOTDIR=$WORK/zdot2 zsh -i >/dev/null 2>&1 || true
+if ! grep -q 'AFTER_SOURCE=\[unset\]' "$WORK/observed" 2>/dev/null; then
+    echo "FAIL: the hook kept a session inherited across setsid" >&2
+    cat "$WORK/observed" 2>/dev/null >&2
+    exit 1
+fi
+echo "stale-session guard passed"
+```
+
+Verified to discriminate: with the guard both scenarios pass, with the guard
+reverted this one fails.
+
 - [ ] **Step 5: Make the e2e harness set it too**
 
 `run_armed` stands in for a hook, so it must export what a hook exports or no

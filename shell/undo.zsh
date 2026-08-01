@@ -41,6 +41,11 @@ _undo_sid=
 if [[ -r /proc/self/stat ]]; then
     read -r _ _ _ _ _ _undo_sid _ < /proc/self/stat
 fi
+# see the bash hook: drop a session inherited across setsid before publishing
+# our own sid, or we re-authorise the one the shim just rejected
+if [[ -n ${UNDO_SESSION-} && -n ${UNDO_SID-} && ${UNDO_SID-} != "$_undo_sid" ]]; then
+    unset UNDO_SESSION
+fi
 [[ -n $_undo_sid ]] && export UNDO_SID=$_undo_sid
 unset _undo_boot _undo_pidns _undo_sid
 

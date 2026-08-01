@@ -38,6 +38,13 @@ _undo_sid=
 if [[ -r /proc/self/stat ]]; then
     read -r _ _ _ _ _ _undo_sid _ < /proc/self/stat
 fi
+# A session inherited across setsid is not ours. We are about to overwrite
+# UNDO_SID with our own sid, which would re-authorise it for the rest of
+# startup, so it goes first. Only on disagreement: unset UNDO_SID means no
+# reference, and the shim honours UNDO_SESSION in that case by design.
+if [[ -n ${UNDO_SESSION-} && -n ${UNDO_SID-} && ${UNDO_SID-} != "$_undo_sid" ]]; then
+    unset UNDO_SESSION
+fi
 [[ -n $_undo_sid ]] && export UNDO_SID=$_undo_sid
 unset _undo_sid
 
