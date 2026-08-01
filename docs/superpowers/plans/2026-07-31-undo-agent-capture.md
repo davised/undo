@@ -696,9 +696,38 @@ leave that session an unversioned journal full of stamped records:
     return open_journal(sdir, path);
 ```
 
-- [ ] **Step 5: Add the e2e case**
+- [ ] **Step 5: Add the e2e cases**
 
-Append to `test/e2e.sh`:
+Add these helpers near `fail()` in `test/e2e.sh` first — every case below uses
+them, and hand-rolling the field reads is what the gate caught twice:
+
+```bash
+# Field <n> of /proc/<pid>/stat, one-indexed.
+#
+# Everything up to the LAST ')' is stripped first: field 2 is the executable
+# name in parentheses and may contain spaces and parentheses of its own, so
+# `cut -d' ' -fN` silently reads the wrong field for such a process.
+statfield() { # statfield <pid|self> <n>
+    sed 's/.*) //' "/proc/$1/stat" | awk -v n="$(( $2 - 2 ))" '{print $n}'
+}
+
+# UNDO_ARM exactly as `undo arm` builds it: the process group's id, paired with
+# the START TIME OF THE GROUP LEADER -- not our own.
+#
+# When this shell is not its group leader, which is the ordinary case in a
+# container with no job control, those are two different processes and pairing
+# them describes nothing at all. armer_is_us would never match and the
+# exclusion would silently stop working.
+arm_id() {
+    local pgid st
+    pgid=$(statfield self 5)
+    st=$(statfield "$pgid" 22)
+    [[ -n $pgid && -n $st ]] || return 1
+    printf '%s:%s\n' "$pgid" "$st"
+}
+```
+
+Then append the cases:
 
 ```bash
 echo "== case 36: every record carries an integrity field the reader accepts"
@@ -743,7 +772,7 @@ cp "$PLAY/top.txt" "$sess/data/legacy-1"
 rm -f "$PLAY/top.txt"
 printf 'unlink\t%s\t%s\tlink\n' "$PLAY/top.txt" "$sess/data/legacy-1" >"$sess/journal"
 # now the new shim appends to that same journal
-env UNDO_SESSION="$sess" UNDO_SID="$(cut -d' ' -f6 /proc/self/stat)" \
+env UNDO_SESSION="$sess" UNDO_SID="$(statfield self 6)" \
     LD_PRELOAD="$LIB" bash -c "rm $PLAY/docs/report.txt"
 [[ ! -f $sess/journalv ]] ||
     fail "case 38: the integrity contract was declared over records written \
@@ -1125,7 +1154,7 @@ printf '%s\t%s\t%s\n' "$(uname -n)" \
     "$(readlink /proc/self/ns/pid 2>/dev/null)" >"$sess/host"
 # setsid puts the command in a new terminal session, which is what a
 # multiplexer server or any daemonizing program does
-env UNDO_SESSION="$sess" UNDO_SID="$(cut -d' ' -f6 /proc/self/stat)" \
+env UNDO_SESSION="$sess" UNDO_SID="$(statfield self 6)" \
     LD_PRELOAD="$LIB" setsid bash -c "rm $PLAY/top.txt" || true
 [[ ! -e $PLAY/top.txt ]] || fail "case 39: the rm did not run"
 [[ ! -s $sess/journal ]] ||
@@ -1300,7 +1329,7 @@ case exercises the matching path.
 In `test/e2e.sh`, in `run_armed`, change the `env` line to:
 
 ```bash
-    env UNDO_SESSION="$sess" UNDO_SID="$(cut -d' ' -f6 /proc/self/stat)" \
+    env UNDO_SESSION="$sess" UNDO_SID="$(statfield self 6)" \
         LD_PRELOAD="$LIB" bash -c "$*"
 ```
 
@@ -1717,7 +1746,7 @@ Append to `test/e2e.sh`:
 # arms a command the way `undo arm` will: environment only, no session
 run_agent() {
     env UNDO_DATA_DIR="$UNDO_DATA_DIR" \
-        UNDO_ARM="$(cut -d' ' -f5 /proc/self/stat):$(cut -d' ' -f22 /proc/self/stat)" \
+        UNDO_ARM="$(arm_id)" \
         LD_PRELOAD="$LIB" setsid bash -c "$*"
     sleep 0.01
 }
@@ -1750,7 +1779,7 @@ make_tree
 before=$(ls "$UNDO_DATA_DIR/sessions" | wc -l)
 # UNDO_ARM naming *this* process group, and the command runs in it
 env UNDO_DATA_DIR="$UNDO_DATA_DIR" \
-    UNDO_ARM="$(cut -d' ' -f5 /proc/self/stat):$(cut -d' ' -f22 /proc/self/stat)" \
+    UNDO_ARM="$(arm_id)" \
     LD_PRELOAD="$LIB" bash -c "rm $PLAY/top.txt"
 [[ ! -e $PLAY/top.txt ]] || fail "case 43: the rm did not run"
 after=$(ls "$UNDO_DATA_DIR/sessions" | wc -l)
