@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -274,5 +275,34 @@ func TestCheckVolumeLeavesNothingBehind(t *testing.T) {
 	}
 	if len(ents) != 0 {
 		t.Fatalf("checkVolume left %d entries behind", len(ents))
+	}
+}
+
+// The deferred cleanup must reload the session, because session.Create returns
+// one with no journal entries and Session.Remove finds distributed backups
+// through exactly those. This pins the reload rather than the leak itself,
+// which needs a built shim and belongs in the e2e suite.
+func TestCheckVolumeRemovesAReloadedSession(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("needs the session store")
+	}
+	store := t.TempDir()
+	t.Setenv("UNDO_DATA_DIR", store)
+
+	before, err := os.ReadDir(filepath.Join(store, "sessions"))
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	// no shim, so the round trip reports a problem rather than succeeding
+	if _, err := checkVolume("", t.TempDir()); err != nil {
+		t.Fatalf("checkVolume returned a target error: %v", err)
+	}
+	after, err := os.ReadDir(filepath.Join(store, "sessions"))
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("checkVolume left %d session(s) behind, was %d",
+			len(after), len(before))
 	}
 }

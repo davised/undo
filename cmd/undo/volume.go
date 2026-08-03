@@ -167,7 +167,25 @@ func checkVolume(shim, target string) (volumeVerdict, error) {
 	if err != nil {
 		return volumeVerdict{}, err
 	}
-	defer sess.Remove() // classification happens first: Remove deletes the very backups being classified
+	defer func() {
+		// Remove finds distributed backups through the session's journal
+		// entries, and session.Create returns a session with none. Reload it,
+		// or a store this round trip placed on the target filesystem outlives
+		// the diagnostic: every path that skips the restore -- a corrupt
+		// journal, duplicate records, an unexpected backup location -- would
+		// otherwise orphan <root>/.undo/<id>/ in the user's own tree.
+		//
+		// Safe after a successful restore too: the backup has already moved
+		// back by then, so there is nothing left to unlink and this is a
+		// no-op. Nothing outside our own store is reachable either way --
+		// removeDistributedBackups checks both the path's shape against this
+		// session's id and what is actually on disk before unlinking.
+		if fresh, err := session.Get(sess.ID); err == nil {
+			fresh.Remove()
+			return
+		}
+		sess.Remove()
+	}()
 
 	// The victim is passed as an argument, never concatenated into the script:
 	// once a user-supplied path reaches here, a space or a metacharacter would
