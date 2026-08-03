@@ -4,6 +4,8 @@ import (
 	"os"
 	"runtime"
 	"testing"
+
+	"github.com/edaywalid/undo/internal/journal"
 )
 
 // The probe must answer for a real directory without reporting an error.
@@ -87,5 +89,105 @@ func TestTryCloneThatSucceedsMovedTheData(t *testing.T) {
 	}
 	if string(got) != body {
 		t.Fatalf("clone reported success but dst holds %q, want %q", got, body)
+	}
+}
+
+func TestStoreRootOfTakesTheComponentBeforeUndo(t *testing.T) {
+	root, ok := storeRootOf("/data/me/.undo/1785717763234605/4882-1", "1785717763234605")
+	if !ok || root != "/data/me" {
+		t.Fatalf("got %q ok=%v, want /data/me true", root, ok)
+	}
+}
+
+// A path shaped like a store but belonging to some other session is not this
+// session's store, and reporting it as one would name a directory this run
+// never wrote to.
+func TestStoreRootOfRejectsAnotherSessionsStore(t *testing.T) {
+	if _, ok := storeRootOf("/data/me/.undo/1111111111111111/x-1", "2222222222222222"); ok {
+		t.Fatal("accepted a store belonging to a different session")
+	}
+}
+
+func TestStoreRootOfRejectsAnEmptyPrefix(t *testing.T) {
+	if _, ok := storeRootOf("/.undo/1785717763234605/x-1", "1785717763234605"); ok {
+		t.Fatal("accepted the filesystem root as a store root")
+	}
+}
+
+func TestClassifyReadsTheMethodOfTheMatchingUnlink(t *testing.T) {
+	entries := []journal.Entry{
+		{Op: journal.OpStoreMove, Fields: []string{"/data/me/.undo", "-"}},
+		{Op: journal.OpUnlink, Fields: []string{"/t/canary", "/data/me/.undo/99/1", "link"}},
+	}
+	v := classify(entries, "/t/canary", "/store/sessions/99", "99")
+	if v.Problem != "" {
+		t.Fatalf("unexpected problem: %s", v.Problem)
+	}
+	if v.Method != "link" || v.StoreRoot != "/data/me" || v.Fallback || v.Lost {
+		t.Fatalf("got %+v", v)
+	}
+}
+
+// A backup that failed is written as `lost <victim> unlink`, NOT as an unlink
+// record. Matching only OpUnlink goes blind exactly when nothing was saved,
+// which is the case most worth reporting.
+func TestClassifyMatchesTheLostRecordForAFailedBackup(t *testing.T) {
+	entries := []journal.Entry{
+		{Op: journal.OpLost, Fields: []string{"/t/canary", "unlink"}},
+	}
+	v := classify(entries, "/t/canary", "/store/sessions/99", "99")
+	if v.Problem != "" {
+		t.Fatalf("unexpected problem: %s", v.Problem)
+	}
+	if !v.Lost {
+		t.Fatalf("a lost record was not reported as lost: %+v", v)
+	}
+}
+
+func TestClassifyReportsTheSessionStoreFallback(t *testing.T) {
+	entries := []journal.Entry{
+		{Op: journal.OpUnlink, Fields: []string{"/t/canary", "/store/sessions/99/data/1", "copy"}},
+	}
+	v := classify(entries, "/t/canary", "/store/sessions/99", "99")
+	if !v.Fallback || v.StoreRoot != "" {
+		t.Fatalf("got %+v, want the fallback", v)
+	}
+}
+
+func TestClassifyRefusesACorruptRecord(t *testing.T) {
+	entries := []journal.Entry{
+		{Op: journal.OpUnlink, Fields: []string{"/t/canary", "/d/.undo/99/1", "link"}, Corrupt: true},
+	}
+	if v := classify(entries, "/t/canary", "/store/sessions/99", "99"); v.Problem == "" {
+		t.Fatal("classified from a record that failed its integrity check")
+	}
+}
+
+// One deletion producing two records is a defect to surface, not something to
+// resolve by silently taking the first or the last.
+func TestClassifyRefusesTwoMatches(t *testing.T) {
+	entries := []journal.Entry{
+		{Op: journal.OpUnlink, Fields: []string{"/t/canary", "/d/.undo/99/1", "link"}},
+		{Op: journal.OpUnlink, Fields: []string{"/t/canary", "/d/.undo/99/2", "link"}},
+	}
+	if v := classify(entries, "/t/canary", "/store/sessions/99", "99"); v.Problem == "" {
+		t.Fatal("accepted two records for one deletion")
+	}
+}
+
+func TestClassifyReportsNothingRecorded(t *testing.T) {
+	if v := classify(nil, "/t/canary", "/store/sessions/99", "99"); v.Problem == "" {
+		t.Fatal("an empty journal was not reported as a problem")
+	}
+}
+
+// An unrecognised token is printed rather than mapped, so that a future save
+// method does not read as a failure.
+func TestClassifyPassesAnUnknownMethodThrough(t *testing.T) {
+	entries := []journal.Entry{
+		{Op: journal.OpUnlink, Fields: []string{"/t/canary", "/d/.undo/99/1", "reflink"}},
+	}
+	if v := classify(entries, "/t/canary", "/store/sessions/99", "99"); v.Method != "reflink" {
+		t.Fatalf("method = %q, want it passed through verbatim", v.Method)
 	}
 }
