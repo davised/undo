@@ -76,8 +76,13 @@ relative target would not produce.
 
 One section per argument, in the order given, even when two arguments land on
 the same filesystem: the user asked about two directories and deduplicating
-would answer a question they did not ask. Where two sections resolve to the
-same store root, say so rather than repeating the work silently.
+would answer a question they did not ask.
+
+An earlier revision also promised to say when two sections resolve to the same
+store root. That is **not implemented**: targets are processed independently
+and no prior roots are tracked. The roots are printed on each line, so two
+arguments sharing one are visible to anyone reading, just not called out.
+Recorded here rather than quietly dropped.
 
 ### The round trip moves; the old location becomes a control
 
@@ -121,8 +126,17 @@ back. Cleanup runs **after** classification and verification, removes only
 paths this run created, and runs **without the armed environment** — deleting
 the canary under the shim would journal a second operation, and with lazy
 session creation it could mint a whole extra session as a side effect of a
-diagnostic. Cleanup failures are reported, not swallowed, but do not change the
-volume's verdict: the answer was already obtained.
+diagnostic.
+
+Cleanup failures are currently **swallowed, not reported** — the canary
+removal, the session removal and the reflink probe's own files all ignore their
+errors. The design asked for them to be visible without changing the volume's
+verdict, and reporting them from a deferred cleanup needs the verdict to be a
+named return value the defer can still amend. That was judged too invasive to
+land at the final gate, so it is recorded as an accepted deviation rather than
+left as a promise the code does not keep. The consequence is bounded: a
+cleanup failure leaves a canary or a session behind and says nothing, which
+e2e case 59 would catch for the store and case 56 for the canary.
 
 ### Why the canary is not placed in a temp subdirectory
 
