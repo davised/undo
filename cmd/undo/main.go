@@ -32,7 +32,7 @@ usage:
   undo show [id]          show what a session changed
   undo gc                 prune old, empty, and oversized sessions
   undo purge              delete all stored sessions and backups
-  undo doctor             check the install and run a live self-test
+  undo doctor [path...]   check the install, and whether files are protected here
   undo arm -- <harness>   arm an agent so everything it runs is captured
   undo upgrade [--check]  update to the latest release
   undo uninstall [--purge] remove undo (--purge also deletes backups)
@@ -457,7 +457,7 @@ func main() {
 	case "purge":
 		cmdPurge(yes, opts.Force)
 	case "doctor":
-		cmdDoctor()
+		cmdDoctor(args[1:])
 	case "upgrade":
 		cmdUpgrade(len(args) > 1 && args[1] == "--check")
 	case "uninstall":

@@ -3,12 +3,9 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
-	"github.com/edaywalid/undo/internal/journal"
-	"github.com/edaywalid/undo/internal/restore"
 	"github.com/edaywalid/undo/internal/session"
 )
 
@@ -33,7 +30,7 @@ func (s checkState) mark() string {
 
 // cmdDoctor runs environment checks and a live capture/restore round trip,
 // so "nothing happened" turns into a concrete diagnosis.
-func cmdDoctor() {
+func cmdDoctor(targets []string) {
 	var worst checkState
 	report := func(state checkState, name, detail string) {
 		if state > worst {
@@ -44,6 +41,17 @@ func cmdDoctor() {
 			line += ": " + detail
 		}
 		fmt.Println(line)
+	}
+
+	if len(targets) == 0 {
+		wd, err := os.Getwd()
+		if err != nil {
+			report(failed, "volume", "cannot determine the working directory: "+err.Error())
+			wd = ""
+		}
+		if wd != "" {
+			targets = []string{wd}
+		}
 	}
 
 	fmt.Println("undo doctor")
@@ -76,7 +84,32 @@ func cmdDoctor() {
 
 	// 6 and 7. live capture + restore round trip
 	if shim != "" {
-		reportRoundTrip(report, shim)
+		controlRun, controlOK := false, false
+		for _, t := range targets {
+			v, err := checkVolume(shim, t)
+			if err != nil {
+				// never reached the shim, so the control would say nothing
+				report(failed, "volume "+t, err.Error())
+				continue
+			}
+			// The literal labels below are asserted by test/e2e.sh case 23.
+			if v.Problem != "" {
+				if !controlRun {
+					controlRun, controlOK = true, controlPasses(shim)
+				}
+				if controlOK {
+					report(failed, "capture", v.Problem+
+						"; the same check passes in the temporary directory, so this volume is the difference")
+				} else {
+					report(failed, "capture", v.Problem+
+						"; it also fails in the temporary directory, so this volume is not implicated")
+				}
+				continue
+			}
+			report(pass, "capture", "1 change recorded")
+			report(pass, "restore", "canary recovered intact")
+			reportVolume(report, t, v)
+		}
 	}
 
 	fmt.Println()
@@ -148,12 +181,13 @@ func reportStore(report func(checkState, string, string), root string) {
 		return
 	}
 	// writability probe
-	probe := filepath.Join(root, ".doctor-probe")
-	if err := os.WriteFile(probe, []byte("x"), 0o600); err != nil {
+	probe, err := os.CreateTemp(root, ".doctor-probe-")
+	if err != nil {
 		report(failed, "store", "not writable: "+err.Error())
 		return
 	}
-	os.Remove(probe)
+	probe.Close()
+	os.Remove(probe.Name())
 
 	// Only the sessions dir holds backups, so it is the one that must be
 	// private. Its parent also holds the hook scripts and is world-readable
@@ -220,59 +254,55 @@ func reportHooks(report func(checkState, string, string), shim string) {
 		dir, dir, dir))
 }
 
-func reportRoundTrip(report func(checkState, string, string), shim string) {
-	dir, err := os.MkdirTemp("", "undo-doctor-")
+// reportVolume prints what one target established. The two labels that are
+// qualified here are qualified deliberately: reflink is a property of the
+// filesystem that the shim does not yet use, and the budget is one global
+// number, not a per-volume one. Dropping either qualifier would tell the
+// reader something untrue.
+func reportVolume(report func(checkState, string, string), name string, v volumeVerdict) {
+	switch {
+	case v.Lost:
+		report(warn, "volume "+name, "nothing was saved for the canary here")
+	case v.Fallback:
+		report(warn, "volume "+name,
+			"no directory you own on this filesystem, so backups go to the session store as "+
+				"size-capped copies. Creating a directory of your own on this volume fixes it")
+	default:
+		free := "costing real bytes"
+		if v.Method == "link" {
+			free = "hardlinked, costing nothing"
+		}
+		report(pass, "volume "+name, fmt.Sprintf("store %s; deletions %s (%s)",
+			v.StoreRoot, free, v.Method))
+	}
+	if v.ReflinkKnown {
+		state := "no"
+		if v.Reflink {
+			state = "yes"
+		}
+		fmt.Printf("       reflink on this filesystem: %s (not yet used by the shim)\n", state)
+	}
+	fmt.Printf("       overwrite cap %s per file; store budget %s, global rather than per-volume\n",
+		envOr("UNDO_MAX_BYTES", "256 MiB"), envOr("UNDO_MAX_STORE", "1 GiB"))
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+// controlPasses re-runs the round trip in the temporary directory, to separate
+// "this volume cannot be protected" from "the shim is not working anywhere it
+// was tried". It narrows a diagnosis; it does not prove causation -- both
+// locations carry their own permissions, mount options and ignore rules.
+func controlPasses(shim string) bool {
+	dir, err := os.MkdirTemp("", "undo-doctor-control-")
 	if err != nil {
-		report(failed, "round trip", err.Error())
-		return
+		return false
 	}
 	defer os.RemoveAll(dir)
-
-	victim := filepath.Join(dir, "canary.txt")
-	const body = "undo doctor canary\n"
-	if err := os.WriteFile(victim, []byte(body), 0o644); err != nil {
-		report(failed, "round trip", err.Error())
-		return
-	}
-
-	sess, err := session.Create("undo doctor self-test")
-	if err != nil {
-		report(failed, "round trip", err.Error())
-		return
-	}
-	defer sess.Remove()
-
-	// delete the canary through a shell with the shim armed
-	cmd := exec.Command("/bin/sh", "-c", "rm "+victim)
-	cmd.Env = armedEnv(os.Environ(), shim, sess.Dir)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		report(failed, "capture", fmt.Sprintf("rm failed: %v %s", err, out))
-		return
-	}
-	sess.MarkDone()
-
-	entries, _ := journal.Read(filepath.Join(sess.Dir, "journal"))
-	if len(entries) == 0 {
-		report(failed, "capture",
-			"the shim did not record the deletion (LD_PRELOAD may be blocked here)")
-		return
-	}
-	report(pass, "capture", fmt.Sprintf("%d change recorded", len(entries)))
-
-	// reload and restore
-	fresh, err := session.Get(sess.ID)
-	if err != nil {
-		report(failed, "restore", err.Error())
-		return
-	}
-	if _, err := restore.Run(fresh, restore.Undo, restore.Options{}); err != nil {
-		report(failed, "restore", err.Error())
-		return
-	}
-	got, err := os.ReadFile(victim)
-	if err != nil || string(got) != body {
-		report(failed, "restore", "canary not restored to its original contents")
-		return
-	}
-	report(pass, "restore", "canary recovered intact")
+	v, err := checkVolume(shim, dir)
+	return err == nil && v.Problem == ""
 }
