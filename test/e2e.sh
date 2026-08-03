@@ -26,6 +26,39 @@ statfield() { # statfield <pid|self> <n>
     sed 's/.*) //' "/proc/$1/stat" | awk -v n="$(( $2 - 2 ))" '{print $n}'
 }
 
+# The session id the shim guards against (shim/undo_shim.c): getsid(2), not
+# /proc/self/stat field 6. Those two agree natively but NOT under qemu user-mode
+# emulation, where /proc hides the session and reads field 6 as 0 while getsid
+# still reports the real id. Ordinary runs are native and the two agree; an
+# emulated run -- the only way to reach the el9/amd64 target from an Apple
+# Silicon workstation -- would publish a /proc-derived 0 and silently disarm the
+# detach guard cases 38, 39, 40 and 49 exercise, for a green run that proved
+# nothing. Prefer the real syscall; python3 is optional here (case 21 skips
+# without it), so fall back to /proc rather than requiring it.
+getsid_self() {
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import os; print(os.getsid(0))'
+    else
+        statfield self 6
+    fi
+}
+
+# The detach guard (cases 38/39/40/49) is armed by UNDO_SID. If that value is
+# empty or 0 the shim treats it as "no trustworthy reference" and honours the
+# inherited session, so every one of those cases passes vacuously while testing
+# nothing -- the same silent-data-loss-is-success failure this suite exists to
+# catch. Under qemu user-mode emulation /proc/self/stat field 6 reads 0 while
+# getsid(2) correctly reports the real id, so a /proc-derived value is exactly
+# what hits here. Refuse to run rather than publish a green but meaningless
+# result.
+_undo_sid=$(getsid_self)
+if [[ -z $_undo_sid || $_undo_sid == 0 ]]; then
+    fail "no trustworthy session id (got '$_undo_sid'); the detach guard would \
+be silently disarmed. qemu user-mode emulation hides the session from /proc and \
+has no python3 here to ask getsid(2) instead -- run natively, and cover the \
+el9/amd64 target with the el9 CI job"
+fi
+
 # UNDO_ARM exactly as `undo arm` builds it: the process group's id, paired with
 # the START TIME OF THE GROUP LEADER -- not our own.
 #
@@ -61,7 +94,7 @@ run_armed() {
     printf '%s\t%s\t%s\n' "$(uname -n)" \
         "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" \
         "$(readlink /proc/self/ns/pid 2>/dev/null)" >"$sess/host"
-    env UNDO_SESSION="$sess" UNDO_SID="$(statfield self 6)" \
+    env UNDO_SESSION="$sess" UNDO_SID="$_undo_sid" \
         LD_PRELOAD="$LIB" bash -c "$*"
     sleep 0.01 # keep session ids strictly ordered
 }
@@ -600,7 +633,7 @@ cp "$PLAY/top.txt" "$sess/data/legacy-1"
 rm -f "$PLAY/top.txt"
 printf 'unlink\t%s\t%s\tlink\n' "$PLAY/top.txt" "$sess/data/legacy-1" >"$sess/journal"
 # now the new shim appends to that same journal
-env UNDO_SESSION="$sess" UNDO_SID="$(statfield self 6)" \
+env UNDO_SESSION="$sess" UNDO_SID="$_undo_sid" \
     LD_PRELOAD="$LIB" bash -c "rm $PLAY/docs/report.txt"
 [[ ! -f $sess/journalv ]] ||
     fail "case 38: the integrity contract was declared over records written \
@@ -620,7 +653,7 @@ printf '%s\t%s\t%s\n' "$(uname -n)" \
     "$(readlink /proc/self/ns/pid 2>/dev/null)" >"$sess/host"
 # setsid puts the command in a new terminal session, which is what a
 # multiplexer server or any daemonizing program does
-env UNDO_SESSION="$sess" UNDO_SID="$(statfield self 6)" \
+env UNDO_SESSION="$sess" UNDO_SID="$_undo_sid" \
     LD_PRELOAD="$LIB" setsid bash -c "rm $PLAY/top.txt" || true
 [[ ! -e $PLAY/top.txt ]] || fail "case 39: the rm did not run"
 [[ ! -s $sess/journal ]] ||
@@ -640,9 +673,6 @@ env UNDO_SESSION="$sess" LD_PRELOAD="$LIB" setsid bash -c "rm $PLAY/top.txt" || 
 [[ -s $sess/journal ]] ||
     fail "case 40: the detach test disarmed a shell whose hook predates \
 UNDO_SID; a rollout would silently stop recording"
-
-echo
-echo "all cases passed"
 
 # arms a command the way `undo arm` will: environment only, no session
 run_agent() {
@@ -812,7 +842,7 @@ inherited=$UNDO_DATA_DIR/sessions/$(date +%s%N | cut -c1-16)
 mkdir -p "$inherited/data"
 echo "the shell command that started the agent" >"$inherited/cmd"
 before=$(ls "$UNDO_DATA_DIR/sessions" | wc -l)
-env UNDO_SESSION="$inherited" UNDO_SID="$(statfield self 6)" UNDO_LIB=$LIB \
+env UNDO_SESSION="$inherited" UNDO_SID="$_undo_sid" UNDO_LIB=$LIB \
     "$UNDO" arm -- bash -c "setsid rm $PLAY/top.txt; sleep 0.3"
 [[ ! -e $PLAY/top.txt ]] || fail "case 52: the rm did not run"
 [[ ! -s $inherited/journal ]] ||
@@ -820,3 +850,10 @@ env UNDO_SESSION="$inherited" UNDO_SID="$(statfield self 6)" UNDO_LIB=$LIB \
 after=$(ls "$UNDO_DATA_DIR/sessions" | wc -l)
 [[ $after -gt $before ]] ||
     fail "case 52: no new session was created for the spawned process group"
+
+# Last line of the file, deliberately. This banner used to sit after case 40,
+# where the agent-capture cases were later appended past it: the suite
+# announced success with twelve cases still to run, and AGENTS.md names this
+# line as the signal to trust. Anything added below must go ABOVE it.
+echo
+echo "all cases passed"
