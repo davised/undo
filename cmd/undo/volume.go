@@ -23,8 +23,9 @@ type volumeVerdict struct {
 	Method       string // link, copy, none, or an unrecognised token verbatim
 	Lost         bool   // nothing was saved for the canary
 	Problem      string
-	Reflink      bool // the target's filesystem can clone extents
-	ReflinkKnown bool // the probe produced an answer at all
+	Reflink      bool   // the target's filesystem can clone extents
+	ReflinkKnown bool   // the probe produced an answer at all
+	ReflinkErr   string // why the probe could not answer, empty if it did
 }
 
 // storeRootOf splits a backup path of the form <root>/.undo/<session-id>/<name>
@@ -107,7 +108,7 @@ func classify(entries []journal.Entry, victim, sessionDir, sessionID string) vol
 	v := volumeVerdict{Method: e.Method()}
 	backup := e.Backup()
 	switch {
-	case backup == "" || backup == "-":
+	case backup == "" || backup == "-" || v.Method == "none":
 		v.Lost = true
 	case strings.HasPrefix(backup, sessionDir+"/"):
 		v.Fallback = true
@@ -224,6 +225,8 @@ func checkVolume(shim, target string) (volumeVerdict, error) {
 	if supported, err := probeReflink(dir); err == nil {
 		v.Reflink = supported
 		v.ReflinkKnown = true
+	} else {
+		v.ReflinkErr = err.Error()
 	}
 	return v, nil
 }

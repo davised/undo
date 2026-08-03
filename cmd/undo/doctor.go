@@ -99,16 +99,23 @@ func cmdDoctor(targets []string) {
 					controlRun, controlOK = true, controlPasses(shim)
 				}
 				if controlOK {
-					report(failed, "capture", safeLabel(v.Problem)+
+					report(failed, "capture "+safeLabel(t), safeLabel(v.Problem)+
 						"; the same check passes in the temporary directory, so this volume is the difference")
 				} else {
-					report(failed, "capture", safeLabel(v.Problem)+
+					report(failed, "capture "+safeLabel(t), safeLabel(v.Problem)+
 						"; it also fails in the temporary directory, so this volume is not implicated")
 				}
 				continue
 			}
 			report(pass, "capture", "1 change recorded")
-			report(pass, "restore", "canary recovered intact")
+			if v.Lost {
+				// checkVolume skips the restore when nothing was saved, so there is no
+				// result to report. Saying so beats omitting the line: an absence is
+				// not something a reader should have to notice.
+				report(warn, "restore", "not attempted: there was no backup to restore from")
+			} else {
+				report(pass, "restore", "canary recovered intact")
+			}
 			reportVolume(report, t, v)
 		}
 	}
@@ -283,9 +290,15 @@ func reportVolume(report func(checkState, string, string), name string, v volume
 			"no directory you own on this filesystem, so backups go to the session store as "+
 				"size-capped copies. Creating a directory of your own on this volume fixes it")
 	default:
-		free := "costing real bytes"
-		if v.Method == "link" {
+		// An unrecognised token is printed verbatim rather than guessed at:
+		// a future save method that costs nothing would otherwise be described
+		// as expensive on the strength of not being "link".
+		free := "saved by an unrecognised method"
+		switch v.Method {
+		case "link":
 			free = "hardlinked, costing nothing"
+		case "copy":
+			free = "copied, costing real bytes"
 		}
 		report(pass, "volume "+safeLabel(name), fmt.Sprintf("store %s; deletions %s (%s)",
 			safeLabel(v.StoreRoot), free, v.Method))
@@ -296,6 +309,9 @@ func reportVolume(report func(checkState, string, string), name string, v volume
 			state = "yes"
 		}
 		fmt.Printf("       reflink on this filesystem: %s (not yet used by the shim)\n", state)
+	} else if v.ReflinkErr != "" {
+		fmt.Printf("       reflink on this filesystem: could not tell (%s)\n",
+			safeLabel(v.ReflinkErr))
 	}
 	fmt.Printf("       overwrite cap %s per file; store budget %s, global rather than per-volume\n",
 		envOr("UNDO_MAX_BYTES", "256 MiB"), envOr("UNDO_MAX_STORE", "1 GiB"))

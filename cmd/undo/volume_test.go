@@ -208,6 +208,20 @@ func TestClassifyTreatsADiscardedBackupAsLost(t *testing.T) {
 	}
 }
 
+// A method of "none" is how the reader reports a record whose save did not
+// happen, so it means the same as a missing backup path even when a path is
+// present: deciding loss from the path alone would report a volume as healthy,
+// store root and all, while its own journal says nothing was saved.
+func TestClassifyTreatsAMethodOfNoneAsLost(t *testing.T) {
+	entries := []journal.Entry{
+		{Op: journal.OpUnlink, Fields: []string{"/t/canary", "/d/.undo/99/1", "none"}},
+	}
+	v := classify(entries, "/t/canary", "/store/sessions/99", "99")
+	if !v.Lost {
+		t.Fatalf("got %+v, want lost: the journal says no save method succeeded", v)
+	}
+}
+
 // A sibling directory whose name merely starts with the session dir is not
 // the session dir.
 func TestClassifyDoesNotMistakeASiblingForTheSessionStore(t *testing.T) {
