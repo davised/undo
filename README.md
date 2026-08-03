@@ -210,6 +210,18 @@ $ undo doctor
 canary file, so you get a real answer rather than a guess. Then try it
 for yourself:
 
+`doctor` answers for the directory you run it in, because the answer differs
+per filesystem: a deletion is a free hardlink only when undo can put its store
+on the same filesystem as the file. Name other directories to ask about them
+too:
+
+```console
+$ undo doctor ~ /scratch
+```
+
+A volume reported as using the session store has no directory you own on it,
+so backups there are size-capped copies rather than free hardlinks.
+
 ```console
 $ touch x
 $ rm x
@@ -244,7 +256,7 @@ undo show [id]    what a session changed
 undo apply <id>   revert a specific session
 undo gc           prune old, empty, and oversized sessions
 undo purge        delete all stored sessions and backups
-undo doctor       check the install and run a live capture/restore test
+undo doctor [path...]  check the install, and whether files are protected here
 undo upgrade      update to the latest release
 undo uninstall    remove undo (--purge also deletes backups)
 ```

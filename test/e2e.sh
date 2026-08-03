@@ -867,6 +867,64 @@ after=$(ls "$UNDO_DATA_DIR/sessions" | wc -l)
 [[ $after -gt $before ]] ||
     fail "case 52: no new session was created for the spawned process group"
 
+echo "== case 53: doctor reports the volume it was asked about"
+make_tree
+out=$("$UNDO" doctor "$PLAY" 2>&1) || fail "doctor exited non-zero: $out"
+grep -q "volume $PLAY" <<<"$out" || fail "case 53: doctor did not report the target volume"
+grep -q "\[ok  \] capture" <<<"$out" || fail "case 53: capture label changed; case 23 depends on it"
+
+echo "== case 54: a missing target fails that target and no more"
+out=$("$UNDO" doctor "$WORK/definitely-not-here" 2>&1 || true)
+grep -q "volume $WORK/definitely-not-here" <<<"$out" ||
+    fail "case 54: a missing target was not reported"
+
+echo "== case 55: a target whose name contains a space is not run through a shell"
+spaced="$WORK/two words"
+mkdir -p "$spaced"
+out=$("$UNDO" doctor "$spaced" 2>&1) || fail "doctor exited non-zero: $out"
+grep -q "\[ok  \] capture" <<<"$out" ||
+    fail "case 55: a path with a space broke the round trip, so it is being interpolated"
+
+echo "== case 56: doctor leaves nothing behind in the directory it probed"
+before=$(ls -A "$spaced" | wc -l)
+"$UNDO" doctor "$spaced" >/dev/null 2>&1 || true
+[[ $(ls -A "$spaced" | wc -l) -eq $before ]] ||
+    fail "case 56: doctor left files in the directory it probed"
+
+echo "== case 57: an unwritable target is reported, and later targets still run"
+ro=$WORK/readonly
+mkdir -p "$ro"
+chmod 500 "$ro"
+out=$("$UNDO" doctor "$ro" "$PLAY" 2>&1 || true)
+chmod 700 "$ro"
+grep -q "volume $ro" <<<"$out" || fail "case 57: the unwritable target was not reported"
+grep -q "volume $PLAY" <<<"$out" ||
+    fail "case 57: a failing target stopped the targets after it being checked"
+
+echo "== case 58: the answer follows the target, not TMPDIR"
+# The bug this whole feature exists to fix: the round trip used to run in
+# whatever TMPDIR named, which a batch system repoints per job.
+tmpalt=$WORK/tmpalt
+mkdir -p "$tmpalt"
+out=$(TMPDIR=$tmpalt "$UNDO" doctor "$PLAY" 2>&1) || fail "doctor exited non-zero: $out"
+grep -q "volume $PLAY" <<<"$out" || fail "case 58: doctor did not report the target"
+[[ -z $(ls -A "$tmpalt") ]] ||
+    fail "case 58: doctor wrote into TMPDIR instead of the target it was given"
+
+echo "== case 59: doctor leaves no backup store behind in the directory it probed"
+# checkVolume's deferred cleanup reloads the session so Session.Remove can find
+# the backup it put on the target's filesystem. Nothing in the Go tests can
+# reach that -- it needs a real store, which needs the shim -- so this is the
+# only place the reload is actually pinned. A .undo directory surviving here
+# means doctor is leaving quota behind on every volume it is pointed at.
+probe=$WORK/storeprobe
+mkdir -p "$probe"
+"$UNDO" doctor "$probe" >/dev/null 2>&1 || true
+[[ ! -d $probe/.undo ]] ||
+    fail "case 59: doctor left a backup store at $probe/.undo"
+found=$(find "$WORK" -name .undo -type d 2>/dev/null | head -1)
+[[ -z $found ]] || fail "case 59: doctor left a backup store at $found"
+
 # Last line of the file, deliberately. This banner used to sit after case 40,
 # where the agent-capture cases were later appended past it: the suite
 # announced success with twelve cases still to run, and AGENTS.md names this
