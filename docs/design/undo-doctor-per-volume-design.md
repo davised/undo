@@ -173,10 +173,12 @@ blind exactly when nothing was saved. The match is:
 - `OpUnlink` whose first field is the canary, or
 - `OpLost` whose first field is the canary and whose second is `unlink`.
 
-If no entry matches, that is the "nothing recorded" case. If more than one
-matches, that is itself a defect worth surfacing — one deletion produced two
-records — and it is reported rather than resolved by taking the first or the
-last, either of which would be a guess.
+If no entry matches, that is the "nothing recorded" case **only once the
+journal has been cleared of corruption** — see below, where the distinction is
+made, because a corrupt record cannot match and would otherwise be silently
+counted as silence. If more than one matches, that is itself a defect worth
+surfacing — one deletion produced two records — and it is reported rather than
+resolved by taking the first or the last, either of which would be a guess.
 
 Journal corruption is reported as corruption, and **not** by looking for a
 `Corrupt` flag on the matched record. There will never be one: `journal.Read`
