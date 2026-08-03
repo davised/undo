@@ -320,6 +320,14 @@ the temp-subdirectory mistake above would have hidden.
 Exit status remains worst-of-all-checks across the install checks, every
 target, and the control.
 
+A target that reports a `Problem` prints that and nothing else: the whole
+per-volume detail section is suppressed, reflink and budget included. Raised in
+final review as a case where a reflink probe error goes unreported, and kept
+deliberately. When the round trip did not conclude there is no store root to
+name, and a filesystem capability printed beside a failed round trip is noise
+next to the thing the reader actually has to act on. A probe error on a volume
+that *did* conclude is reported.
+
 ### Two existing defects this touches
 
 Both are in code this design rewrites, and both are fixed here rather than
