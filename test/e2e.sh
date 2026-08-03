@@ -877,6 +877,8 @@ echo "== case 54: a missing target fails that target and no more"
 out=$("$UNDO" doctor "$WORK/definitely-not-here" 2>&1 || true)
 grep -q "volume $WORK/definitely-not-here" <<<"$out" ||
     fail "case 54: a missing target was not reported"
+"$UNDO" doctor "$WORK/definitely-not-here" >/dev/null 2>&1 &&
+    fail "case 54: a missing target did not make doctor exit non-zero"
 
 echo "== case 55: a target whose name contains a space is not run through a shell"
 spaced="$WORK/two words"
@@ -887,43 +889,64 @@ grep -q "\[ok  \] capture" <<<"$out" ||
 
 echo "== case 56: doctor leaves nothing behind in the directory it probed"
 before=$(ls -A "$spaced" | wc -l)
-"$UNDO" doctor "$spaced" >/dev/null 2>&1 || true
+"$UNDO" doctor "$spaced" >/dev/null 2>&1 ||
+    fail "case 56: doctor exited non-zero, so it may not have probed at all"
 [[ $(ls -A "$spaced" | wc -l) -eq $before ]] ||
     fail "case 56: doctor left files in the directory it probed"
 
-echo "== case 57: an unwritable target is reported, and later targets still run"
-ro=$WORK/readonly
-mkdir -p "$ro"
-chmod 500 "$ro"
-out=$("$UNDO" doctor "$ro" "$PLAY" 2>&1 || true)
-chmod 700 "$ro"
-grep -q "volume $ro" <<<"$out" || fail "case 57: the unwritable target was not reported"
+echo "== case 57: a failing target is reported, and later targets still run"
+# A regular file fails for every uid, unlike an unwritable directory, which
+# root writes to anyway -- and this suite runs as root in a container.
+notdir=$WORK/not-a-directory
+echo x >"$notdir"
+out=$("$UNDO" doctor "$notdir" "$PLAY" 2>&1 || true)
+grep -q "volume $notdir" <<<"$out" || fail "case 57: the failing target was not reported"
+grep -q "\[FAIL\] volume $notdir" <<<"$out" ||
+    fail "case 57: a target that is not a directory did not fail: $out"
 grep -q "volume $PLAY" <<<"$out" ||
     fail "case 57: a failing target stopped the targets after it being checked"
 
 echo "== case 58: the answer follows the target, not TMPDIR"
 # The bug this whole feature exists to fix: the round trip used to run in
-# whatever TMPDIR named, which a batch system repoints per job.
+# whatever TMPDIR named, which a batch system repoints per job. Asserting the
+# label names the target is not enough -- an implementation could probe in
+# TMPDIR and still label the result correctly. What must hold is that the
+# reported store root does not move when TMPDIR does.
 tmpalt=$WORK/tmpalt
 mkdir -p "$tmpalt"
-out=$(TMPDIR=$tmpalt "$UNDO" doctor "$PLAY" 2>&1) || fail "doctor exited non-zero: $out"
-grep -q "volume $PLAY" <<<"$out" || fail "case 58: doctor did not report the target"
+storeroot_of() { sed -n 's/.*store \([^;]*\);.*/\1/p' <<<"$1" | head -1; }
+out_alt=$(TMPDIR=$tmpalt "$UNDO" doctor "$PLAY" 2>&1) ||
+    fail "case 58: doctor exited non-zero: $out_alt"
+out_std=$("$UNDO" doctor "$PLAY" 2>&1) || fail "case 58: doctor exited non-zero: $out_std"
+root_alt=$(storeroot_of "$out_alt")
+root_std=$(storeroot_of "$out_std")
+[[ -n $root_alt ]] || fail "case 58: no store root reported: $out_alt"
+[[ $root_alt == "$root_std" ]] ||
+    fail "case 58: TMPDIR changed the reported store root ($root_std -> $root_alt)"
 [[ -z $(ls -A "$tmpalt") ]] ||
     fail "case 58: doctor wrote into TMPDIR instead of the target it was given"
 
 echo "== case 59: doctor leaves no backup store behind in the directory it probed"
-# checkVolume's deferred cleanup reloads the session so Session.Remove can find
-# the backup it put on the target's filesystem. Nothing in the Go tests can
-# reach that -- it needs a real store, which needs the shim -- so this is the
-# only place the reload is actually pinned. A .undo directory surviving here
-# means doctor is leaving quota behind on every volume it is pointed at.
+# The only pin for checkVolume reloading its session so Session.Remove can find
+# the backup it placed on the target's filesystem: nothing in the Go tests can
+# reach it, because it needs a real store and therefore the shim.
+#
+# Do not guess where the store lands. Running as root under /tmp it resolves to
+# /tmp, not to the probe directory, so searching the work tree finds nothing
+# whether the cleanup works or not. Doctor reports the root it used; count what
+# is under it before and after a second run, because another session's store
+# may legitimately be there already.
 probe=$WORK/storeprobe
 mkdir -p "$probe"
-"$UNDO" doctor "$probe" >/dev/null 2>&1 || true
-[[ ! -d $probe/.undo ]] ||
-    fail "case 59: doctor left a backup store at $probe/.undo"
-found=$(find "$WORK" -name .undo -type d 2>/dev/null | head -1)
-[[ -z $found ]] || fail "case 59: doctor left a backup store at $found"
+out=$("$UNDO" doctor "$probe" 2>&1) || fail "case 59: doctor exited non-zero: $out"
+root=$(sed -n 's/.*store \([^;]*\);.*/\1/p' <<<"$out" | head -1)
+[[ -n $root ]] ||
+    fail "case 59: doctor reported no store root, so this case proves nothing: $out"
+before=$(ls -A "$root/.undo" 2>/dev/null | wc -l)
+"$UNDO" doctor "$probe" >/dev/null 2>&1 || fail "case 59: second doctor run failed"
+after=$(ls -A "$root/.undo" 2>/dev/null | wc -l)
+[[ $after -eq $before ]] ||
+    fail "case 59: doctor left a backup store under $root/.undo ($before -> $after)"
 
 # Last line of the file, deliberately. This banner used to sit after case 40,
 # where the agent-capture cases were later appended past it: the suite

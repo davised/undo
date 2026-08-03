@@ -246,19 +246,19 @@ musl, macOS and WSL.
 ## Usage
 
 ```
-undo              revert the most recent command that changed files
-undo -i           pick a session, cherry-pick individual entries to restore
-undo redo [id]    re-apply an undone session
-undo diff [id]    show what a session changed, with content diffs
-undo run -- cmd   run one command with the shim armed, no hook needed
-undo list         recent sessions, newest first
-undo show [id]    what a session changed
-undo apply <id>   revert a specific session
-undo gc           prune old, empty, and oversized sessions
-undo purge        delete all stored sessions and backups
+undo                   revert the most recent command that changed files
+undo -i                pick a session, cherry-pick individual entries to restore
+undo redo [id]         re-apply an undone session
+undo diff [id]         show what a session changed, with content diffs
+undo run -- cmd        run one command with the shim armed, no hook needed
+undo list              recent sessions, newest first
+undo show [id]         what a session changed
+undo apply <id>        revert a specific session
+undo gc                prune old, empty, and oversized sessions
+undo purge             delete all stored sessions and backups
 undo doctor [path...]  check the install, and whether files are protected here
-undo upgrade      update to the latest release
-undo uninstall    remove undo (--purge also deletes backups)
+undo upgrade           update to the latest release
+undo uninstall         remove undo (--purge also deletes backups)
 ```
 
 ## Storage and disk space
