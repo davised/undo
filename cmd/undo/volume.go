@@ -70,12 +70,26 @@ func classify(entries []journal.Entry, victim, sessionDir, sessionID string) vol
 	}
 	switch {
 	case len(found) == 0:
+		// A corrupt record cannot match: journal.Read keeps its Op and drops
+		// its fields on purpose, so there is no victim path left to compare.
+		// Without this, a journal whose canary record failed its integrity
+		// check reads as "the shim recorded nothing" -- blaming the shim for
+		// what is a journal problem.
+		for _, e := range entries {
+			if e.Corrupt {
+				return volumeVerdict{Problem: "a journal record failed its integrity check"}
+			}
+		}
 		return volumeVerdict{Problem: "the shim recorded no deletion of the canary"}
 	case len(found) > 1:
 		return volumeVerdict{Problem: fmt.Sprintf(
 			"%d records for one deletion; the journal disagrees with itself", len(found))}
 	}
 	e := found[0]
+	// Defence for a future reader that preserves fields: a corrupt record that
+	// matched would have untrustworthy fields, so it must not be trusted. Not
+	// reachable today -- journal.Read drops a corrupt record's fields, so it
+	// never matches -- but keep guarding the matched path regardless.
 	if e.Corrupt {
 		return volumeVerdict{Problem: "the canary's journal record failed its integrity check"}
 	}

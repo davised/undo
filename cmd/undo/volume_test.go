@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/edaywalid/undo/internal/journal"
@@ -154,12 +155,70 @@ func TestClassifyReportsTheSessionStoreFallback(t *testing.T) {
 	}
 }
 
-func TestClassifyRefusesACorruptRecord(t *testing.T) {
+// journal.Read keeps a corrupt record's Op and drops its fields, so this is
+// what a corrupt canary record really looks like by the time classify sees it.
+// It cannot match the victim, which is why the no-match path has to look for it.
+func TestClassifyReportsCorruptionRatherThanSilence(t *testing.T) {
 	entries := []journal.Entry{
-		{Op: journal.OpUnlink, Fields: []string{"/t/canary", "/d/.undo/99/1", "link"}, Corrupt: true},
+		{Op: journal.OpUnlink, Corrupt: true},
 	}
-	if v := classify(entries, "/t/canary", "/store/sessions/99", "99"); v.Problem == "" {
-		t.Fatal("classified from a record that failed its integrity check")
+	v := classify(entries, "/t/canary", "/store/sessions/99", "99")
+	if v.Problem == "" {
+		t.Fatal("a corrupt journal was not reported at all")
+	}
+	if !strings.Contains(v.Problem, "integrity") {
+		t.Fatalf("problem = %q, want it to name the integrity failure rather "+
+			"than blaming the shim for recording nothing", v.Problem)
+	}
+}
+
+// A corrupt record alongside the real one must not be counted as a second
+// match: it has no fields to match with.
+func TestClassifyIgnoresACorruptRecordBesideAGoodOne(t *testing.T) {
+	entries := []journal.Entry{
+		{Op: journal.OpUnlink, Corrupt: true},
+		{Op: journal.OpUnlink, Fields: []string{"/t/canary", "/d/.undo/99/1", "link"}},
+	}
+	v := classify(entries, "/t/canary", "/store/sessions/99", "99")
+	if v.Problem != "" {
+		t.Fatalf("unexpected problem: %s", v.Problem)
+	}
+	if v.StoreRoot != "/d" || v.Method != "link" {
+		t.Fatalf("got %+v, want the good record classified", v)
+	}
+}
+
+// The marker can appear more than once; the valid one is the component
+// followed by this run's session id.
+func TestStoreRootOfHandlesARepeatedMarker(t *testing.T) {
+	root, ok := storeRootOf("/a/.undo/x/.undo/99/f", "99")
+	if !ok || root != "/a/.undo/x" {
+		t.Fatalf("got %q ok=%v, want /a/.undo/x true", root, ok)
+	}
+}
+
+// "-" is a discarded backup: nothing was saved.
+func TestClassifyTreatsADiscardedBackupAsLost(t *testing.T) {
+	entries := []journal.Entry{
+		{Op: journal.OpUnlink, Fields: []string{"/t/canary", "-", "none"}},
+	}
+	if v := classify(entries, "/t/canary", "/store/sessions/99", "99"); !v.Lost {
+		t.Fatalf("got %+v, want lost", v)
+	}
+}
+
+// A sibling directory whose name merely starts with the session dir is not
+// the session dir.
+func TestClassifyDoesNotMistakeASiblingForTheSessionStore(t *testing.T) {
+	entries := []journal.Entry{
+		{Op: journal.OpUnlink, Fields: []string{"/t/canary", "/store/sessions/999/x/1", "copy"}},
+	}
+	v := classify(entries, "/t/canary", "/store/sessions/99", "99")
+	if v.Fallback {
+		t.Fatalf("got %+v, want no fallback: sibling named like the session dir", v)
+	}
+	if v.Problem == "" {
+		t.Fatalf("got %+v, want a problem classifying the sibling's backup", v)
 	}
 }
 

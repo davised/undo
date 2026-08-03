@@ -178,9 +178,24 @@ matches, that is itself a defect worth surfacing — one deletion produced two
 records — and it is reported rather than resolved by taking the first or the
 last, either of which would be a guess.
 
-A matching record with `Corrupt` set is reported as journal corruption. Its
-fields are not used to classify, and nothing is restored from it: the whole
-point of the integrity field is that those fields are not trustworthy.
+Journal corruption is reported as corruption, and **not** by looking for a
+`Corrupt` flag on the matched record. There will never be one: `journal.Read`
+builds a corrupt entry from its op alone and drops the fields on purpose —
+"they are the untrustworthy part and nothing should be tempted to read them" —
+so a corrupt record has no victim path left to match on and can never be the
+record selected above.
+
+Corruption is therefore detected on the **no-match** path: when nothing matches
+the canary, any entry carrying `Corrupt` means the journal is the problem. The
+distinction is the whole point. Without it a corrupted canary record reports as
+"the shim recorded no deletion", which tells the user their shim is broken when
+it recorded the deletion faithfully and the journal is what failed — a
+confidently wrong cause, which is the failure this design exists to avoid.
+
+An earlier revision of this document specified the flag check on the matched
+record. That rule was unreachable, and the test written for it constructed a
+corrupt entry with fields, a shape the reader never produces — so it passed
+while exercising nothing. Found in review of the implementation.
 
 From the selected entry:
 
