@@ -2,9 +2,14 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/edaywalid/undo/internal/journal"
+	"github.com/edaywalid/undo/internal/restore"
+	"github.com/edaywalid/undo/internal/session"
 )
 
 // volumeVerdict is what one target directory's round trip established.
@@ -13,11 +18,13 @@ import (
 // the volume could not be judged, and the caller reports FAIL rather than
 // guessing at a healthy answer.
 type volumeVerdict struct {
-	StoreRoot string // "" when the backup did not land in a filesystem-local store
-	Fallback  bool   // the backup went to the session store instead
-	Method    string // link, copy, none, or an unrecognised token verbatim
-	Lost      bool   // nothing was saved for the canary
-	Problem   string
+	StoreRoot    string // "" when the backup did not land in a filesystem-local store
+	Fallback     bool   // the backup went to the session store instead
+	Method       string // link, copy, none, or an unrecognised token verbatim
+	Lost         bool   // nothing was saved for the canary
+	Problem      string
+	Reflink      bool // the target's filesystem can clone extents
+	ReflinkKnown bool // the probe produced an answer at all
 }
 
 // storeRootOf splits a backup path of the form <root>/.undo/<session-id>/<name>
@@ -112,4 +119,88 @@ func classify(entries []journal.Entry, victim, sessionDir, sessionID string) vol
 		v.StoreRoot = root
 	}
 	return v
+}
+
+// checkVolume runs one capture/restore round trip inside target and reports
+// what it established about that filesystem.
+//
+// The canary is a FILE created directly in target, never inside a directory
+// this function creates. resolve_store_root takes the highest ancestor that is
+// on the same device, owned by the caller and writable; a directory doctor just
+// made is owned by the caller by construction, so putting the canary inside one
+// would supply a qualifying ancestor on exactly the volumes where a real file
+// finds none -- and doctor would report a healthy local store for a directory
+// whose real files fall back to capped copies.
+func checkVolume(shim, target string) (volumeVerdict, error) {
+	dir, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		return volumeVerdict{}, err
+	}
+	if dir, err = filepath.Abs(dir); err != nil {
+		return volumeVerdict{}, err
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return volumeVerdict{}, err
+	}
+	if !fi.IsDir() {
+		return volumeVerdict{}, fmt.Errorf("%s is not a directory", target)
+	}
+
+	f, err := os.CreateTemp(dir, ".undo-doctor-")
+	if err != nil {
+		return volumeVerdict{}, err
+	}
+	victim := f.Name()
+	const body = "undo doctor canary\n"
+	_, werr := f.WriteString(body)
+	f.Close()
+	// Cleanup runs unarmed: os.Remove is a raw syscall from Go, which
+	// LD_PRELOAD never sees, so it cannot journal an operation or mint a
+	// session of its own as a side effect of a diagnostic.
+	defer os.Remove(victim)
+	if werr != nil {
+		return volumeVerdict{}, werr
+	}
+
+	sess, err := session.Create("undo doctor volume check")
+	if err != nil {
+		return volumeVerdict{}, err
+	}
+	defer sess.Remove() // classification happens first: Remove deletes the very backups being classified
+
+	// The victim is passed as an argument, never concatenated into the script:
+	// once a user-supplied path reaches here, a space or a metacharacter would
+	// otherwise change what runs.
+	cmd := exec.Command("/bin/sh", "-c", `rm -- "$1"`, "sh", victim)
+	cmd.Env = armedEnv(os.Environ(), shim, sess.Dir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return volumeVerdict{}, fmt.Errorf("rm failed: %v %s", err, out)
+	}
+	sess.MarkDone()
+
+	entries, err := journal.Read(filepath.Join(sess.Dir, "journal"))
+	if err != nil && !os.IsNotExist(err) {
+		// Discarding this would surface a truncated journal as "nothing was
+		// recorded", which is a different and far more alarming diagnosis.
+		return volumeVerdict{Problem: "the journal could not be read: " + err.Error()}, nil
+	}
+	v := classify(entries, victim, sess.Dir, sess.ID)
+
+	if v.Problem == "" && !v.Lost {
+		fresh, err := session.Get(sess.ID)
+		if err != nil {
+			v.Problem = "the session could not be reloaded: " + err.Error()
+		} else if _, err := restore.Run(fresh, restore.Undo, restore.Options{}); err != nil {
+			v.Problem = "restore failed: " + err.Error()
+		} else if got, err := os.ReadFile(victim); err != nil || string(got) != body {
+			v.Problem = "the canary came back with different contents"
+		}
+	}
+
+	if supported, err := probeReflink(dir); err == nil {
+		v.Reflink = supported
+		v.ReflinkKnown = true
+	}
+	return v, nil
 }

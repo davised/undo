@@ -250,3 +250,29 @@ func TestClassifyPassesAnUnknownMethodThrough(t *testing.T) {
 		t.Fatalf("method = %q, want it passed through verbatim", v.Method)
 	}
 }
+
+func TestCheckVolumeRejectsAMissingTarget(t *testing.T) {
+	if _, err := checkVolume("", "/nonexistent-undo-doctor-target"); err == nil {
+		t.Fatal("a missing target did not produce an error")
+	}
+}
+
+// The canary must never be created inside a directory doctor made: the
+// resolver takes the HIGHEST owned, writable ancestor, so a doctor-owned
+// subdirectory becomes the store root on exactly the volumes where a real file
+// would find none -- reporting a healthy store where there is not one.
+// Whatever happens, nothing is left in the user's directory.
+func TestCheckVolumeLeavesNothingBehind(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("needs the shim")
+	}
+	dir := t.TempDir()
+	_, _ = checkVolume("", dir) // no shim: the round trip fails, cleanup must not
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 0 {
+		t.Fatalf("checkVolume left %d entries behind", len(ents))
+	}
+}
