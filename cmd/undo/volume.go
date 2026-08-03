@@ -193,7 +193,12 @@ func checkVolume(shim, target string) (volumeVerdict, error) {
 	cmd := exec.Command("/bin/sh", "-c", `rm -- "$1"`, "sh", victim)
 	cmd.Env = armedEnv(os.Environ(), shim, sess.Dir)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return volumeVerdict{}, fmt.Errorf("rm failed: %v %s", err, out)
+		// A Problem, not an error: the shim was reached, so the control in
+		// doctor can still say whether this volume is the difference. An
+		// error here means the target was never usable at all, and the
+		// control has nothing to compare against.
+		return volumeVerdict{Problem: fmt.Sprintf(
+			"the canary could not be deleted: %v %s", err, strings.TrimSpace(string(out)))}, nil
 	}
 	sess.MarkDone()
 

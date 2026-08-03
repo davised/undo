@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 
 	"github.com/edaywalid/undo/internal/session"
 )
@@ -89,7 +90,7 @@ func cmdDoctor(targets []string) {
 			v, err := checkVolume(shim, t)
 			if err != nil {
 				// never reached the shim, so the control would say nothing
-				report(failed, "volume "+t, err.Error())
+				report(failed, "volume "+safeLabel(t), err.Error())
 				continue
 			}
 			// The literal labels below are asserted by test/e2e.sh case 23.
@@ -254,6 +255,20 @@ func reportHooks(report func(checkState, string, string), shim string) {
 		dir, dir, dir))
 }
 
+// safeLabel makes a path safe to print in a report line. Filenames may contain
+// newlines and control bytes, and doctor's output is read by people and grepped
+// by the e2e suite: an embedded newline lets a directory name forge a line that
+// looks like a passing check. Ordinary paths pass through untouched, so the
+// output does not suddenly grow quotes around every path.
+func safeLabel(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' || unicode.IsControl(r) {
+			return '?'
+		}
+		return r
+	}, s)
+}
+
 // reportVolume prints what one target established. The two labels that are
 // qualified here are qualified deliberately: reflink is a property of the
 // filesystem that the shim does not yet use, and the budget is one global
@@ -262,9 +277,9 @@ func reportHooks(report func(checkState, string, string), shim string) {
 func reportVolume(report func(checkState, string, string), name string, v volumeVerdict) {
 	switch {
 	case v.Lost:
-		report(warn, "volume "+name, "nothing was saved for the canary here")
+		report(warn, "volume "+safeLabel(name), "nothing was saved for the canary here")
 	case v.Fallback:
-		report(warn, "volume "+name,
+		report(warn, "volume "+safeLabel(name),
 			"no directory you own on this filesystem, so backups go to the session store as "+
 				"size-capped copies. Creating a directory of your own on this volume fixes it")
 	default:
@@ -272,8 +287,8 @@ func reportVolume(report func(checkState, string, string), name string, v volume
 		if v.Method == "link" {
 			free = "hardlinked, costing nothing"
 		}
-		report(pass, "volume "+name, fmt.Sprintf("store %s; deletions %s (%s)",
-			v.StoreRoot, free, v.Method))
+		report(pass, "volume "+safeLabel(name), fmt.Sprintf("store %s; deletions %s (%s)",
+			safeLabel(v.StoreRoot), free, v.Method))
 	}
 	if v.ReflinkKnown {
 		state := "no"
