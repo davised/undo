@@ -1013,7 +1013,27 @@ static int resolve_store_root(const char *abs, char *out)
             *slash = 0;
         if (stat(cur, &st) != 0 || st.st_dev != dev)
             break; /* left the filesystem, or cannot see it */
-        if (st.st_uid == me && (st.st_mode & S_IWUSR))
+        /* Refuse the filesystem root itself as the store root. Running as root
+         * every directory passes the ownership test (st_uid == me && S_IWUSR),
+         * so the walk would otherwise degenerate to "/" -- backups land at
+         * `//.undo/<sid>` (a doubled slash, implementation-defined in POSIX)
+         * and in_any_store (guarded on rootlen > 0) cannot recognise that path
+         * as a store at all. Measured in the container: root under /tmp resolves
+         * to /tmp, not "/". A non-root user is unaffected, since nobody but root
+         * owns "/" and the walk never selected it for them.
+         *
+         * The cost, raised in review and accepted: a file directly beneath "/"
+         * has no other ancestor, so resolution now fails and save_file falls
+         * back to $UNDO_SESSION/data. Where that is another filesystem and the
+         * file is over UNDO_MAX_BYTES it is recorded lost rather than
+         * hardlinked locally. That is the documented degradation, and it is
+         * reported -- Session.Unprotected surfaces it in `undo list` and in the
+         * pre-revert preview. What it replaces was not protection: a store at
+         * "/" is invisible to in_any_store, so the shim would have backed up
+         * its own backups and said nothing when another session destroyed
+         * them. A loud, bounded loss beats a silent one. */
+        if ((cur[0] != '/' || cur[1] != 0) &&
+            st.st_uid == me && (st.st_mode & S_IWUSR))
             snprintf(best, sizeof best, "%s", cur);
         if (cur[0] == '/' && cur[1] == 0)
             break;

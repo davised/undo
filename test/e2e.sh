@@ -437,20 +437,29 @@ echo "== case 29: a rename whose target could not be saved is recorded as lost"
 # filesystems (so it gets EXDEV) and the copy fallback must hit the
 # UNDO_MAX_BYTES cap.  We use /dev/shm (tmpfs) for the renamed files, and we
 # sabotage the store that resolve_store_root would create there by planting a
-# regular file at /dev/shm/.undo, which makes ensure_store fail and forces
-# save_file to use the overlay-backed session data dir -- cross-device link.
+# regular file where ensure_store would make it, which makes ensure_store fail
+# and forces save_file to use the overlay-backed session data dir -- cross-device
+# link.
+#
+# Which directory the walk selects depends on who owns /dev/shm: running as
+# root it resolves to /dev/shm itself and the planted /dev/shm/.undo is the
+# load-bearing one; running as a non-root uid (a GitHub runner, say) the walk
+# stops at $RAM, which this case created and therefore owns, and $RAM/.undo is
+# what stops it instead. Plant both so the case exercises the fallback under
+# either euid, and remove both afterwards.
 RAM=/dev/shm/undo-case29
 rm -rf "$RAM"
 mkdir -p "$RAM/ren"
 echo "victim content" >"$RAM/ren/target.txt"
 echo "source" >"$RAM/ren/src.txt"
 touch /dev/shm/.undo
+touch "$RAM/.undo"
 id=$(date +%s%N | cut -c1-16); sess="$UNDO_DATA_DIR/sessions/$id"
 mkdir -p "$sess/data"; echo "mv over target" >"$sess/cmd"
 env UNDO_SESSION="$sess" UNDO_MAX_BYTES=4 LD_PRELOAD="$LIB" \
     bash -c "mv $RAM/ren/src.txt $RAM/ren/target.txt"
 sleep 0.01
-rm -f /dev/shm/.undo
+rm -f /dev/shm/.undo "$RAM/.undo"
 grep -q '^rename' "$sess/journal" ||
     fail "no rename record, journal: $(cat "$sess/journal")"
 awk -F'\t' '$1=="rename"{print $5}' "$sess/journal" | grep -qx lost ||
@@ -487,6 +496,13 @@ env UNDO_SESSION="$adir" LD_PRELOAD="$LIB" bash -c "rm $PLAY/shared/work/one.txt
 sleep 0.01
 abak=$(awk -F'\t' '$1=="unlink"{print $3}' "$adir/journal" | tail -1)
 [[ -f $abak ]] || fail "session A took no backup: $(cat "$adir/journal")"
+# Fix 1 (resolve_store_root refusing the filesystem root) must hold here: a
+# store at "/" would record a backup path of the form //.undo/<sid>, doubling
+# the slash (implementation-defined in POSIX) and leaving in_any_store unable
+# to recognise it. This case runs as root in the container jobs, so it is the
+# regression coverage for that fix; keep asserting no "//" ever comes back.
+[[ $abak != *//* ]] ||
+    fail "backup path has a doubled slash: $abak"
 
 # session B destroys that store while session A is already finished
 store_root=${abak%/.undo/*}
