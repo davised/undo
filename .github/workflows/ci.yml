@@ -62,6 +62,23 @@ jobs:
             *) echo "::error::shim requires $max, breaks Debian 12 / Ubuntu 22.04 / RHEL 9"; exit 1 ;;
           esac
 
+  # The one place the deployment target (el9/x86_64) can actually be run.
+  # test/in-container.sh inherits the host architecture, so on an Apple Silicon
+  # workstation it is aarch64 -- and emulating amd64 there is NOT a valid
+  # substitute, because under qemu /proc/self/stat and getsid(2) disagree
+  # (/proc reads session id 0, getsid the real id), silently disabling the
+  # detach guard the suite checks for. GitHub runners are native amd64, so this
+  # container is real el9/amd64 with no emulation.
+  el9:
+    runs-on: ubuntu-latest
+    container: rockylinux:9
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: dnf -y install gcc make golang python3 diffutils util-linux git tar findutils
+      - name: unit and end-to-end tests
+        run: make test
+
   # Proves the advertised curl | sh actually works on real distros, using
   # the published release. Scheduled so a bad release surfaces on its own.
   #

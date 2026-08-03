@@ -17,9 +17,11 @@ tools/check-no-site-data.sh <files...>            # or: git ls-files -z | xargs 
 tools/check-ere.sh                                # scanner patterns must compile
 ```
 
-**Baseline verified 2026-07-30 at `9291f36`: fully green.** `go test ./...`
-passes and `test/e2e.sh` reports `all cases passed` across 24 cases. There are no
-known-failing tests — if a test is red, you broke it.
+**Baseline verified 2026-08-02 at `c39702f`: fully green on aarch64.** `go test
+./...` passes and `test/e2e.sh` reports `all cases passed` across all 52 e2e
+cases, run in a bookworm container on the Apple Silicon workstation. amd64
+coverage comes from CI only (the el9 job). There are no known-failing tests —
+if a test is red, you broke it.
 
 ## Facts that override default assumptions
 
@@ -27,6 +29,16 @@ known-failing tests — if a test is red, you broke it.
   test`, `gcc`, or `test/e2e.sh` directly — they will fail or, worse, silently
   test the wrong platform. Everything goes through `test/in-container.sh`.
   `test/multifs.sh` additionally needs `--privileged` because it mounts tmpfs.
+- **`test/in-container.sh` inherits the host architecture — aarch64 on an Apple
+  Silicon workstation — while the deployment target is el9/x86_64.** Emulating
+  amd64 (`--platform linux/amd64`) is **not** a valid substitute: under qemu
+  user-mode emulation `/proc/self/stat` field 6 (session id) reads 0 while
+  `getsid(2)` correctly reports the real id (measured: bookworm/amd64 emulated
+  and rocky9/amd64 emulated both read field 6 as 0, getsid(0) as 1). A
+  /proc-derived `UNDO_SID=0` silently switches off the shim's detach guard,
+  so an emulated green run proves nothing. Real amd64 coverage exists only in
+  the el9 CI job; `test/e2e.sh` refuses to run when it cannot resolve a
+  trustworthy session id.
 - **The shim must never cause the user's command to fail.** All internal errors
   are swallowed and the real syscall's return value is passed through untouched.
   This is not a style preference; it is the property that makes the tool safe to
