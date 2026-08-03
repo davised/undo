@@ -56,10 +56,23 @@ gains a `[]string` parameter. With none given the target is the working
 directory as `os.Getwd` reports it.
 
 Each argument is reported under the name the user typed, because that is the
-name they will recognise. Probing resolves symlinks, since the resolver works
-on the real path's `st_dev` — and a home directory that is a symlink onto a
-different volume is common enough that reporting the link's name while probing
-the target is the only honest combination.
+name they will recognise. It is **canonicalized before anything is probed**:
+`filepath.EvalSymlinks` then `filepath.Abs`, and the canary is created in, and
+passed as, that canonical directory.
+
+That is not tidiness, it is required for a correct answer. The shim does not
+call `realpath` — `abs_path` keeps the lexical path — and `resolve_store_root`
+then walks *lexical* parents while `stat` follows each final component. For
+`/link/canary`, where `/link` is a symlink onto another filesystem, the walk can
+select `/link` and stop immediately at `/` because the device changed, never
+visiting the real parents at all. The answer for the symlink spelling and the
+answer for the real path differ, and only the latter describes the volume. A
+home directory that is a symlink onto another volume is a common enough layout
+that this is the normal case, not an edge one.
+
+Canonicalizing also settles the journal match below: the victim handed to the
+deletion must be the same absolute lexical string the shim records, which a
+relative target would not produce.
 
 One section per argument, in the order given, even when two arguments land on
 the same filesystem: the user asked about two directories and deduplicating
@@ -92,16 +105,24 @@ about capture.
 
 For each target directory:
 
-1. Create the canary with `os.CreateTemp(target, ".undo-doctor-")` — **a file,
-   directly in the target directory, never inside a subdirectory the doctor
-   creates.** See below; this is the single most important constraint in this
-   design.
+1. Create the canary with `os.CreateTemp(canonicalTarget, ".undo-doctor-")` —
+   **a file, directly in the target directory, never inside a subdirectory the
+   doctor creates.** See below; this is the single most important constraint in
+   this design.
 2. Create a session. Delete the canary through the shim, armed exactly as the
    existing round trip arms it.
 3. Read the journal and classify (below).
 4. Restore, and compare the recovered bytes with what was written.
 5. Probe reflink support between two files created the same way in the target.
 6. Remove anything the doctor created that still exists.
+
+Step 6 needs stating precisely, because step 4 deliberately puts the canary
+back. Cleanup runs **after** classification and verification, removes only
+paths this run created, and runs **without the armed environment** — deleting
+the canary under the shim would journal a second operation, and with lazy
+session creation it could mint a whole extra session as a side effect of a
+diagnostic. Cleanup failures are reported, not swallowed, but do not change the
+volume's verdict: the answer was already obtained.
 
 ### Why the canary is not placed in a temp subdirectory
 
@@ -139,11 +160,27 @@ be: this design reads fields out of the journal to decide what to report, so a
 truncated or unreadable journal would otherwise surface as "nothing was
 recorded", which is a different and much more alarming diagnosis than the truth.
 
-The canary's record is selected **by operation and exact path** — the `unlink`
-entry whose victim is the canary — not by position. Journals legitimately carry
-other records, `storemv` among them, and records that failed an integrity check
-keep their slots rather than being filtered out, so an index-based rule is
-wrong. If no matching entry exists, that is the "nothing recorded" case.
+The canary's record is selected **by operation and exact path**, not by
+position. Journals legitimately carry other records, `storemv` among them, and
+records that failed an integrity check keep their slots rather than being
+filtered out, so an index-based rule is wrong.
+
+Two operations match, and accepting only the first would miss the case most
+worth reporting. When the backup fails, the shim writes `lost <victim> unlink`
+*instead of* an `unlink` record — so a rule that looks only for `OpUnlink` goes
+blind exactly when nothing was saved. The match is:
+
+- `OpUnlink` whose first field is the canary, or
+- `OpLost` whose first field is the canary and whose second is `unlink`.
+
+If no entry matches, that is the "nothing recorded" case. If more than one
+matches, that is itself a defect worth surfacing — one deletion produced two
+records — and it is reported rather than resolved by taking the first or the
+last, either of which would be a guess.
+
+A matching record with `Corrupt` set is reported as journal corruption. Its
+fields are not used to classify, and nothing is restored from it: the whole
+point of the integrity field is that those fields are not trustworthy.
 
 From the selected entry:
 
@@ -162,9 +199,11 @@ future save method does not read as a failure.
 
 Truncation at `/.undo/` is a structural claim about a path this process just
 caused to be written, so it is checked rather than assumed: the component must
-be present, what precedes it must be non-empty, and what follows must parse as
-a session id. Anything else is reported as an unexpected backup location rather
-than being parsed into a store root.
+be present, what precedes it must be non-empty, and the component that follows
+must be **this run's own session id**, not merely something session-id shaped.
+The weaker test would accept an unrelated `.undo`-shaped path elsewhere in the
+tree and report it as this session's store. Anything failing the check is
+reported as an unexpected backup location rather than parsed into a store root.
 
 Classification happens **before** the session is removed. `Session.Remove`
 deletes backups outside the session directory by reading the journal, so the
@@ -202,9 +241,14 @@ and does not guess which occurred.
 
 `FICLONE` is an `ioctl`. `go.mod` requires no external modules, and pulling in
 `golang.org/x/sys` for one request number would make this the project's first
-dependency; it is done with `syscall.Syscall` and the constant written out,
-documented, in a small helper behind `//go:build linux` so the package still
-builds and vets on a developer's macOS workstation.
+dependency; it is done with `syscall.Syscall` and the constant written out and
+documented.
+
+It takes **two** files, not one. A `//go:build linux` file holds the real
+probe, and a `//go:build !linux` file defines the same function returning "not
+available on this platform". A Linux-only file alone does not make the package
+build elsewhere — it makes the call site undefined — and the workstation these
+agents run on is macOS, where `gofmt` and `go vet` are expected to work.
 
 The probe runs between two files in the target directory, so it describes the
 target's filesystem. That is the store's filesystem in every case except the
@@ -231,6 +275,9 @@ Every one is a report, never a crash, and never aborts the remaining targets:
 | shim recorded nothing here, control also fails | FAIL | the shim, not the volume |
 | method is `none`, or an `OpLost` record | warn | nothing was saved for that file |
 | restore returned different bytes | FAIL | this volume |
+| the matching record is corrupt | FAIL | the journal, and nothing is restored from it |
+| more than one record matches the canary | FAIL | one deletion produced two records |
+| target is a symlink that cannot be resolved | FAIL | that target only; no control |
 
 The fallback warning matters more than its severity suggests. It is the
 documented deployment consequence of the placement algorithm: where per-user
@@ -286,6 +333,10 @@ that is testing the right thing.
 - **Missing path.** Fails cleanly; the remaining targets are unaffected.
 - **A path containing a space.** Proves the victim is not interpolated into a
   shell script.
+- **A target reached through a symlink onto another filesystem.** Reports the
+  same store root as the real path does, which is what canonicalizing buys.
+- **A failed backup.** The record is `lost <victim> unlink`, not `unlink`, and
+  the volume is still classified rather than reported as "nothing recorded".
 - **Two filesystems.** `test/multifs.sh` already builds them, so the assertion
   that two targets report two different store roots is real rather than
   simulated. This is the case that would have caught the original bug.
