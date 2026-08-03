@@ -278,11 +278,12 @@ func TestCheckVolumeLeavesNothingBehind(t *testing.T) {
 	}
 }
 
-// The deferred cleanup must reload the session, because session.Create returns
-// one with no journal entries and Session.Remove finds distributed backups
-// through exactly those. This pins the reload rather than the leak itself,
-// which needs a built shim and belongs in the e2e suite.
-func TestCheckVolumeRemovesAReloadedSession(t *testing.T) {
+// checkVolume must not leave a session in the store, whatever the round trip
+// concluded. This pins that and only that: with no shim there is no
+// distributed backup, so it cannot and does not exercise the reload in the
+// deferred cleanup. Proving the reload needs a real store on a target
+// filesystem, which needs the shim, so that assertion lives in the e2e suite.
+func TestCheckVolumeLeavesNoSessionBehind(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("needs the session store")
 	}
