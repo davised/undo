@@ -90,7 +90,7 @@ func cmdDoctor(targets []string) {
 			v, err := checkVolume(shim, t)
 			if err != nil {
 				// never reached the shim, so the control would say nothing
-				report(failed, "volume "+safeLabel(t), err.Error())
+				report(failed, "volume "+safeLabel(t), safeLabel(err.Error()))
 				continue
 			}
 			// The literal labels below are asserted by test/e2e.sh case 23.
@@ -99,10 +99,10 @@ func cmdDoctor(targets []string) {
 					controlRun, controlOK = true, controlPasses(shim)
 				}
 				if controlOK {
-					report(failed, "capture", v.Problem+
+					report(failed, "capture", safeLabel(v.Problem)+
 						"; the same check passes in the temporary directory, so this volume is the difference")
 				} else {
-					report(failed, "capture", v.Problem+
+					report(failed, "capture", safeLabel(v.Problem)+
 						"; it also fails in the temporary directory, so this volume is not implicated")
 				}
 				continue
