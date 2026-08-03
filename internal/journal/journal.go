@@ -15,17 +15,17 @@ import (
 
 // Op types written by the shim.
 const (
-	OpCreate   = "create"   // path            -> remove it
-	OpUnlink   = "unlink"   // path, backup    -> move backup back
-	OpRmlink   = "rmlink"   // path, target    -> recreate symlink
-	OpMod      = "mod"      // path, backup    -> move backup back
-	OpRename   = "rename"   // old, new, backup|- -> rename back, restore target
-	OpExchange = "exchange" // a, b            -> swap back
-	OpMkdir    = "mkdir"    // path            -> rmdir
-	OpRmdir    = "rmdir"    // path, mode      -> mkdir
-	OpChmod    = "chmod"    // path, old, new  -> chmod back
-	OpLost     = "lost"     // path, why       -> warn only
-	OpStoreMove = "storemv" // old-prefix, new-prefix|- -> backups moved
+	OpCreate    = "create"   // path            -> remove it
+	OpUnlink    = "unlink"   // path, backup    -> move backup back
+	OpRmlink    = "rmlink"   // path, target    -> recreate symlink
+	OpMod       = "mod"      // path, backup    -> move backup back
+	OpRename    = "rename"   // old, new, backup|- -> rename back, restore target
+	OpExchange  = "exchange" // a, b            -> swap back
+	OpMkdir     = "mkdir"    // path            -> rmdir
+	OpRmdir     = "rmdir"    // path, mode      -> mkdir
+	OpChmod     = "chmod"    // path, old, new  -> chmod back
+	OpLost      = "lost"     // path, why       -> warn only
+	OpStoreMove = "storemv"  // old-prefix, new-prefix|- -> backups moved
 )
 
 type Entry struct {
