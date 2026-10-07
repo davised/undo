@@ -2,8 +2,10 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -16,6 +18,14 @@ const (
 	pass checkState = iota
 	warn
 	failed
+)
+
+// The defaults the consumers fall back to. defaultMaxBytes matches
+// DEFAULT_MAX_BYTES in shim/undo_shim.c; defaultMaxStore matches the 1 GiB
+// envInt fallback for UNDO_MAX_STORE.
+const (
+	defaultMaxBytes = 256 << 20
+	defaultMaxStore = 1 << 30
 )
 
 func (s checkState) mark() string {
@@ -82,6 +92,9 @@ func cmdDoctor(targets []string) {
 
 	// 5. hooks installed
 	reportHooks(report, shim)
+
+	// The limits are global, so a misread one is reported once, not per volume.
+	reportLimitMisreads(report)
 
 	// 6 and 7. live capture + restore round trip
 	if shim != "" {
@@ -286,9 +299,22 @@ func reportVolume(report func(checkState, string, string), name string, v volume
 	case v.Lost:
 		report(warn, "volume "+safeLabel(name), "nothing was saved for the canary here")
 	case v.Fallback:
-		report(warn, "volume "+safeLabel(name),
-			"no directory you own on this filesystem, so backups go to the session store as "+
-				"size-capped copies. Creating a directory of your own on this volume fixes it")
+		// The method is mapped exactly as in the default branch below: a
+		// fallback onto the same filesystem can still be hardlinked, so
+		// assuming "size-capped copy" here would describe a cost the journal
+		// does not show.
+		free := "saved by an unrecognised method"
+		switch v.Method {
+		case "link":
+			free = "hardlinked, costing nothing"
+		case "copy":
+			free = "copied, costing real bytes"
+		}
+		report(warn, "volume "+safeLabel(name), fmt.Sprintf(
+			"backups go to the session store (%s, %s): undo could not use a store on "+
+				"this filesystem -- usually no directory you own here, or a .undo in the "+
+				"way that is not a directory you own. Creating a directory of your own "+
+				"on this volume usually fixes it", free, v.Method))
 	default:
 		// An unrecognised token is printed verbatim rather than guessed at:
 		// a future save method that costs nothing would otherwise be described
@@ -314,12 +340,116 @@ func reportVolume(report func(checkState, string, string), name string, v volume
 			safeLabel(v.ReflinkErr))
 	}
 	fmt.Printf("       overwrite cap %s per file; store budget %s, global rather than per-volume\n",
-		envOr("UNDO_MAX_BYTES", "256 MiB"), envOr("UNDO_MAX_STORE", "1 GiB"))
+		humanBytes(effectiveMaxBytes(os.Getenv("UNDO_MAX_BYTES"))),
+		humanBytes(uint64(effectiveMaxStore(os.Getenv("UNDO_MAX_STORE")))))
 }
 
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
+// reportLimitMisreads warns when an environment value would not be read the way
+// a worded unit (or a sign, or trailing junk) suggests. It never changes what
+// the consumers do -- it only stops doctor from printing a cap the shim and gc
+// do not enforce.
+func reportLimitMisreads(report func(checkState, string, string)) {
+	if raw := os.Getenv("UNDO_MAX_BYTES"); raw != "" && maxBytesMisread(raw) {
+		report(warn, "limits", fmt.Sprintf(
+			"UNDO_MAX_BYTES=\"%s\" is read as %s; give a plain number of bytes",
+			safeLabel(raw), humanBytes(effectiveMaxBytes(raw))))
+	}
+	if raw := os.Getenv("UNDO_MAX_STORE"); raw != "" && maxStoreMisread(raw) {
+		report(warn, "limits", fmt.Sprintf(
+			"UNDO_MAX_STORE=\"%s\" is read as %s; give a plain number of bytes",
+			safeLabel(raw), humanBytes(uint64(effectiveMaxStore(raw)))))
+	}
+}
+
+// effectiveMaxBytes mirrors the shim's max_bytes(): parse_ulong over
+// UNDO_MAX_BYTES, then the zero result falls back to the 256 MiB default.
+// UNDO_MAX_BYTES="256MiB" therefore means 256 BYTES, not 256 MiB.
+func effectiveMaxBytes(raw string) uint64 {
+	if v := parseULong(raw); v != 0 {
 		return v
+	}
+	return defaultMaxBytes
+}
+
+// effectiveMaxStore is what envInt derives from UNDO_MAX_STORE: a base-10
+// integer that fails to parse or is <= 0 silently becomes the 1 GiB default.
+func effectiveMaxStore(raw string) int64 {
+	return parsePositiveInt(raw, defaultMaxStore)
+}
+
+// maxBytesMisread reports whether UNDO_MAX_BYTES(raw) is read differently from
+// how it is written: anything but a leading run of decimal digits after
+// optional leading spaces/tabs, or a value that still parses to zero.
+func maxBytesMisread(raw string) bool {
+	s := strings.TrimLeft(raw, " \t")
+	if s == "" {
+		return true
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return true
+		}
+	}
+	return parseULong(s) == 0
+}
+
+// maxStoreMisread reports whether envInt would reject the raw value: not a
+// base-10 integer, or <= 0.
+func maxStoreMisread(raw string) bool {
+	n, err := strconv.ParseInt(raw, 10, 64)
+	return err != nil || n <= 0
+}
+
+// parseULong mirrors parse_ulong in shim/undo_shim.c: skip leading spaces and
+// tabs, consume the leading run of decimal digits, stop at the first other
+// byte, and saturate at the unsigned maximum instead of wrapping. An
+// unparseable value is zero, which max_bytes then replaces with its default.
+func parseULong(s string) uint64 {
+	var v uint64
+	i := 0
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+		i++
+	}
+	for ; i < len(s) && s[i] >= '0' && s[i] <= '9'; i++ {
+		d := uint64(s[i] - '0')
+		if v > (math.MaxUint64-d)/10 {
+			return math.MaxUint64
+		}
+		v = v*10 + d
+	}
+	return v
+}
+
+// humanBytes renders a byte count in the largest binary unit that keeps it at
+// least 1, with up to one decimal place.
+func humanBytes(n uint64) string {
+	units := []struct {
+		name string
+		size uint64
+	}{
+		{"TiB", 1 << 40},
+		{"GiB", 1 << 30},
+		{"MiB", 1 << 20},
+		{"KiB", 1 << 10},
+	}
+	for _, u := range units {
+		if n >= u.size {
+			q, r := n/u.size, n%u.size
+			tenths := (r * 10) / u.size
+			if tenths == 0 {
+				return fmt.Sprintf("%d %s", q, u.name)
+			}
+			return fmt.Sprintf("%d.%d %s", q, tenths, u.name)
+		}
+	}
+	return fmt.Sprintf("%d B", n)
+}
+
+func parsePositiveInt(raw string, def int64) int64 {
+	if raw != "" {
+		if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
+			return n
+		}
 	}
 	return def
 }

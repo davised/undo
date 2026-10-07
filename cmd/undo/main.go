@@ -45,17 +45,12 @@ flags:
 `
 
 func envInt(name string, def int64) int64 {
-	if v := os.Getenv(name); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
-			return n
-		}
-	}
-	return def
+	return parsePositiveInt(os.Getenv(name), def)
 }
 
 func cmdGC(auto bool) {
 	keep := int(envInt("UNDO_KEEP", 30))
-	maxBytes := envInt("UNDO_MAX_STORE", 1<<30)
+	maxBytes := envInt("UNDO_MAX_STORE", defaultMaxStore)
 	maxAge := time.Duration(envInt("UNDO_MAX_AGE", 0)) * time.Second
 	removed, err := session.GC(keep, maxBytes, maxAge)
 	if auto {

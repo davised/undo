@@ -219,8 +219,10 @@ too:
 $ undo doctor ~ /scratch
 ```
 
-A volume reported as using the session store has no directory you own on it,
-so backups there are size-capped copies rather than free hardlinks.
+A volume reported as using the session store usually has no directory you own
+on it, or an obstructing `.undo` that is not a directory you own; such backups
+are usually copies rather than free hardlinks, and `doctor` says which method it
+saw.
 
 ```console
 $ touch x
